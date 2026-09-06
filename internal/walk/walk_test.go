@@ -28,6 +28,11 @@ func TestEntrySumsSizesAndMaxMtime(t *testing.T) {
 	old := now.Add(-72 * time.Hour)
 	writeFile(t, filepath.Join(root, "a.bin"), 100, old)
 	writeFile(t, filepath.Join(root, "sub", "b.bin"), 50, now.Add(-1*time.Hour))
+	// The dir's own mtime is the activity FLOOR (empty-dir fallback): age it
+	// so this test pins the file-driven max, not the freshly-created dir.
+	if err := os.Chtimes(root, old, old); err != nil {
+		t.Fatal(err)
+	}
 
 	info := Entry(root, root, now)
 	if info.Bytes != 150 || info.Files != 2 {
@@ -45,22 +50,48 @@ func TestEntrySumsSizesAndMaxMtime(t *testing.T) {
 	}
 }
 
+// Empty dirs have no file mtimes: the dir's own mtime is their activity.
+func TestEntryEmptyDirFallsBackToDirMtime(t *testing.T) {
+	base := t.TempDir()
+	now := time.Now()
+	old := now.Add(-40 * 24 * time.Hour)
+	empty := filepath.Join(base, "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(empty, old, old); err != nil {
+		t.Fatal(err)
+	}
+	info := Entry(base, empty, now)
+	if info.MaxMtime.IsZero() || info.MaxMtime.After(now) {
+		t.Fatalf("empty dir activity = %v, want the aged dir mtime", info.MaxMtime)
+	}
+	if now.Sub(info.MaxMtime) < 39*24*time.Hour {
+		t.Fatalf("empty dir activity too fresh: %v", info.MaxMtime)
+	}
+}
+
 // A future-dated file must be clamped to now (and counted), so clock skew can
-// never make a live dir read as never-active and age it into SAFE.
+// never make a live dir read as never-active and age it into SAFE. `now` is
+// captured AFTER the fixture writes: the writes tick the dir's own mtime,
+// which the fallback also clamps against `now`, and a pre-write `now` would
+// make the fresh dir count as future (that clamp is correct behavior, just
+// not what this test isolates).
 func TestEntryClampsFutureMtimes(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cand")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	base := time.Now()
+	writeFile(t, filepath.Join(root, "skewed"), 10, base.Add(48*time.Hour))
+	writeFile(t, filepath.Join(root, "normal"), 10, base.Add(-2*time.Hour))
 	now := time.Now()
-	writeFile(t, filepath.Join(root, "skewed"), 10, now.Add(48*time.Hour))
-	writeFile(t, filepath.Join(root, "normal"), 10, now.Add(-2*time.Hour))
 
 	info := Entry(root, root, now)
 	if info.Clamped != 1 {
-		t.Fatalf("Clamped=%d, want 1", info.Clamped)
+		t.Fatalf("Clamped=%d, want 1 (only the skewed file)", info.Clamped)
 	}
-	if info.MaxMtime.After(now.Add(time.Minute)) {
+	if info.MaxMtime.After(now) {
 		t.Fatalf("MaxMtime %v escaped the clamp", info.MaxMtime)
 	}
 }

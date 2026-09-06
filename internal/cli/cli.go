@@ -26,11 +26,13 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return ExitUsage
 	}
-	cmd, _ := args[0], args[1:]
+	cmd, rest := args[0], args[1:]
 	switch cmd {
 	case "version":
 		fmt.Fprintf(stdout, "reap %s\n", versionLabel())
 		return ExitOK
+	case "scan":
+		return cmdScan(rest, stdout, stderr)
 	case "help", "-h", "--help":
 		usage(stdout)
 		return ExitOK
@@ -53,9 +55,21 @@ func usage(w io.Writer) {
 
 commands:
   version    print the build version
+  scan       walk configured roots and verdict every directory
   help       this help
 
-scan, plan, apply, discard, activity, log, quarantine, hold, unhold, holds,
+reap scan [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj] [--json]
+
+plan, apply, discard, activity, log, quarantine, hold, unhold, holds,
 doctor land with their milestones (see the design spec's normative grammar).
 `)
+}
+
+// multiFlag collects a repeated string flag (--roots a --roots b).
+type multiFlag []string
+
+func (m *multiFlag) String() string { return "" }
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
 }

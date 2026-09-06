@@ -43,6 +43,18 @@ type DirInfo struct {
 func Entry(root, path string, now time.Time) DirInfo {
 	info := DirInfo{Path: path, Root: root}
 
+	// An empty tree has no file mtimes; the dir's own mtime is its activity
+	// (otherwise a freshly created empty scratch verdicts as 106751 days
+	// idle, which is absurd and unsafe). Clamped like any file mtime.
+	if fi, err := os.Stat(path); err == nil {
+		mt := fi.ModTime()
+		if mt.After(now) {
+			mt = now
+			info.Clamped++
+		}
+		info.MaxMtime = mt
+	}
+
 	var walkErr error
 	err := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
