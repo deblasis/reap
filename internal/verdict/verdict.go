@@ -259,7 +259,10 @@ func Decide(in Input) Verdict {
 
 	// The clean rows. SAFE requires EVERYTHING clean, per kind applicability:
 	// git facts for git kinds, jj facts for jj kinds, and nothing shadowed.
-	if cleanAndPushed(in) {
+	// A scratch dir has no VCS facts at all, so cleanAndPushed must not fire
+	// for it — vacuous cleanliness is not cleanliness (the scratch tiers own
+	// that decision, from walk-derived activity).
+	if (in.Git != nil || in.JJ != nil) && cleanAndPushed(in) {
 		return v.set(Safe, "clean-pushed", "clean + fully pushed", "reap plan, then reap apply")
 	}
 
