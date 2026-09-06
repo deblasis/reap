@@ -170,6 +170,27 @@ func (r Runner) RemoteURL(dir string) string {
 	return strings.TrimSpace(firstLine(out))
 }
 
+// Remotes returns every configured remote name -> URL. The gh join matches
+// PR head repositories against ALL of them: origin, upstream, a secondary
+// fork — head repos vary by clone layout, and matching origin only is exactly
+// the fork blind spot the spec closed.
+func (r Runner) Remotes(dir string) map[string]string {
+	out, err := r.run(dir, r.GitBudget, "remote", "-v")
+	if err != nil {
+		return nil
+	}
+	m := map[string]string{}
+	for _, line := range nonEmpty(out) {
+		// "name\turl (fetch)" / "name\turl (push)"
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		m[fields[0]] = fields[1]
+	}
+	return m
+}
+
 func (r Runner) run(dir string, budget time.Duration, args ...string) (string, error) {
 	if budget <= 0 {
 		return "", fmt.Errorf("no exec budget configured; refusing to run unbounded")

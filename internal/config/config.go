@@ -228,6 +228,11 @@ func Canonical(p string) string {
 		p = strings.TrimSuffix(p, string(os.PathSeparator))
 	}
 	if runtime.GOOS == "windows" {
+		// 8.3 expansion before folding: Go temp dirs and some tool output
+		// carry short forms (ALESSA~1) while git/jj record long ones, and a
+		// textual mismatch on either side silently defeats every comparison
+		// built on Canonical.
+		p = longPath(p)
 		p = strings.ToLower(p)
 	}
 	return p
