@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/walk"
 )
 
@@ -72,11 +73,21 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// Status: repo-level failure if it cannot run. A live index.lock is
 	// detected STRUCTURALLY, before any exec: with optional locks disabled
 	// (below) git never takes or waits on that lock, so the only honest way
-	// to see "a concurrent git holds the index" is to look for the file.
+	// to see "a concurrent git holds the index" is to look for the file —
+	// in the worktree's OWN gitdir (linked worktrees keep their index there)
+	// and in the common dir.
+	if gi, ok := gitDirFor(dir); ok {
+		if _, err := os.Stat(filepath.Join(gi, "index.lock")); err == nil {
+			f.StateUnreadable = true
+			f.Why = "index.lock present (a concurrent git is mid-write)"
+			f.Children = fileChildren(dir)
+			return f
+		}
+	}
 	if common, ok := gitCommonDir(dir); ok {
 		if _, err := os.Stat(filepath.Join(common, "index.lock")); err == nil {
 			f.StateUnreadable = true
-			f.Why = "index.lock present (a concurrent git is mid-write)"
+			f.Why = "index.lock present in the common dir (a concurrent git is mid-write)"
 			f.Children = fileChildren(dir)
 			return f
 		}
@@ -93,10 +104,13 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// rev-list decomposition: also repo-level when unreadable, EXCEPT the
 	// unborn-HEAD repo (fresh `git init`, no commits yet): rev-list over
 	// HEAD fails there, but that is not unreadable state — there is simply
-	// nothing to push. Verified with zero unpushed and normal rows below.
+	// nothing to push. `rev-parse --verify -q HEAD` exits NONZERO on an
+	// unborn HEAD (the quiet missing-ref signal; pinned after the round-2
+	// seat proved the exit-0-and-empty reading was dead code), and the
+	// already-parsed dirty/untracked rows carry on and decide below.
 	if err := r.unpushed(dir, &f); err != nil {
-		if unborn, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr == nil && strings.TrimSpace(unborn) == "" {
-			f.Unpushed, f.ReflogOnly = 0, 0
+		if _, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr != nil {
+			f.Unpushed, f.ReflogOnly = 0, 0 // unborn HEAD: nothing exists to push
 		} else {
 			f.StateUnreadable = true
 			f.Why = fmt.Sprintf("git rev-list: %v", err)
@@ -409,14 +423,45 @@ func fileChildren(dir string) []string {
 		// LIVE registered children only: a registration whose worktree dir
 		// is gone (rm without prune) is stale metadata, not a child —
 		// counting it would pin the parent MANUAL parent-of-live-children
-		// forever over a path nothing can act on.
+		// forever over a path nothing can act on. And the candidate itself
+		// is never its own child (an only-child worktree listed itself and
+		// displayed parent-of-live-children instead of its real row — the
+		// round-2 finding).
 		if _, err := os.Stat(wtPath); err != nil {
+			continue
+		}
+		if config.Canonical(wtPath) == config.Canonical(dir) {
 			continue
 		}
 		out = append(out, wtPath)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// gitDirFor resolves the candidate's OWN git dir: the linked worktree's
+// per-worktree gitdir when .git is a file (index.lock lives THERE), else the
+// root .git. Returns ok=false when no backend exists.
+func gitDirFor(dir string) (string, bool) {
+	gitPath := filepath.Join(dir, ".git")
+	if fi, err := os.Stat(gitPath); err == nil && fi.IsDir() {
+		return gitPath, true
+	}
+	raw, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", false
+	}
+	s := strings.TrimSpace(string(raw))
+	s = strings.TrimPrefix(s, "gitdir:")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	s = filepath.FromSlash(s)
+	if !filepath.IsAbs(s) {
+		s = filepath.Join(dir, s)
+	}
+	return s, true
 }
 
 // gitCommonDir resolves the common git dir for a repo or linked worktree,

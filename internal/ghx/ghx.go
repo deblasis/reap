@@ -38,9 +38,10 @@ const searchLimit = 200
 
 // maxBases caps the phase-2 fan-out: repos with open authored PRs. Past the
 // cap the whole PR set degrades to Unavailable (never silently narrowed).
-// 50 covers the realistic personal-fleet ceiling (this account measured 50
-// with open PRs) while bounding the phase; the pool keeps it inside budget.
-const maxBases = 50
+// 100 sits safely above this account's measured 51-with-open-PRs (round 2
+// caught 50 sitting exactly one below it, permanently degrading gh) while
+// bounding the phase; the pool keeps it inside budget.
+const maxBases = 100
 
 // Client runs gh with a budget.
 type Client struct {

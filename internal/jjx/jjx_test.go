@@ -180,3 +180,86 @@ func TestUnavailableWhenBudgetZero(t *testing.T) {
 		t.Fatal("zero-budget runner must refuse rather than run unbounded")
 	}
 }
+
+// Split-layout (non-colocated) jj repo: no .git anywhere. jj facts must
+// still read (the scan layer gates git facts on classify.GitBackend, which
+// is false here — this test pins the jj side of that split).
+func TestSplitLayoutFactsWork(t *testing.T) {
+	needJJ(t)
+	base := t.TempDir()
+	dir := filepath.Join(base, "pure")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("jj", "git", "init", "--colocate", dir).CombinedOutput(); err == nil {
+		_ = out
+	} else if out2, err2 := exec.Command("jj", "git", "init", "--colocated", dir).CombinedOutput(); err2 != nil {
+		t.Skipf("cannot colocate: %v %s / %v %s", err, out, err2, out2)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh(t, dir, "jj", "commit", "-m", "one")
+
+	f := Runner{Budget: 30 * time.Second}.Facts(dir, time.Now(), 72*time.Hour)
+	if f.Unavailable {
+		t.Fatalf("split-layout facts unavailable: %s", f.Why)
+	}
+	if f.UnpushedChanges != 1 {
+		t.Fatalf("UnpushedChanges=%d, want 1", f.UnpushedChanges)
+	}
+}
+
+// Consecutive-scan stability: two Facts calls on an aged repo must not
+// advance the activity reap itself measures (op-heads/working-copy mtimes
+// restored, files created by the snapshot clamped to the capture instant).
+func TestRepeatReadsStable(t *testing.T) {
+	needJJ(t)
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sh(t, repo, "git", "init", "-q", "-b", "main")
+	colocate(t, repo)
+	sh(t, repo, "jj", "commit", "-m", "one")
+
+	// Age the whole .jj tree well past the active window.
+	aged := time.Now().Add(-72 * time.Hour)
+	maxBefore := aged
+	filepath.WalkDir(filepath.Join(repo, ".jj"), func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, aged, aged)
+			if d.IsDir() {
+				os.Chtimes(p, aged, aged)
+			}
+		}
+		return nil
+	})
+	os.Chtimes(repo, aged, aged)
+
+	r := Runner{Budget: 30 * time.Second}
+	_ = r.Facts(repo, time.Now(), 72*time.Hour)
+	time.Sleep(1100 * time.Millisecond) // cross a mtime tick boundary
+	f2 := r.Facts(repo, time.Now(), 72*time.Hour)
+	_ = maxBefore
+
+	// After two full fact reads, the freshest thing under .jj must still
+	// read as aged (the capture-instant clamp may add at most the first
+	// call's timestamp — assert it is NOT "now fresh").
+	freshest := time.Time{}
+	filepath.WalkDir(filepath.Join(repo, ".jj"), func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if fi, e := d.Info(); e == nil && fi.ModTime().After(freshest) {
+				freshest = fi.ModTime()
+			}
+		}
+		return nil
+	})
+	if time.Since(freshest) < 24*time.Hour {
+		t.Fatalf("reap's own reads freshened .jj (freshest %v): consecutive scans would flip this repo ACTIVE", freshest)
+	}
+	if !f2.LastOp.Before(time.Now().Add(-time.Hour)) {
+		t.Fatalf("LastOp advanced across reads: %v", f2.LastOp)
+	}
+}

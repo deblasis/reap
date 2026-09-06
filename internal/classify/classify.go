@@ -39,6 +39,12 @@ type Info struct {
 	Kind       Kind
 	ParentRepo string // resolved parent repo root for worktree/workspace kinds
 	GitDirFile string // the .git file content target when linked
+	// GitBackend reports whether a git backend exists HERE: a root .git dir
+	// or a linked .git file. Colocated jj repos have it, split-layout jj
+	// repos do not — and running git facts where no backend exists yields a
+	// bogus state-unreadable that shadows the jj rows for that whole
+	// population (the round-2 finding both seats disproved live).
+	GitBackend bool
 }
 
 // Dir classifies one candidate directory.
@@ -50,17 +56,21 @@ func Dir(path string) Info {
 	switch {
 	case hasJJ && hasGit:
 		// Colocated jj repo: the git dir and jj repo share the root.
-		return Info{Kind: KindJJRepo, ParentRepo: path}
+		return Info{Kind: KindJJRepo, ParentRepo: path, GitBackend: true}
 	case hasJJ && isLinked:
 		// A jj workspace whose working copy is also a linked git worktree
 		// (the common `jj workspace add` shape in a colocated repo).
-		return classifyJJWorkspace(path, gitFile)
+		info := classifyJJWorkspace(path, gitFile)
+		info.GitBackend = true
+		return info
 	case hasJJ:
 		return classifyJJStandalone(path)
 	case hasGit:
-		return Info{Kind: KindGitRepo, ParentRepo: path}
+		return Info{Kind: KindGitRepo, ParentRepo: path, GitBackend: true}
 	case isLinked:
-		return classifyWorktree(path, gitFile)
+		info := classifyWorktree(path, gitFile)
+		info.GitBackend = info.Kind == KindGitWorktree // orphaned-by-parent-gone has no reachable backend
+		return info
 	default:
 		if readable(path) {
 			return Info{Kind: KindScratch}

@@ -78,6 +78,12 @@ type Input struct {
 	Held      bool
 	Protected bool
 
+	// GitBackend mirrors classify.Info.GitBackend: a jj repo may or may not
+	// carry a git backend (colocated vs split-layout), and only the kind+backend
+	// pair says whether git facts are REQUIRED. A backend-less jj repo with
+	// nil Git is deciding on jj facts, not missing evidence.
+	GitBackend bool
+
 	IncodaLive bool // live incoda ticket at/under the dir (M4 attribution)
 
 	Thresholds config.Thresholds
@@ -167,7 +173,7 @@ func Decide(in Input) Verdict {
 	// cleanliness: --no-jj (or jj missing) on a jj kind must not let the
 	// clean rows read the jj side as clean by omission. Mirrors the gh
 	// treatment (nil PRHeads -> gh-unavailable).
-	if kindNeedsGit(in.Kind) && in.Git == nil {
+	if kindNeedsGit(in.Kind, in.GitBackend) && in.Git == nil {
 		return v.set(Manual, "facts-unavailable",
 			"git facts unavailable (git missing or disabled)",
 			"install git, or rerun with the git phase enabled")
@@ -325,9 +331,16 @@ func (v *Verdict) set(verdict, code, reason, hint string) Verdict {
 	v.Reason = reason
 	v.Hint = hint
 	// Shadow-aware hints: a judgment row that shadows a BLOCKED-class fact
-	// must not advertise the override as if it were unblocked.
+	// must not advertise the override as if it were unblocked. The orphaned
+	// carve-out is the exception — its BLOCKED facts do NOT gate the
+	// override (the hardened confirm does), so "resolve that first" would
+	// advertise an ordering the tool will not enforce.
 	if v.BlockedClassFact != "" && v.Verdict == Manual && judgmentClass[code] && hint != "" {
-		v.Hint = "also: " + v.BlockedClassFact + "; resolve that first, then " + hint
+		if v.OrphanedCarveOut {
+			v.Hint = "also: " + v.BlockedClassFact + "; " + hint
+		} else {
+			v.Hint = "also: " + v.BlockedClassFact + "; resolve that first, then " + hint
+		}
 	}
 	return *v
 }
@@ -436,16 +449,16 @@ func liveChildren(in Input) int {
 }
 
 // kindNeedsGit reports whether a kind's verdict requires git facts. A nil Git
-// on these kinds is unavailable evidence (git missing, disabled), never
-// "checked and clean". Split-layout jj repos WITHOUT a git backend are not
-// in this set: git facts are not applicable there, and running git would
-// only produce a bogus state-unreadable shadow over the jj rows.
-func kindNeedsGit(k classify.Kind) bool {
+// where facts are required is unavailable evidence (git missing, disabled),
+// never "checked and clean". Split-layout jj repos (jj kind, no backend)
+// decide on jj facts alone: git is not applicable, and running it there
+// would only produce a bogus state-unreadable shadow over the jj rows.
+func kindNeedsGit(k classify.Kind, gitBackend bool) bool {
 	switch k {
-	case classify.KindGitRepo, classify.KindGitWorktree,
-		classify.KindJJRepo, // colocated repos carry a git backend
-		classify.KindJJWorkspace:
+	case classify.KindGitRepo, classify.KindGitWorktree:
 		return true
+	case classify.KindJJRepo, classify.KindJJWorkspace:
+		return gitBackend
 	}
 	return false
 }

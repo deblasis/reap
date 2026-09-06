@@ -205,12 +205,16 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	}
 
 	// Reparse candidates are NEVER read through: no classify, no facts, no
-	// activity — the KEEP row decides, on the link's own nature.
+	// activity — the KEEP row decides, on the link's own nature. The
+	// never-walked fields stay zero (no 0001-01-01 sentinels, no 106751-day
+	// ages): "kind":"reparse" is the documented marker.
 	if info.IsReparse {
 		in := verdict.Input{Path: info.Path, Kind: classify.KindScratch, IsReparse: true,
 			Thresholds: cfg.Thresholds, Now: now}
 		v := verdict.Decide(in)
 		e.Kind = "reparse"
+		e.LastActivity = time.Time{}
+		e.AgeDays = 0
 		e.Verdict = v.Verdict
 		e.ReasonCode = v.Code
 		e.Reason = v.Reason
@@ -231,22 +235,17 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 		SizePartial:  info.Partial,
 		LastActivity: info.MaxMtime,
 		NestedVCS:    info.NestedVCS,
+		GitBackend:   classInfo.GitBackend,
 		Thresholds:   cfg.Thresholds,
 		Now:          now,
 	}
 
-	// git facts where a git backend is REACHABLE for the kind. Pure
-	// split-layout jj repos have no .git: running git there yields a bogus
-	// state-unreadable that shadows the jj rows. Orphaned kinds with a live
-	// parent (broken-branch flavor) still attempt facts, so the carve-out
-	// can name real counts; parent-gone orphans leave them nil.
-	gitReachable := false
-	switch classInfo.Kind {
-	case classify.KindGitRepo, classify.KindGitWorktree, classify.KindJJRepo, classify.KindJJWorkspace:
-		gitReachable = true
-	case classify.KindGitWorktreeOrphaned:
-		gitReachable = classInfo.ParentRepo != ""
-	}
+	// git facts only where classify found a git BACKEND (a root .git or a
+	// linked .git file) — or an orphaned worktree whose parent metadata is
+	// intact (the broken-branch flavor), so the carve-out can name real
+	// counts. Split-layout jj repos decide on jj facts alone.
+	gitReachable := classInfo.GitBackend ||
+		(classInfo.Kind == classify.KindGitWorktreeOrphaned && classInfo.ParentRepo != "")
 	if useGit && gitReachable {
 		f := gr.Facts(info.Path, now, remoteStale)
 		in.Git = &f

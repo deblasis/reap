@@ -112,30 +112,47 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	return f
 }
 
-// captureOpHeads records op-heads file mtimes and returns a restore func.
-// Called around any jj invocation that snapshots; the restore undoes the
-// mtime freshening so reap's own reads never count as repo activity.
+// captureOpHeads records mtimes across everything the push-state snapshot
+// touches and returns a restore func. The round-2 panel proved the snapshot
+// rewrites more than op_heads: .jj/working_copy and .jj/working_copy/
+// tree_state too, and newly created op-head files kept fresh mtimes under
+// the old restore. The restore now: (a) resets every pre-existing file to
+// its captured mtime, and (b) resets files CREATED by the snapshot (mtime
+// newer than the capture instant, anywhere under .jj) back to the capture
+// instant — one second of clamped freshness rather than a permanent
+// activity refresh. Residual, documented: file CONTENT the snapshot wrote
+// is real state; only its apparent age is undone.
 func captureOpHeads(dir string) func() {
-	heads := filepath.Join(dir, ".jj", "repo", "op_heads")
-	entries, err := os.ReadDir(heads)
-	if err != nil {
-		return func() {}
-	}
+	jjDir := filepath.Join(dir, ".jj")
+	captureAt := time.Now()
 	type stamp struct {
 		path string
 		at   time.Time
 	}
 	var stamps []stamp
-	for _, e := range entries {
-		p := filepath.Join(heads, e.Name())
-		if fi, err := os.Stat(p); err == nil {
+	filepath.WalkDir(jjDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if fi, err := d.Info(); err == nil {
 			stamps = append(stamps, stamp{p, fi.ModTime()})
 		}
-	}
+		return nil
+	})
 	return func() {
 		for _, s := range stamps {
 			os.Chtimes(s.path, s.at, s.at)
 		}
+		// Files the snapshot created (none at capture time, fresh now).
+		filepath.WalkDir(jjDir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if fi, err := d.Info(); err == nil && fi.ModTime().After(captureAt) {
+				os.Chtimes(p, captureAt, captureAt)
+			}
+			return nil
+		})
 	}
 }
 

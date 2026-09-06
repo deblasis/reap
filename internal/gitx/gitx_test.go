@@ -175,12 +175,9 @@ func TestRemoteStaleByFetchHeadAge(t *testing.T) {
 }
 
 // The spec's state-unreadable row names "locked index, corrupt .git". The
-// corrupt half is the deterministic fixture: porcelain status never takes the
-// index lock on a fresh index, so a lock collision is version-dependent git
-// internals, not a stable test. The CODE treats any status failure as
-// StateUnreadable; the lock-failure variant is simulated exactly in the
-// verdict suite's fault-injection layer (fake git shim), where a status that
-// fails with "index.lock exists" asserts the same row.
+// corrupt half is the deterministic fixture; the locked-index half is pinned
+// STRUCTURALLY (Facts stats index.lock before any exec), which a plain
+// fixture CAN exercise deterministically: create the lock, assert the row.
 func TestCorruptRepoIsStateUnreadable(t *testing.T) {
 	dir, _ := newRepo(t)
 	gitDir := run(t, dir, "rev-parse", "--absolute-git-dir")
@@ -298,5 +295,89 @@ func TestDetachedHeadCounted(t *testing.T) {
 	}
 	if f.Branch != "HEAD" && f.Branch != "(detached)" {
 		t.Logf("branch label %q (informational)", f.Branch)
+	}
+}
+
+// The unborn-HEAD repo (fresh git init, no commits) has nothing to push:
+// untracked content must route BLOCKED dirty-files, not state-unreadable.
+// Round 2 proved the original exit-0 probe was dead code; this fixture pins
+// the inverted semantics.
+func TestUnbornHeadIsDirtyFilesNotUnreadable(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "fresh")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "init", "-q", "-b", "main")
+	write(t, dir, "parked.txt", "agent left this here")
+	f := runner().Facts(dir, time.Now(), 72*time.Hour)
+	if f.StateUnreadable {
+		t.Fatalf("unborn HEAD must not read as unreadable: %+v", f)
+	}
+	if f.Untracked != 1 {
+		t.Fatalf("Untracked=%d, want 1", f.Untracked)
+	}
+	if f.Unpushed != 0 || f.ReflogOnly != 0 {
+		t.Fatalf("unborn repo has nothing to push: %+v", f)
+	}
+}
+
+// The locked-index row, deterministic now that detection is structural:
+// the lock file alone (no contention choreography) must produce the row.
+func TestLockedIndexIsStateUnreadableStructurally(t *testing.T) {
+	dir, _ := newRepo(t)
+	gitDir := run(t, dir, "rev-parse", "--absolute-git-dir")
+	if err := os.WriteFile(filepath.Join(gitDir, "index.lock"), []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(filepath.Join(gitDir, "index.lock")) })
+	f := runner().Facts(dir, time.Now(), 72*time.Hour)
+	if !f.StateUnreadable || !strings.Contains(f.Why, "index.lock") {
+		t.Fatalf("structural lock check failed: %+v", f)
+	}
+}
+
+// A linked worktree's index lock lives in ITS OWN gitdir, not the parent's
+// common dir: a busy worktree must read StateUnreadable, and a busy PARENT
+// must not poison the worktree's verdict.
+func TestWorktreeOwnIndexLockDetected(t *testing.T) {
+	base := t.TempDir()
+	repo, _ := newRepoAt(t, base)
+	wt := filepath.Join(base, "wt")
+	run(t, repo, "worktree", "add", "-q", "--detach", wt)
+
+	gitDir := run(t, wt, "rev-parse", "--absolute-git-dir")
+	if filepath.Clean(gitDir) == filepath.Clean(run(t, repo, "rev-parse", "--absolute-git-dir")) {
+		t.Fatal("fixture assumption: worktree gitdir should differ from parent's")
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "index.lock"), []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(filepath.Join(gitDir, "index.lock")) })
+	f := runner().Facts(wt, time.Now(), 72*time.Hour)
+	if !f.StateUnreadable || !strings.Contains(f.Why, "index.lock") {
+		t.Fatalf("worktree's own lock must be detected: %+v", f)
+	}
+}
+
+// The candidate is never its own child: an only-child worktree lists its own
+// registration in the parent's worktrees dir, and that self-entry must not
+// display parent-of-live-children over the worktree's real row.
+func TestWorktreeNotItsOwnChild(t *testing.T) {
+	base := t.TempDir()
+	repo, _ := newRepoAt(t, base)
+	wt := filepath.Join(base, "wt")
+	run(t, repo, "worktree", "add", "-q", "--detach", wt)
+
+	f := runner().Facts(wt, time.Now(), 72*time.Hour)
+	for _, c := range f.Children {
+		if strings.EqualFold(filepath.Clean(longPath(c)), filepath.Clean(longPath(wt))) {
+			t.Fatalf("worktree lists itself as a child: %v", f.Children)
+		}
+	}
+	// The PARENT still sees it as a live child (that is correct and wanted).
+	pf := runner().Facts(repo, time.Now(), 72*time.Hour)
+	if len(pf.Children) != 1 {
+		t.Fatalf("parent must see the live worktree: %v", pf.Children)
 	}
 }
