@@ -86,12 +86,18 @@ func (l *Log) Append(line Line) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// The handle is closed BEFORE rotation: Windows refuses to rename a file
+	// with an open handle, and rotation runs on the same call that crossed
+	// the bound.
 	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("audit append failed (apply must abort): %w", err)
 	}
-	defer f.Close()
 	if _, err := f.Write(append(raw, '\n')); err != nil {
+		f.Close()
+		return fmt.Errorf("audit append failed (apply must abort): %w", err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("audit append failed (apply must abort): %w", err)
 	}
 	return l.rotateIfNeeded()
@@ -107,9 +113,12 @@ func (l *Log) rotateIfNeeded() error {
 	}
 	// Whole-file rotation: reap.log -> reap.log.1 (previous .1 is dropped;
 	// the envelope lines carry per-session summaries, so recent history
-	// stays readable without unbounded growth).
+	// stays readable without unbounded growth). A rotation failure is not
+	// fatal — the ledger stays correct, just over the soft bound until a
+	// later append rotates it.
 	_ = os.Remove(l.path + ".1")
-	return os.Rename(l.path, l.path+".1")
+	_ = os.Rename(l.path, l.path+".1")
+	return nil
 }
 
 // NewRunID mints a readable run identifier.

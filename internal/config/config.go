@@ -326,11 +326,20 @@ func expandPercentVars(s string) string {
 	}
 }
 
-// globRegex caches compiled protect globs. Protect patterns support ** across
+// globRegex compiles protect globs. Protect patterns support ** across
 // separators and * within a component, matched case-insensitively on Windows
 // via Canonical (the pattern and the path are both canonicalized first).
+// A trailing separator+** (the shape of every built-in protect default)
+// covers the directory itself as well as everything under it: `vigz/**`
+// reads as "vigz and its tree", and a candidate that IS vigz must KEEP.
 func globRegex(glob string) (*regexp.Regexp, error) {
 	c := Canonical(glob)
+	sep := regexp.QuoteMeta(string(os.PathSeparator))
+	trailingTree := false
+	if strings.HasSuffix(c, string(os.PathSeparator)+"**") {
+		trailingTree = true
+		c = strings.TrimSuffix(c, string(os.PathSeparator)+"**")
+	}
 	var sb strings.Builder
 	sb.WriteString(`^`)
 	for i := 0; i < len(c); i++ {
@@ -342,11 +351,14 @@ func globRegex(glob string) (*regexp.Regexp, error) {
 				sb.WriteString(`.*`)
 				i++
 			} else {
-				sb.WriteString(`[^` + regexp.QuoteMeta(string(os.PathSeparator)) + `]*`)
+				sb.WriteString(`[^` + sep + `]*`)
 			}
 		default:
 			sb.WriteString(regexp.QuoteMeta(string(ch)))
 		}
+	}
+	if trailingTree {
+		sb.WriteString(`(` + sep + `.*)?`)
 	}
 	sb.WriteString(`$`)
 	return regexp.Compile(sb.String())

@@ -150,3 +150,31 @@ func TestBudgetsParse(t *testing.T) {
 		t.Fatalf("budgets: git=%v jj=%v gh=%v fetch=%v", git, jj, gh, fetch)
 	}
 }
+
+// A trailing sep+** protect glob covers the DIRECTORY ITSELF as well as its
+// tree: "vigz/**" reads as "vigz and everything under it", and a candidate
+// that IS vigz must KEEP (found by the M2 applycmd tests: re-verify let a
+// protected dir through because the glob only matched strictly-inside paths).
+func TestMatchProtectCoversDirItself(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("canonical form differs off Windows")
+	}
+	globs := []string{`C:\Users\x\AppData\Local\vigz\**`}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{`C:\Users\x\AppData\Local\vigz`, true},         // the dir itself
+		{`C:\Users\x\AppData\Local\vigz\local\h`, true}, // inside
+		{`C:\Users\x\AppData\Local\vigz-backup`, false}, // component boundary
+	}
+	for _, c := range cases {
+		got, err := MatchProtect(c.path, globs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("MatchProtect(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
