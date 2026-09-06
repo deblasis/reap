@@ -108,9 +108,15 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// unborn HEAD (the quiet missing-ref signal; pinned after the round-2
 	// seat proved the exit-0-and-empty reading was dead code), and the
 	// already-parsed dirty/untracked rows carry on and decide below.
+	unborn := false
 	if err := r.unpushed(dir, &f); err != nil {
-		if _, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr != nil {
-			f.Unpushed, f.ReflogOnly = 0, 0 // unborn HEAD: nothing exists to push
+		// `rev-parse --verify -q HEAD` exits NONZERO on an unborn HEAD. Only
+		// an exit-status failure means that: a timeout must NOT be read as
+		// "nothing to push" (that would zero unpushed counts on unreadable
+		// evidence — the cardinal rule's edge, flagged two rounds running).
+		if _, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr != nil && !strings.Contains(uerr.Error(), "timeout") {
+			unborn = true
+			f.Unpushed, f.ReflogOnly = 0, 0
 		} else {
 			f.StateUnreadable = true
 			f.Why = fmt.Sprintf("git rev-list: %v", err)
@@ -138,7 +144,11 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 
 	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
 		f.Branch = strings.TrimSpace(out)
-	} else {
+	} else if !unborn {
+		// On an unborn HEAD the branch probe fails with "ambiguous HEAD":
+		// that is the unborn shape, not a tool failure, and marking it
+		// FactsUnavailable would shadow the dirty/untracked rows that decide
+		// (the end-to-end bug the engineering seat proved on pass three).
 		f.FactsUnavailable = true
 		f.Why = fmt.Sprintf("branch: %v", err)
 	}
@@ -365,7 +375,14 @@ var nowSince = time.Since
 // every ref that follows it (the reverse order would negate the positives too
 // and quietly return nothing).
 func (r Runner) revlistDates(dir string, refs ...string) (map[string]time.Time, error) {
-	args := append([]string{"rev-list", "--pretty=format:%H %cI"}, refs...)
+	// refs/jj/** are jj's internal bookkeeping refs (move-tracking keeps
+	// commits alive under refs/jj/keep indefinitely). Sweeping them with
+	// --all mints phantom BLOCKED unpushed-reflog rows on every colocated
+	// repo with zero user work — and because they are refs, not reflog
+	// entries, the "expire in 90d" story is false forever (the conformance
+	// seat's round-3 major). Excluded here in BOTH rev-lists of the
+	// decomposition; --exclude must precede --all to apply.
+	args := append([]string{"rev-list", "--exclude=refs/jj/*", "--pretty=format:%H %cI"}, refs...)
 	args = append(args, "--not", "--remotes")
 	out, err := r.run(dir, r.GitBudget, args...)
 	if err != nil {

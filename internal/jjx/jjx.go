@@ -113,46 +113,62 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 }
 
 // captureOpHeads records mtimes across everything the push-state snapshot
-// touches and returns a restore func. The round-2 panel proved the snapshot
-// rewrites more than op_heads: .jj/working_copy and .jj/working_copy/
-// tree_state too, and newly created op-head files kept fresh mtimes under
-// the old restore. The restore now: (a) resets every pre-existing file to
-// its captured mtime, and (b) resets files CREATED by the snapshot (mtime
-// newer than the capture instant, anywhere under .jj) back to the capture
-// instant — one second of clamped freshness rather than a permanent
-// activity refresh. Residual, documented: file CONTENT the snapshot wrote
-// is real state; only its apparent age is undone.
+// touches and returns a restore func. The panel proved, across three rounds,
+// that the snapshot writes: op_heads, .jj/working_copy/tree_state, and — in
+// colocated repos — git objects and the index under .git. The restore:
+// (a) resets every pre-existing file to its captured mtime, and (b) clamps
+// files CREATED by the snapshot (mtime newer than the capture instant) to
+// the tree's PRE-SCAN freshest mtime — clamping to the capture instant
+// (round 2) still read as fresh activity to the next walk and flipped dirty
+// jj repos BLOCKED to ACTIVE on every subsequent scan. Residual, documented:
+// file CONTENT the snapshot wrote is real state; only its apparent age is
+// undone, and the very first scan of a never-scanned dirty repo still does
+// one snapshot's worth of work.
 func captureOpHeads(dir string) func() {
-	jjDir := filepath.Join(dir, ".jj")
+	roots := []string{filepath.Join(dir, ".jj")}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		roots = append(roots, filepath.Join(dir, ".git"))
+	}
 	captureAt := time.Now()
+	preScanNewest := time.Time{} // freshest mtime that existed before reap ran
 	type stamp struct {
 		path string
 		at   time.Time
 	}
 	var stamps []stamp
-	filepath.WalkDir(jjDir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	for _, root := range roots {
+		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if fi, err := d.Info(); err == nil {
+				stamps = append(stamps, stamp{p, fi.ModTime()})
+				if fi.ModTime().After(preScanNewest) && !fi.ModTime().After(captureAt) {
+					preScanNewest = fi.ModTime()
+				}
+			}
 			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			stamps = append(stamps, stamp{p, fi.ModTime()})
-		}
-		return nil
-	})
+		})
+	}
+	if preScanNewest.IsZero() {
+		preScanNewest = captureAt
+	}
+	clampTo := preScanNewest
 	return func() {
 		for _, s := range stamps {
 			os.Chtimes(s.path, s.at, s.at)
 		}
-		// Files the snapshot created (none at capture time, fresh now).
-		filepath.WalkDir(jjDir, func(p string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
+		for _, root := range roots {
+			filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if fi, err := d.Info(); err == nil && fi.ModTime().After(captureAt) {
+					os.Chtimes(p, clampTo, clampTo)
+				}
 				return nil
-			}
-			if fi, err := d.Info(); err == nil && fi.ModTime().After(captureAt) {
-				os.Chtimes(p, captureAt, captureAt)
-			}
-			return nil
-		})
+			})
+		}
 	}
 }
 

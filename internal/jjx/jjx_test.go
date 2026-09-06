@@ -181,13 +181,14 @@ func TestUnavailableWhenBudgetZero(t *testing.T) {
 	}
 }
 
-// Split-layout (non-colocated) jj repo: no .git anywhere. jj facts must
-// still read (the scan layer gates git facts on classify.GitBackend, which
-// is false here — this test pins the jj side of that split).
-func TestSplitLayoutFactsWork(t *testing.T) {
+// Colocated jj repo (jj 0.44 cannot create real split roots with default
+// flags, so the honest fixture here is colocated; the BACKENDLESS half of
+// the gating is pinned in classify's TestDirBackendlessGate plus the scan
+// layer's synthetic-dir behavior). jj facts must read unpushed work.
+func TestColocatedFactsWork(t *testing.T) {
 	needJJ(t)
 	base := t.TempDir()
-	dir := filepath.Join(base, "pure")
+	dir := filepath.Join(base, "coloc")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -203,10 +204,68 @@ func TestSplitLayoutFactsWork(t *testing.T) {
 
 	f := Runner{Budget: 30 * time.Second}.Facts(dir, time.Now(), 72*time.Hour)
 	if f.Unavailable {
-		t.Fatalf("split-layout facts unavailable: %s", f.Why)
+		t.Fatalf("colocated facts unavailable: %s", f.Why)
 	}
 	if f.UnpushedChanges != 1 {
 		t.Fatalf("UnpushedChanges=%d, want 1", f.UnpushedChanges)
+	}
+}
+
+// The dirty-tree stability case (the one that WRITES on snapshot): two
+// Facts calls on an aged, dirty colocated repo must leave nothing under
+// .jj or .git reading fresh — the round-3 panel proved clamping to the
+// capture instant still flipped BLOCKED to ACTIVE on the next scan.
+func TestDirtyTreeStableAcrossReads(t *testing.T) {
+	needJJ(t)
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sh(t, repo, "git", "init", "-q", "-b", "main")
+	colocate(t, repo)
+	sh(t, repo, "jj", "commit", "-m", "one")
+	// A DIRTY working copy: the file exists uncommitted, so every push-state
+	// query snapshots real state.
+	if err := os.WriteFile(filepath.Join(repo, "wip.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	aged := time.Now().Add(-72 * time.Hour)
+	for _, root := range []string{filepath.Join(repo, ".jj"), filepath.Join(repo, ".git")} {
+		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err == nil {
+				os.Chtimes(p, aged, aged)
+			}
+			return nil
+		})
+	}
+	os.Chtimes(repo, aged, aged)
+	os.Chtimes(filepath.Join(repo, "wip.txt"), aged, aged)
+
+	r := Runner{Budget: 30 * time.Second}
+	f1 := r.Facts(repo, time.Now(), 72*time.Hour)
+	if f1.UnpushedChanges != 1 {
+		t.Fatalf("first read must see the dirty change: %+v", f1)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	f2 := r.Facts(repo, time.Now(), 72*time.Hour)
+	if f2.UnpushedChanges != 1 {
+		t.Fatalf("second read must see the same change: %+v", f2)
+	}
+	freshest := time.Time{}
+	for _, root := range []string{filepath.Join(repo, ".jj"), filepath.Join(repo, ".git")} {
+		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				if fi, e := d.Info(); e == nil && fi.ModTime().After(freshest) {
+					freshest = fi.ModTime()
+				}
+			}
+			return nil
+		})
+	}
+	if time.Since(freshest) < 24*time.Hour {
+		t.Fatalf("snapshot writes read as fresh (freshest %v): the next scan would flip this repo ACTIVE", freshest)
 	}
 }
 

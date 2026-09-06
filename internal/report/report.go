@@ -20,32 +20,32 @@ import (
 // omitted), per the spec's schema example: consumers must never distinguish
 // "absent" from "false"/"none".
 type Entry struct {
-	Path               string    `json:"path"`
-	Zone               string    `json:"zone"`
-	Kind               string    `json:"kind"`
-	SizeBytes          int64     `json:"sizeBytes"`
-	SizePartial        bool      `json:"sizePartial"`
-	LastActivity       time.Time `json:"lastActivity"`
-	AgeDays            int       `json:"ageDays"`
-	ClampedFiles       int       `json:"clampedFiles"`
-	Verdict            string    `json:"verdict"`
-	ReasonCode         string    `json:"reasonCode"`
-	Reason             string    `json:"reason"`
-	Hint               string    `json:"hint"`
-	Branch             string    `json:"branch,omitempty"`
-	Origin             string    `json:"origin,omitempty"`
-	Dirty              int       `json:"dirty,omitempty"`
-	Untracked          int       `json:"untracked,omitempty"`
-	Ignored            int       `json:"ignored,omitempty"`
-	Stashes            int       `json:"stashes,omitempty"`
-	Unpushed           int       `json:"unpushed,omitempty"`
-	UnpushedReflogOnly int       `json:"unpushedReflogOnly,omitempty"`
-	OpenPR             bool      `json:"openPR"`
-	LineageGroup       *string   `json:"lineageGroup"`
-	Held               bool      `json:"held"`
-	DowngradedBy       *string   `json:"downgradedBy"`
-	BlockedClassFact   string    `json:"blockedClassFact,omitempty"`
-	OrphanedCarveOut   bool      `json:"orphanedCarveOut,omitempty"`
+	Path               string     `json:"path"`
+	Zone               string     `json:"zone"`
+	Kind               string     `json:"kind"`
+	SizeBytes          int64      `json:"sizeBytes"`
+	SizePartial        bool       `json:"sizePartial"`
+	LastActivity       *time.Time `json:"lastActivity"` // null for reparse candidates (never walked)
+	AgeDays            int        `json:"ageDays"`
+	ClampedFiles       int        `json:"clampedFiles"`
+	Verdict            string     `json:"verdict"`
+	ReasonCode         string     `json:"reasonCode"`
+	Reason             string     `json:"reason"`
+	Hint               string     `json:"hint"`
+	Branch             string     `json:"branch,omitempty"`
+	Origin             string     `json:"origin,omitempty"`
+	Dirty              int        `json:"dirty,omitempty"`
+	Untracked          int        `json:"untracked,omitempty"`
+	Ignored            int        `json:"ignored,omitempty"`
+	Stashes            int        `json:"stashes,omitempty"`
+	Unpushed           int        `json:"unpushed,omitempty"`
+	UnpushedReflogOnly int        `json:"unpushedReflogOnly,omitempty"`
+	OpenPR             bool       `json:"openPR"`
+	LineageGroup       *string    `json:"lineageGroup"`
+	Held               bool       `json:"held"`
+	DowngradedBy       *string    `json:"downgradedBy"`
+	BlockedClassFact   string     `json:"blockedClassFact,omitempty"`
+	OrphanedCarveOut   bool       `json:"orphanedCarveOut,omitempty"`
 }
 
 // RootSummary aggregates one scanned root.

@@ -121,9 +121,10 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 				mu.Lock()
 				entries = append(entries, e)
 				done++
-				// Progress after a few seconds of work, on stderr, never in
-				// --json mode: a >60s silent scan reads as a hang.
-				if !*asJSON && done%16 == 0 {
+				// Progress is TIME-gated (the spec: "after a few seconds"),
+				// on stderr, never in --json mode: a fast scan stays silent
+				// and a >60s silent scan reads as a hang.
+				if !*asJSON && done%16 == 0 && time.Since(now) > 3*time.Second {
 					fmt.Fprintf(stderr, "reap scan: %d/%d dirs\n", done, total)
 				}
 				mu.Unlock()
@@ -199,7 +200,7 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 		Zone:         info.Root,
 		SizeBytes:    info.Bytes,
 		SizePartial:  info.Partial,
-		LastActivity: info.MaxMtime,
+		LastActivity: &info.MaxMtime,
 		ClampedFiles: info.Clamped,
 		AgeDays:      int(now.Sub(info.MaxMtime).Hours() / 24),
 	}
@@ -213,7 +214,7 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 			Thresholds: cfg.Thresholds, Now: now}
 		v := verdict.Decide(in)
 		e.Kind = "reparse"
-		e.LastActivity = time.Time{}
+		e.LastActivity = nil
 		e.AgeDays = 0
 		e.Verdict = v.Verdict
 		e.ReasonCode = v.Code

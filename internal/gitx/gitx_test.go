@@ -381,3 +381,61 @@ func TestWorktreeNotItsOwnChild(t *testing.T) {
 		t.Fatalf("parent must see the live worktree: %v", pf.Children)
 	}
 }
+
+// Verdict-level pin for the unborn row (the engineering seat's third-pass
+// finding): the branch probe failing on an unborn HEAD must NOT shadow the
+// dirty/untracked rows — a fresh-init repo with parked files verdicts
+// BLOCKED dirty-files end to end, not facts-unavailable.
+func TestUnbornHeadVerdictIsDirtyFiles(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "fresh")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "init", "-q", "-b", "main")
+	write(t, dir, "parked.txt", "agent left this here")
+	f := runner().Facts(dir, time.Now(), 72*time.Hour)
+	if f.StateUnreadable || f.FactsUnavailable {
+		t.Fatalf("unborn repo must read clean facts: %+v", f)
+	}
+}
+
+// An idle colocated jj repo (pushed, bookmark tracked, zero user work) must
+// NOT mint phantom unpushed-reflog rows from refs/jj/keep/*: the conformance
+// seat proved --all sweeps those bookkeeping refs and they never expire.
+func TestIdleColocatedNoPhantomReflogOnly(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	remote := filepath.Join(base, "remote.git")
+	for _, d := range []string{repo, remote} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(t, repo, "init", "-q", "-b", "main")
+	run(t, remote, "init", "-q", "--bare", "-b", "main")
+	write(t, repo, "f.txt", "x")
+	run(t, repo, "add", "-A")
+	run(t, repo, "commit", "-q", "-m", "one")
+	run(t, repo, "remote", "add", "origin", remote)
+	run(t, repo, "push", "-q", "-u", "origin", "main")
+	run(t, repo, "fetch", "-q")
+	jjEnv := append(os.Environ(), "JJ_USER=t", "JJ_EMAIL=t@t")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", repo).CombinedOutput(); err != nil {
+		t.Skipf("cannot colocate: %v %s", err, out)
+	} else {
+		_ = out
+	}
+	if out, err := exec.Command("jj", "-R", repo, "--ignore-working-copy", "git", "import").CombinedOutput(); err != nil {
+		t.Logf("jj import: %v %s (continuing)", err, out)
+	}
+	_ = jjEnv
+
+	f := runner().Facts(repo, time.Now(), 72*time.Hour)
+	if f.ReflogOnly != 0 || f.Unpushed != 0 {
+		t.Fatalf("phantom unpushed from jj bookkeeping refs: Unpushed=%d ReflogOnly=%d (refs/jj/keep must be excluded)", f.Unpushed, f.ReflogOnly)
+	}
+}

@@ -166,3 +166,39 @@ func TestGitLinkParsing(t *testing.T) {
 		t.Fatalf("parse = %q %q %v", parent, name, ok)
 	}
 }
+
+// The backendless half of the gating: a .jj pointer with NO .git anywhere
+// classifies as jj with GitBackend=false, so the scan layer never execs git
+// there. (jj 0.44 cannot create real split roots with default flags, so the
+// synthetic shape — the same one classify sees in the wild via split
+// workspace pointers — is the honest fixture.)
+func TestDirBackendlessGate(t *testing.T) {
+	base := t.TempDir()
+	main := filepath.Join(base, "main")
+	if err := os.MkdirAll(filepath.Join(main, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(main, ".jj", "repo"), []byte(".\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "ws")
+	if err := os.MkdirAll(filepath.Join(ws, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, ".jj", "repo"), []byte(main+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Dir(main).GitBackend; got {
+		t.Error("backendless jj root must report GitBackend=false")
+	}
+	if got := Dir(ws).GitBackend; got {
+		t.Error("backendless jj workspace must report GitBackend=false")
+	}
+	// Colocated (with .git) flips it true.
+	if err := os.MkdirAll(filepath.Join(main, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := Dir(main).GitBackend; !got {
+		t.Error("colocated root must report GitBackend=true")
+	}
+}
