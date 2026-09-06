@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,6 +120,41 @@ func TestEntryDetectsNestedVCS(t *testing.T) {
 	}
 }
 
+// A submodule's .git is a FILE (gitdir pointer), not a directory: the walk
+// must flag it as a nested VCS marker or a superproject with ignore=dirty
+// hides the submodule's real state (the reliability seat proved this mints
+// SAFE on the parent).
+func TestEntryDetectsSubmoduleGitFile(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "vendor", "lib")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, ".git"), []byte("gitdir: ../../.git/modules/lib\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := Entry(root, root, time.Now())
+	found := false
+	for _, m := range info.NestedVCS {
+		if strings.HasSuffix(filepath.ToSlash(m), "vendor/lib/.git") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("submodule .git file not flagged: %v", info.NestedVCS)
+	}
+	// The candidate's OWN linked .git (depth 0) is still not nested.
+	if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info = Entry(root, root, time.Now())
+	for _, m := range info.NestedVCS {
+		if m == ".git" {
+			t.Fatal("own linked .git must not count as nested")
+		}
+	}
+}
+
 func TestEntryMissingPathIsPartial(t *testing.T) {
 	info := Entry(t.TempDir(), filepath.Join(t.TempDir(), "gone"), time.Now())
 	if !info.Partial {
@@ -150,6 +186,47 @@ func TestRootsListsOnlyChildren(t *testing.T) {
 		if i.Path == filepath.Join(base, "missing-root") && !i.Partial {
 			t.Fatal("missing root must be surfaced as Partial")
 		}
+	}
+}
+
+// Roots must surface reparse-point candidates WITH the IsReparse flag and
+// without walking through the link: the KEEP rail depends on the flag, and
+// facts harvested through a junction are evidence about a different path.
+func TestRootsSurfacesReparseCandidates(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("junction test is Windows-specific")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	target := filepath.Join(base, "target")
+	for _, d := range []string{root, target, filepath.Join(root, "plain")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(target, "big.bin"), 4096, time.Now())
+	ps := `New-Item -ItemType Junction -Path '` + filepath.Join(root, "link") + `' -Target '` + target + `' | Out-Null`
+	if out, err := runPowerShell(ps); err != nil {
+		t.Skipf("cannot create junction (skipping): %v %s", err, out)
+	}
+
+	infos := Roots([]string{root}, time.Now(), 4)
+	byName := map[string]DirInfo{}
+	for _, i := range infos {
+		byName[filepath.Base(i.Path)] = i
+	}
+	link, ok := byName["link"]
+	if !ok {
+		t.Fatalf("junction candidate not surfaced: %+v", infos)
+	}
+	if !link.IsReparse {
+		t.Fatal("junction candidate must carry IsReparse=true")
+	}
+	if link.Bytes != 0 || !link.MaxMtime.IsZero() {
+		t.Fatalf("junction candidate must not be walked: %+v", link)
+	}
+	if plain, ok := byName["plain"]; !ok || plain.IsReparse {
+		t.Fatalf("plain dir misflagged: %+v", byName)
 	}
 }
 

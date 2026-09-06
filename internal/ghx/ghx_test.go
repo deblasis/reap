@@ -1,6 +1,7 @@
 package ghx
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,8 +68,17 @@ func TestLiveSearchParses(t *testing.T) {
 		t.Skip("gh not authenticated; live parse test skipped")
 	}
 	p := Client{Budget: 15 * time.Second}.OpenPRHeads()
-	if p.Unavailable && !p.Truncated {
-		t.Fatalf("live search failed against an authed gh: %s", p.Why)
+	// This test pins the SEARCH phase (field names against the installed
+	// gh). Phase-2 degradation on the real account — the fan-out cap, or one
+	// big repo's pr list timing out — is the honest-unavailable contract
+	// working, not a parse failure. Only search-phase and unparseable
+	// outcomes fail the pin.
+	if p.Unavailable {
+		if strings.Contains(p.Why, "gh search:") || strings.Contains(p.Why, "unparseable") {
+			t.Fatalf("live search failed against an authed gh: %s", p.Why)
+		}
+		t.Logf("phase-2 degraded honestly on this account: %s", p.Why)
+		return
 	}
 	// Whatever the account's open PRs are, the parse must have produced a
 	// usable map (possibly empty) rather than an error.

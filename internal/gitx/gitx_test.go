@@ -223,15 +223,16 @@ func TestChildrenIncludingBroken(t *testing.T) {
 		t.Fatalf("Children=%v, want [%s]", f.Children, wt)
 	}
 
-	// Broken child: the worktree dir vanishes but its registration remains.
-	// Enumeration is file-based, so the parent still reports it (which is what
-	// feeds parent-of-live-children checks and prune decisions).
+	// Stale child: the worktree dir vanishes but its registration remains.
+	// It is NOT live: counting it would pin the parent MANUAL forever over a
+	// path nothing can act on (the round-1 panel's fix). git worktree prune
+	// owns cleaning the registration itself.
 	if err := os.RemoveAll(wt); err != nil {
 		t.Fatal(err)
 	}
 	f = runner().Facts(repo, time.Now(), 72*time.Hour)
-	if len(f.Children) != 1 {
-		t.Fatalf("broken child must still be enumerated: %v", f.Children)
+	if len(f.Children) != 0 {
+		t.Fatalf("stale child registration must be dropped: %v", f.Children)
 	}
 }
 

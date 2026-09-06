@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,12 @@ import (
 // 200 is comfortably above any realistic personal open-PR count, and hitting
 // it exactly is treated as truncation (unavailable), not a complete answer.
 const searchLimit = 200
+
+// maxBases caps the phase-2 fan-out: repos with open authored PRs. Past the
+// cap the whole PR set degrades to Unavailable (never silently narrowed).
+// 50 covers the realistic personal-fleet ceiling (this account measured 50
+// with open PRs) while bounding the phase; the pool keeps it inside budget.
+const maxBases = 50
 
 // Client runs gh with a budget.
 type Client struct {
@@ -102,30 +109,76 @@ func (c Client) OpenPRHeads() PRHeads {
 
 	login := c.login()
 	p.heads = map[string]map[string]bool{}
+
+	// Bounded, parallel fan-out. The spec's budget is "gh is one call"; the
+	// two-phase shape (forced by gh 2.83's search lacking head fields) makes
+	// it 2 + N. Measured on this account, N was 51 and the serial version
+	// alone blew 150s — so the per-base calls run under a small pool with a
+	// total wall budget and a base cap; exceeding either degrades the whole
+	// set to Unavailable (truncated semantics) rather than silently
+	// narrowing which PRs are known.
+	if len(bases) > maxBases {
+		p.Unavailable = true
+		p.Why = fmt.Sprintf("gh: %d repos with open PRs exceeds the fan-out cap (%d); PR set cannot be trusted as complete", len(bases), maxBases)
+		return p
+	}
+	type baseResult struct {
+		base string
+		prs  []prRow
+		why  string
+	}
+	results := make(chan baseResult, len(bases))
+	deadline := time.After(c.Budget * 4) // total wall: search + all bases
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
 	for base := range bases {
-		out, why := c.run("pr", "list", "-R", base, "--author", "@me",
-			"--state", "open", "--json", "headRefName,headRepository", "--limit", "100")
-		if why != "" {
+		wg.Add(1)
+		go func(base string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-deadline:
+				results <- baseResult{base: base, why: "gh fan-out budget exhausted"}
+				return
+			}
+			defer func() { <-sem }()
+			out, why := c.run("pr", "list", "-R", base, "--author", "@me",
+				"--state", "open", "--json", "headRefName,headRepository", "--limit", "100")
+			if why != "" {
+				results <- baseResult{base: base, why: why}
+				return
+			}
+			var prs []prRow
+			if err := json.Unmarshal([]byte(out), &prs); err != nil {
+				results <- baseResult{base: base, why: fmt.Sprintf("unparseable: %v", err)}
+				return
+			}
+			if len(prs) == 100 {
+				// Per-base truncation is the same silent-narrowing class the
+				// search limit guards against.
+				results <- baseResult{base: base, why: "result limit reached"}
+				return
+			}
+			results <- baseResult{base: base, prs: prs}
+		}(base)
+	}
+	wg.Wait()
+	close(results)
+	for res := range results {
+		if res.why != "" {
 			// One unreadable base poisons the whole set's completeness.
 			p.Unavailable = true
-			p.Why = why
+			p.Why = fmt.Sprintf("gh pr list -R %s: %s", res.base, res.why)
 			p.heads = nil
 			return p
 		}
-		var prs []prRow
-		if err := json.Unmarshal([]byte(out), &prs); err != nil {
-			p.Unavailable = true
-			p.Why = fmt.Sprintf("gh pr list -R %s: unparseable: %v", base, err)
-			p.heads = nil
-			return p
-		}
-		for _, pr := range prs {
+		for _, pr := range res.prs {
 			slug := pr.HeadRepo.NameWithOwner
 			if slug == "" && pr.HeadRepo.Name != "" && login != "" {
 				slug = login + "/" + pr.HeadRepo.Name
 			}
 			if slug == "" {
-				slug = base // same-repo PR with an empty head object
+				slug = res.base // same-repo PR with an empty head object
 			}
 			if p.heads[slug] == nil {
 				p.heads[slug] = map[string]bool{}

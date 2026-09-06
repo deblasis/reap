@@ -6,7 +6,7 @@
 //     flag, staleness signal, and unreadable state lands MANUAL before any
 //     clean row can fire.
 //  2. Deletion reachability is computed from the FULL fact set, never the
-//     displayed row: BLOCKEDClassFact is set whenever any BLOCKED-class fact
+//     displayed row: BlockedClassFact is set whenever any BLOCKED-class fact
 //     exists, so --include/--override-manual gating cannot be fooled by a
 //     more-specific MANUAL row shadowing it (the nested-clone-is-untracked
 //     class of bug).
@@ -56,8 +56,9 @@ var judgmentClass = map[string]bool{
 }
 
 // Input carries every fact the matrix consumes. Nil optionals mean "not
-// applicable", never "checked and clean": a nil Git on a git kind is a
-// caller bug, and the classifier's kinds make the applicability explicit.
+// applicable", never "checked and clean": applicable-but-nil facts are
+// routed to facts-unavailable by Decide, and the classifier's kinds make
+// applicability explicit.
 type Input struct {
 	Path       string
 	Kind       classify.Kind
@@ -86,12 +87,16 @@ type Input struct {
 // Verdict is the decision plus everything downstream (plan, apply, report)
 // needs: the machine-stable reasonCode, human prose, a full-fact-set hint
 // that never advertises a gate the tool will refuse, and the reachability
-// classification.
+// classification. OpenPRSlug/OpenPRBranch carry the matched join so callers
+// never re-implement it (a duplicated join drifted once already).
 type Verdict struct {
 	Verdict string
 	Code    string
 	Reason  string
 	Hint    string
+
+	OpenPRSlug   string
+	OpenPRBranch string
 
 	// BlockedClassFact is non-empty when any BLOCKED-class fact is present,
 	// regardless of which row displayed. The one exception is the orphaned
@@ -103,9 +108,10 @@ type Verdict struct {
 }
 
 // Decide applies the matrix. Row order is the spec's and is load-bearing:
-// orphan detection (file-based, structural) outranks unreadable-state rows;
-// every failure row outranks every clean row; BLOCKED-class rows outrank
-// SAFE so shadowing can only ever DISPLAY a weaker row, never reach one.
+// KEEP rails first; orphan detection (file-based, structural) outranks
+// unreadable-state rows; every failure row outranks every clean row;
+// BLOCKED-class rows outrank SAFE so shadowing can only ever DISPLAY a
+// weaker row, never reach one.
 func Decide(in Input) Verdict {
 	v := Verdict{Verdict: Manual}
 
@@ -115,11 +121,14 @@ func Decide(in Input) Verdict {
 
 	switch {
 	case in.Held:
-		return keep(in, "held-by-user", "held by user", "reap unhold to release")
+		return keep("held-by-user", "held by user", "reap unhold to release")
 	case in.Protected:
-		return keep(in, "protected", "protected path", "config.json protect list")
+		return keep("protected", "protected path", "config.json protect list")
 	case in.IsReparse:
-		return keep(in, "protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable")
+		// A junction/symlink candidate is the link, not the target: facts
+		// harvested through it are evidence about a DIFFERENT path, and the
+		// walk never ran, so activity and size are zero-value sentinels.
+		return keep("protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable")
 	case in.IncodaLive:
 		return v.set(Active, "incoda-live", "live incoda ticket", "")
 	}
@@ -144,6 +153,29 @@ func Decide(in Input) Verdict {
 		return v.set(Manual, "state-unreadable",
 			"repo state unreadable ("+shortWhy(in.Git.Why)+")",
 			"fix the repo state (locked index? corrupt .git?), rerun scan")
+	}
+	// Partial walk ranks with the other unreadable-state rows, ABOVE the
+	// judgment rows: a size that is only a lower bound must not display a
+	// judgment row whose hint advertises --override-manual over unread
+	// evidence.
+	if in.SizePartial {
+		return v.set(Manual, "state-unreadable", "size walk incomplete (lower bound)",
+			"rerun scan; a path was unreadable under this dir")
+	}
+
+	// Applicable-but-nil facts degrade to ignorance, never vacuous
+	// cleanliness: --no-jj (or jj missing) on a jj kind must not let the
+	// clean rows read the jj side as clean by omission. Mirrors the gh
+	// treatment (nil PRHeads -> gh-unavailable).
+	if kindNeedsGit(in.Kind) && in.Git == nil {
+		return v.set(Manual, "facts-unavailable",
+			"git facts unavailable (git missing or disabled)",
+			"install git, or rerun with the git phase enabled")
+	}
+	if kindNeedsJJ(in.Kind) && in.JJ == nil {
+		return v.set(Manual, "facts-unavailable",
+			"jj facts unavailable (jj missing or disabled)",
+			"install jj, or rerun without --no-jj")
 	}
 
 	// Tool-level failures across every fact source.
@@ -170,24 +202,19 @@ func Decide(in Input) Verdict {
 			"delete the children in the same run to unlock this parent")
 	}
 
-	// Partial walk: the size is a lower bound; that is unreadable evidence.
-	if in.SizePartial {
-		return v.set(Manual, "state-unreadable", "size walk incomplete (lower bound)",
-			"rerun scan; a path was unreadable under this dir")
-	}
-
 	if in.Git != nil {
 		switch {
 		case in.Git.Dirty > 0 || in.Git.Untracked > 0:
 			// The row covers tracked-modified AND untracked content: the spec
-			// detail format carries both counts, and untracked-only content is
-			// exactly the "agent parked files here" case the row exists for.
+			// detail format carries both counts, and untracked-only content
+			// is exactly the "agent parked files here" case the row exists
+			// for.
 			return v.set(Blocked, "dirty-files",
 				fmt.Sprintf("%d tracked-modified, %d untracked", in.Git.Dirty, in.Git.Untracked),
-				"commit+push, or reap discard")
+				"commit+push the work")
 		case in.Git.Stashes > 0:
 			return v.set(Blocked, "stashes", fmt.Sprintf("%d stashes", in.Git.Stashes),
-				"push or pop the stash, or reap discard")
+				"push or pop the stash")
 		}
 		if in.Git.Ignored > 0 {
 			gb := float64(in.Git.IgnoredB) / (1 << 30)
@@ -196,28 +223,28 @@ func Decide(in Input) Verdict {
 				gb = float64(in.Git.IgnoredB) / (1 << 20)
 				unit = "MB"
 			}
-			cap := ""
+			capped := ""
 			if in.Git.IgnoredCap {
-				cap = "+"
+				capped = "+"
 			}
 			return v.set(Manual, "ignored-content",
-				fmt.Sprintf("ignored content: %d files, %.1f%s %s", in.Git.Ignored, gb, cap, unit),
+				fmt.Sprintf("ignored content: %d files, %.1f%s %s", in.Git.Ignored, gb, capped, unit),
 				"review the ignored files, then --override-manual")
 		}
 		if in.Git.Unpushed > 0 {
 			return v.set(Blocked, "unpushed-commits",
 				fmt.Sprintf("%d unpushed commits", in.Git.Unpushed),
-				fmt.Sprintf("push origin %s, or reap discard", branchOr(in, "HEAD")))
+				fmt.Sprintf("push origin %s", branchOr(in, "HEAD")))
 		}
 		if in.Git.ReflogOnly > 0 {
 			return v.set(Blocked, "unpushed-reflog",
 				fmt.Sprintf("%d reflog-only commits, expire in %dd; pushing clears nothing", in.Git.ReflogOnly, in.Git.ExpireDays),
-				fmt.Sprintf("reflog residue: expires in %dd; wait, or reap discard", in.Git.ExpireDays))
+				fmt.Sprintf("reflog residue: expires in %dd; wait it out", in.Git.ExpireDays))
 		}
 		if in.Git.NoRemote {
 			return v.set(Blocked, "no-remote",
 				"no remote configured, work exists only here",
-				"add a remote or bundle the work, or reap discard")
+				"add a remote or bundle the work")
 		}
 		if in.Git.RemoteStale {
 			return v.set(Manual, "remote-stale",
@@ -231,6 +258,7 @@ func Decide(in Input) Verdict {
 				"check gh auth, rerun scan")
 		}
 		if slug, branch := in.openPR(); slug != "" {
+			v.OpenPRSlug, v.OpenPRBranch = slug, branch
 			return v.set(Blocked, "open-pr",
 				fmt.Sprintf("open PR uses branch %s (%s)", branch, slug),
 				"PR is open; keep until merged or closed")
@@ -246,7 +274,7 @@ func Decide(in Input) Verdict {
 		if in.JJ.UnpushedChanges > 0 {
 			return v.set(Blocked, "jj-unpushed",
 				fmt.Sprintf("%d jj changes not on any remote", in.JJ.UnpushedChanges),
-				"jj git push, or reap discard")
+				"jj git push the work")
 		}
 		if in.JJ.RemoteStale {
 			return v.set(Manual, "jj-remote-stale", "jj remote bookmarks stale",
@@ -298,17 +326,13 @@ func (v *Verdict) set(verdict, code, reason, hint string) Verdict {
 	v.Hint = hint
 	// Shadow-aware hints: a judgment row that shadows a BLOCKED-class fact
 	// must not advertise the override as if it were unblocked.
-	if v.BlockedClassFact != "" && v.OrphanedCarveOut && hint != "" {
-		if !strings.Contains(hint, "hardened confirm") {
-			v.Hint = "also: " + v.BlockedClassFact + "; " + hint
-		}
-	} else if v.BlockedClassFact != "" && v.Verdict == Manual && judgmentClass[code] && hint != "" {
+	if v.BlockedClassFact != "" && v.Verdict == Manual && judgmentClass[code] && hint != "" {
 		v.Hint = "also: " + v.BlockedClassFact + "; resolve that first, then " + hint
 	}
 	return *v
 }
 
-func keep(in Input, code, reason, hint string) Verdict {
+func keep(code, reason, hint string) Verdict {
 	return Verdict{Verdict: Keep, Code: code, Reason: reason, Hint: hint}
 }
 
@@ -411,6 +435,31 @@ func liveChildren(in Input) int {
 	return n
 }
 
+// kindNeedsGit reports whether a kind's verdict requires git facts. A nil Git
+// on these kinds is unavailable evidence (git missing, disabled), never
+// "checked and clean". Split-layout jj repos WITHOUT a git backend are not
+// in this set: git facts are not applicable there, and running git would
+// only produce a bogus state-unreadable shadow over the jj rows.
+func kindNeedsGit(k classify.Kind) bool {
+	switch k {
+	case classify.KindGitRepo, classify.KindGitWorktree,
+		classify.KindJJRepo, // colocated repos carry a git backend
+		classify.KindJJWorkspace:
+		return true
+	}
+	return false
+}
+
+// kindNeedsJJ: jj kinds require jj facts. A git-only repo does not.
+func kindNeedsJJ(k classify.Kind) bool {
+	switch k {
+	case classify.KindJJRepo, classify.KindJJWorkspace,
+		classify.KindJJWorkspaceOrphaned:
+		return true
+	}
+	return false
+}
+
 func factsUnavailableWhy(in Input) string {
 	if in.Git != nil && in.Git.FactsUnavailable {
 		return shortWhy(in.Git.Why)
@@ -449,13 +498,16 @@ type LineageGroup struct {
 	Members []string
 }
 
-// LineageGroups groups entries with the same origin and an identical
-// unpushed count above threshold.
-func LineageGroups(entries []struct {
+// LineageEntry is the input shape for LineageGroups.
+type LineageEntry struct {
 	Path     string
 	Origin   string
 	Unpushed int
-}, threshold int) []LineageGroup {
+}
+
+// LineageGroups groups entries with the same origin and an identical
+// unpushed count above threshold.
+func LineageGroups(entries []LineageEntry, threshold int) []LineageGroup {
 	type key struct {
 		origin string
 		count  int

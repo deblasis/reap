@@ -129,7 +129,41 @@ func Load(dir string) (Config, error) {
 	if len(cfg.Roots) == 0 {
 		return Default(), fmt.Errorf("%s: roots must not be empty (refusing to scan nothing)", ConfigPath(dir))
 	}
+	if err := cfg.Thresholds.validate(); err != nil {
+		return Default(), fmt.Errorf("%s: %w", ConfigPath(dir), err)
+	}
 	return cfg, nil
+}
+
+// validate refuses threshold typos that would mint false SAFEs wholesale:
+// scratch-safe-days 0 makes every scratch dir SAFE at any age, and an
+// inverted manual/safe pair silently swaps the tiers.
+func (t Thresholds) validate() error {
+	if t.ActiveHours <= 0 {
+		return fmt.Errorf("thresholds: active-hours must be > 0, got %d", t.ActiveHours)
+	}
+	if t.ScratchManualDays <= 0 || t.ScratchSafeDays < t.ScratchManualDays {
+		return fmt.Errorf("thresholds: need 0 < scratch-manual-days (%d) <= scratch-safe-days (%d)",
+			t.ScratchManualDays, t.ScratchSafeDays)
+	}
+	if t.RemoteStaleHours <= 0 {
+		return fmt.Errorf("thresholds: remote-stale-hours must be > 0, got %d", t.RemoteStaleHours)
+	}
+	if t.QuarantineCapGB <= 0 || t.QuarantineRetentionD <= 0 || t.QuarantineMargin < 1 {
+		return fmt.Errorf("thresholds: quarantine-cap-gb (%v), quarantine-retention-days (%d) and quarantine-margin >= 1 (%v) required",
+			t.QuarantineCapGB, t.QuarantineRetentionD, t.QuarantineMargin)
+	}
+	if t.MinFreeMB <= 0 {
+		return fmt.Errorf("thresholds: min-free-mb must be > 0, got %d", t.MinFreeMB)
+	}
+	for name, s := range map[string]string{
+		"git-budget": t.GitBudget, "jj-budget": t.JJBudget, "gh-budget": t.GHBudget, "fetch-budget": t.FetchBudget,
+	} {
+		if _, err := time.ParseDuration(s); err != nil {
+			return fmt.Errorf("thresholds: %s %q: %w", name, s, err)
+		}
+	}
+	return nil
 }
 
 // Save writes the config atomically (temp file + rename) so a crash mid-write

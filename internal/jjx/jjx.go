@@ -55,18 +55,22 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// any remote bookmark reaches, with EMPTY commits filtered out. The filter
 	// is the whole game: jj keeps a standing (empty) working-copy change, so
 	// without it every jj repo on earth would verdict BLOCKED forever. A dirty
-	// working copy makes @ non-empty and counts (verified against jj 0.44);
-	// described-but-empty commits are bookkeeping, not work. Pinned revset and
-	// template:
-	//   jj log -r '::@ ~ ::remote_bookmarks()' --no-graph \
-	//        -T 'if(empty, "", commit_id ++ "\n")'
-	out, err := r.run(dir, "log", "-r", "::@ ~ ::remote_bookmarks()", "--no-graph", "-T", `if(empty, "", commit_id ++ "\n")`)
+	// working copy makes @ non-empty and counts — which REQUIRES the snapshot
+	// (--ignore-working-copy would hide unsaved working-copy edits from ::@).
+	// The snapshot rewrites op_heads, i.e. reap's own read freshens the
+	// activity it measures, so the mtimes are captured before and restored
+	// after: honest facts AND no self-poisoning.
+	restore := captureOpHeads(dir)
+	out, err := r.runSnapshotting(dir, "log", "-r", "::@ ~ ::remote_bookmarks()", "--no-graph", "-T", `if(empty, "", commit_id ++ "\n")`)
 	if err != nil {
+		restore()
 		f.Unavailable = true
 		f.Why = fmt.Sprintf("jj log: %v", err)
 		return f
 	}
 	f.UnpushedChanges = len(nonEmpty(out))
+	// Metadata-only reads below must not snapshot: --ignore-working-copy.
+	restore()
 
 	// Children: workspace list prints `<name>: <relative-path> <change-id>...`
 	// (verified 0.44). The path is the first token after ": ", relative to the
@@ -108,6 +112,33 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	return f
 }
 
+// captureOpHeads records op-heads file mtimes and returns a restore func.
+// Called around any jj invocation that snapshots; the restore undoes the
+// mtime freshening so reap's own reads never count as repo activity.
+func captureOpHeads(dir string) func() {
+	heads := filepath.Join(dir, ".jj", "repo", "op_heads")
+	entries, err := os.ReadDir(heads)
+	if err != nil {
+		return func() {}
+	}
+	type stamp struct {
+		path string
+		at   time.Time
+	}
+	var stamps []stamp
+	for _, e := range entries {
+		p := filepath.Join(heads, e.Name())
+		if fi, err := os.Stat(p); err == nil {
+			stamps = append(stamps, stamp{p, fi.ModTime()})
+		}
+	}
+	return func() {
+		for _, s := range stamps {
+			os.Chtimes(s.path, s.at, s.at)
+		}
+	}
+}
+
 // WorkspaceForget deregisters a workspace from its parent (apply path; must
 // succeed before rm per the spec).
 func (r Runner) WorkspaceForget(parent, name string) error {
@@ -116,9 +147,27 @@ func (r Runner) WorkspaceForget(parent, name string) error {
 }
 
 func (r Runner) run(dir string, args ...string) (string, error) {
+	return r.runFlags([]string{"--ignore-working-copy"}, dir, args...)
+}
+
+// runSnapshotting runs WITHOUT --ignore-working-copy: the one query that
+// must see the working copy as it stands (push state). Facts() wraps every
+// snapshotting call with op-heads mtime restore.
+func (r Runner) runSnapshotting(dir string, args ...string) (string, error) {
+	return r.runFlags(nil, dir, args...)
+}
+
+func (r Runner) runFlags(prefix []string, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.Budget)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "jj", append([]string{"-R", dir}, args...)...)
+	// --ignore-working-copy by default: read-only queries must not snapshot
+	// the working copy (every snapshot rewrites op_heads and freshens the
+	// activity reap measures). The push-state query opts back IN to
+	// snapshotting (it must see a dirty @) and restores op-heads mtimes
+	// around itself; every other call stays lock-free-read-only.
+	full := append(append([]string{}, prefix...), "-R", dir)
+	full = append(full, args...)
+	cmd := exec.CommandContext(ctx, "jj", full...)
 	// cwd = the repo: jj prints workspace paths RELATIVE TO THE CWD, and the
 	// parser below resolves them against dir. Running from anywhere else
 	// makes the same repo produce different output depending on where reap

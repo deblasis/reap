@@ -244,15 +244,11 @@ func TestCleanPushedSafe(t *testing.T) {
 }
 
 func TestLineageGroups(t *testing.T) {
-	entries := []struct {
-		Path     string
-		Origin   string
-		Unpushed int
-	}{
-		{`C:\a`, "deblasis/wintty", 2286},
-		{`C:\b`, "deblasis/wintty", 2286},
-		{`C:\c`, "deblasis/wintty", 12},
-		{`C:\d`, "deblasis/other", 2286},
+	entries := []LineageEntry{
+		{Path: `C:\a`, Origin: "deblasis/wintty", Unpushed: 2286},
+		{Path: `C:\b`, Origin: "deblasis/wintty", Unpushed: 2286},
+		{Path: `C:\c`, Origin: "deblasis/wintty", Unpushed: 12},
+		{Path: `C:\d`, Origin: "deblasis/other", Unpushed: 2286},
 	}
 	groups := LineageGroups(entries, 100)
 	if len(groups) != 1 {

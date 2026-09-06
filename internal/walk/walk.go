@@ -30,8 +30,15 @@ type DirInfo struct {
 	MaxMtime time.Time // walk-derived; future mtimes clamped to now
 	Clamped  int       // files whose mtime was in the future and got clamped
 	Partial  bool      // a walk error occurred; size is a lower bound
+	// IsReparse marks a candidate that is itself a junction/symlink: Roots
+	// surfaces it WITHOUT walking it, so every other field is the zero value
+	// and the verdict must be KEEP, never a verdict computed through the
+	// link (a junction into a clean repo would otherwise harvest the
+	// target's facts and reach SAFE on evidence about a different path).
+	IsReparse bool
 	// NestedVCS lists ".git"/".jj" markers found BELOW the root (depth >= 1),
-	// relative to the root. Presence of any routes the dir MANUAL
+	// relative to the root — including submodule .git FILES, which porcelain
+	// hides behind ignore=dirty. Presence of any routes the dir MANUAL
 	// nested-repositories in the verdict matrix.
 	NestedVCS []string
 }
@@ -95,6 +102,13 @@ func Entry(root, path string, now time.Time) DirInfo {
 				}
 			}
 			return nil
+		}
+		// A ".git" FILE at depth >= 1 is a submodule's gitdir pointer: the
+		// submodule's own porcelain is invisible to the superproject (worse
+		// behind ignore=dirty), so this marker is the only signal the walk
+		// gets. The candidate's own linked .git (depth 0) is not nested.
+		if rel, rerr := filepath.Rel(path, p); rerr == nil && d.Name() == ".git" && filepath.Dir(rel) != "." {
+			info.NestedVCS = append(info.NestedVCS, rel)
 		}
 		fi, serr := d.Info()
 		if serr != nil {
@@ -161,15 +175,23 @@ func Roots(roots []string, now time.Time, workers int) []DirInfo {
 		}
 		for _, c := range children {
 			// A candidate that is itself a reparse point is surfaced, not
-			// walked: the verdict matrix gives reparse candidates KEEP, and
-			// their size is the link, not the target tree.
+			// walked: IsReparse is carried on the DirInfo so the verdict
+			// layer can KEEP it without ever reading through the link, and
+			// the stat-error flavor stays MANUAL via Partial.
 			rep, rerr := IsReparse(filepath.Join(root, c.Name()), c)
-			if rerr != nil || rep || !c.IsDir() {
-				if rerr != nil || rep {
-					mu.Lock()
-					out = append(out, DirInfo{Path: filepath.Join(root, c.Name()), Root: root, Partial: rerr != nil})
-					mu.Unlock()
-				}
+			if rerr != nil {
+				mu.Lock()
+				out = append(out, DirInfo{Path: filepath.Join(root, c.Name()), Root: root, Partial: true})
+				mu.Unlock()
+				continue
+			}
+			if rep {
+				mu.Lock()
+				out = append(out, DirInfo{Path: filepath.Join(root, c.Name()), Root: root, IsReparse: true})
+				mu.Unlock()
+				continue
+			}
+			if !c.IsDir() {
 				continue
 			}
 			jobs <- job{root: root, dir: filepath.Join(root, c.Name())}

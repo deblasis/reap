@@ -69,7 +69,18 @@ const ignoredBytesCap = 64
 func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration) Facts {
 	var f Facts
 
-	// Status: repo-level failure if it cannot run.
+	// Status: repo-level failure if it cannot run. A live index.lock is
+	// detected STRUCTURALLY, before any exec: with optional locks disabled
+	// (below) git never takes or waits on that lock, so the only honest way
+	// to see "a concurrent git holds the index" is to look for the file.
+	if common, ok := gitCommonDir(dir); ok {
+		if _, err := os.Stat(filepath.Join(common, "index.lock")); err == nil {
+			f.StateUnreadable = true
+			f.Why = "index.lock present (a concurrent git is mid-write)"
+			f.Children = fileChildren(dir)
+			return f
+		}
+	}
 	out, err := r.run(dir, r.GitBudget, "status", "--porcelain", "--ignored")
 	if err != nil {
 		f.StateUnreadable = true
@@ -79,12 +90,19 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	}
 	f.parseStatus(dir, out, now)
 
-	// rev-list decomposition: also repo-level when unreadable.
+	// rev-list decomposition: also repo-level when unreadable, EXCEPT the
+	// unborn-HEAD repo (fresh `git init`, no commits yet): rev-list over
+	// HEAD fails there, but that is not unreadable state — there is simply
+	// nothing to push. Verified with zero unpushed and normal rows below.
 	if err := r.unpushed(dir, &f); err != nil {
-		f.StateUnreadable = true
-		f.Why = fmt.Sprintf("git rev-list: %v", err)
-		f.Children = fileChildren(dir)
-		return f
+		if unborn, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr == nil && strings.TrimSpace(unborn) == "" {
+			f.Unpushed, f.ReflogOnly = 0, 0
+		} else {
+			f.StateUnreadable = true
+			f.Why = fmt.Sprintf("git rev-list: %v", err)
+			f.Children = fileChildren(dir)
+			return f
+		}
 	}
 
 	// Everything below is fact-level: a failure weakens to FactsUnavailable.
@@ -201,10 +219,14 @@ func (r Runner) run(dir string, budget time.Duration, args ...string) (string, e
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	// Deliberately NOT setting GIT_OPTIONAL_LOCKS=0: lockless status would
-	// sail past a live index.lock and read a possibly-stale index, when the
-	// spec's taxonomy demands a locked index read as StateUnreadable. Taking
-	// the shared index lock briefly is the honest, fail-safe direction.
+	// GIT_OPTIONAL_LOCKS=0: reap must never WRITE the index while reading.
+	// git status opportunistically refreshes it, and reap's own write then
+	// freshens the NEXT scan's walk-derived activity floor — a repo scanned
+	// twice 20 seconds apart flipped SAFE to ACTIVE from exactly this. The
+	// locked-index taxonomy is preserved structurally: Facts stats
+	// index.lock before any exec, so a concurrent git mid-write still reads
+	// StateUnreadable without reap having to take the lock to notice.
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("timeout after %s", budget)
@@ -216,7 +238,11 @@ func (r Runner) run(dir string, budget time.Duration, args ...string) (string, e
 }
 
 // parseStatus splits porcelain --ignored output into the three counts and
-// sizes the ignored entries (capped).
+// sizes the ignored entries (capped). The candidate's OWN .jj marker is
+// excluded from the ignored count: jj writes .jj/.gitignore containing /*,
+// so porcelain reports "!! .jj/" on every colocated repo, and counting the
+// VCS's own marker would make clean-pushed structurally unreachable for the
+// entire jj population. User artifacts under ignore rules still count.
 func (f *Facts) parseStatus(dir, out string, now time.Time) {
 	ignored := 0
 	var ignoredPaths []string
@@ -227,9 +253,13 @@ func (f *Facts) parseStatus(dir, out string, now time.Time) {
 		xy, path := line[:2], line[3:]
 		switch {
 		case xy == "!!":
+			p := trimQuotes(path)
+			if p == ".jj" || p == ".jj/" {
+				continue
+			}
 			ignored++
 			if len(ignoredPaths) < ignoredBytesCap {
-				ignoredPaths = append(ignoredPaths, trimQuotes(path))
+				ignoredPaths = append(ignoredPaths, p)
 			}
 		case strings.Contains(xy, "?"):
 			f.Untracked++
@@ -279,7 +309,15 @@ func (r Runner) unpushed(dir string, f *Facts) error {
 	if err != nil {
 		return err
 	}
-	branchReach, err := r.revlistDates(dir, "--branches", "--tags", "HEAD")
+	// Branch-reachable includes the stash tip when one exists (refs/stash
+	// is a ref like any other; leaving it out misfiles stashed commits as
+	// reflog-only residue with a bogus expiry story). Probe first so
+	// stash-less repos do not error on a missing ref.
+	refs := []string{"--branches", "--tags", "HEAD"}
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "refs/stash"); err == nil && strings.TrimSpace(out) != "" {
+		refs = append(refs, "refs/stash")
+	}
+	branchReach, err := r.revlistDates(dir, refs...)
 	if err != nil {
 		return err
 	}
@@ -365,9 +403,17 @@ func fileChildren(dir string) []string {
 		wtPath := strings.TrimSuffix(strings.TrimSpace(string(raw)), "/.git")
 		wtPath = strings.TrimSuffix(wtPath, `\`+`.git`)
 		wtPath = longPath(filepath.Clean(wtPath))
-		if wtPath != "" {
-			out = append(out, wtPath)
+		if wtPath == "" {
+			continue
 		}
+		// LIVE registered children only: a registration whose worktree dir
+		// is gone (rm without prune) is stale metadata, not a child —
+		// counting it would pin the parent MANUAL parent-of-live-children
+		// forever over a path nothing can act on.
+		if _, err := os.Stat(wtPath); err != nil {
+			continue
+		}
+		out = append(out, wtPath)
 	}
 	sort.Strings(out)
 	return out

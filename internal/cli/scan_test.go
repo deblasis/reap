@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -153,4 +154,99 @@ func TestScanRootsNarrowRefusesUnconfigured(t *testing.T) {
 	if code := cmdScan([]string{"--roots", root, "--no-gh"}, &bytes.Buffer{}, &bytes.Buffer{}); code != ExitOK {
 		t.Fatalf("configured root narrowed: exit %d", code)
 	}
+}
+
+// The round-1 panel's live-proven blocker, pinned end to end: a junction
+// child of a configured root must verdict KEEP/protected, never a verdict
+// computed through the link (it verdicted SAFE/scratch-idle with a
+// 106751-day age before the IsReparse wiring existed).
+func TestScanJunctionCandidateKeeps(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("junction test is Windows-specific")
+	}
+	root, _ := scanFixture(t)
+	target := filepath.Join(filepath.Dir(root), "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ps := `New-Item -ItemType Junction -Path '` + filepath.Join(root, "link") + `' -Target '` + target + `' | Out-Null`
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-Command", ps)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("cannot create junction: %v %s", err, out)
+	}
+
+	var out bytes.Buffer
+	if code := cmdScan([]string{"--json", "--no-gh"}, &out, &bytes.Buffer{}); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	var rep struct {
+		Entries []struct {
+			Path       string `json:"path"`
+			Verdict    string `json:"verdict"`
+			ReasonCode string `json:"reasonCode"`
+			AgeDays    int    `json:"ageDays"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range rep.Entries {
+		if filepath.Base(e.Path) == "link" {
+			if e.Verdict != "KEEP" || e.ReasonCode != "protected" {
+				t.Fatalf("junction candidate = %s/%s, want KEEP/protected", e.Verdict, e.ReasonCode)
+			}
+			return
+		}
+	}
+	t.Fatal("junction candidate missing from scan")
+}
+
+// Missing tool degrades to ignorance, never the "report as bug" fallback:
+// with git absent from PATH, a git repo past the active window must verdict
+// MANUAL facts-unavailable (a fresh repo verdicts ACTIVE first — row 3
+// outranks degradation, which is safe, just not what this test isolates).
+func TestScanGitMissingDegradesToFactsUnavailable(t *testing.T) {
+	root, _ := scanFixture(t)
+	// Age the repo past the 48h window so the active row cannot shadow:
+	// every FILE under it (the walk's activity is max file mtime, so aging
+	// the dir alone leaves fresh files in charge).
+	past := time.Now().AddDate(0, 0, -3)
+	repo := filepath.Join(root, "repo")
+	filepath.WalkDir(repo, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+	empty := t.TempDir() // a PATH with no git
+
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	// cmdScan resolves gitx.Available() internally; simulate absence by
+	// pointing PATH at an empty dir through the environment the test process
+	// already fixed. Since cmdScan caches nothing, run with PATH stripped.
+	old := os.Getenv("PATH")
+	t.Setenv("PATH", empty)
+	defer t.Setenv("PATH", old)
+	code := cmdScan([]string{"--json", "--no-gh"}, &out, &stderr)
+	_ = code
+	var rep struct {
+		Entries []struct {
+			Path       string `json:"path"`
+			Verdict    string `json:"verdict"`
+			ReasonCode string `json:"reasonCode"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	for _, e := range rep.Entries {
+		if filepath.Base(e.Path) == "repo" {
+			if e.Verdict != "MANUAL" || e.ReasonCode != "facts-unavailable" {
+				t.Fatalf("repo with git missing = %s/%s, want MANUAL/facts-unavailable", e.Verdict, e.ReasonCode)
+			}
+			return
+		}
+	}
+	t.Fatalf("repo entry missing under stripped PATH:\n%s", out.String())
 }

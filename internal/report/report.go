@@ -16,6 +16,9 @@ import (
 )
 
 // Entry is one directory in a scan (the scan --json "entries" element).
+// openPR always serializes and the nullable fields serialize as null (not
+// omitted), per the spec's schema example: consumers must never distinguish
+// "absent" from "false"/"none".
 type Entry struct {
 	Path               string    `json:"path"`
 	Zone               string    `json:"zone"`
@@ -37,10 +40,10 @@ type Entry struct {
 	Stashes            int       `json:"stashes,omitempty"`
 	Unpushed           int       `json:"unpushed,omitempty"`
 	UnpushedReflogOnly int       `json:"unpushedReflogOnly,omitempty"`
-	OpenPR             bool      `json:"openPR,omitempty"`
-	LineageGroup       string    `json:"lineageGroup,omitempty"`
+	OpenPR             bool      `json:"openPR"`
+	LineageGroup       *string   `json:"lineageGroup"`
 	Held               bool      `json:"held"`
-	DowngradedBy       string    `json:"downgradedBy,omitempty"`
+	DowngradedBy       *string   `json:"downgradedBy"`
 	BlockedClassFact   string    `json:"blockedClassFact,omitempty"`
 	OrphanedCarveOut   bool      `json:"orphanedCarveOut,omitempty"`
 }
@@ -77,11 +80,12 @@ type Totals struct {
 
 // ScanReport is the whole scan --json document.
 type ScanReport struct {
-	Generated time.Time     `json:"generated"`
-	Roots     []RootSummary `json:"roots"`
-	Entries   []Entry       `json:"entries"`
-	Excluded  int           `json:"excludedBelowMinGB"`
-	Totals    Totals        `json:"totals"`
+	Generated       time.Time     `json:"generated"`
+	Roots           []RootSummary `json:"roots"`
+	Entries         []Entry       `json:"entries"`
+	Excluded        int           `json:"excludedBelowMinGB"`
+	UnreadableRoots []string      `json:"unreadableRoots"`
+	Totals          Totals        `json:"totals"`
 }
 
 func gb(b int64) float64 { return float64(b) / (1 << 30) }
@@ -198,6 +202,15 @@ func (r *ScanReport) Table(w io.Writer) {
 		fmt.Fprintln(w)
 	}
 	fmt.Fprintf(w, "%s\n", dim("sizes are logical; hardlinked content may reclaim less (zig lane cache shares bytes)"))
+	// Per-reason breakdown in the printed totals too: bucket inflation (one
+	// row quietly owning half of MANUAL) must be visible to the human at the
+	// screen, not only to agents reading --json.
+	for _, bt := range r.Totals.ByReason {
+		fmt.Fprintf(w, "%7.1f GB  %-24s %d dirs\n", bt.SizeGB, bt.Code, bt.Dirs)
+	}
+	if r.Totals.Errors > 0 {
+		fmt.Fprintf(w, "%s\n", dim(fmt.Sprintf("%d dirs had walk errors (see sizePartial entries)", r.Totals.Errors)))
+	}
 	if r.Excluded > 0 {
 		fmt.Fprintf(w, "%s\n", dim(fmt.Sprintf("%d dirs below --min-gb excluded from this listing (totals count them)", r.Excluded)))
 	}
