@@ -1,0 +1,424 @@
+// Package gitx collects every git fact the verdict matrix consumes, through
+// exec with per-call budgets. Its contract is the taxonomy from the design
+// spec: a repo-level failure (status or rev-list cannot run: locked index,
+// corrupt .git) is StateUnreadable; any other failure (git missing, timeout,
+// unparseable output) is FactsUnavailable. Neither may ever read as "clean":
+// missing evidence weakens a verdict toward MANUAL, never toward SAFE.
+package gitx
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/deblasis/reap/internal/walk"
+)
+
+// Runner executes git with budgets. The zero Runner refuses to run (zero
+// budgets mean "cannot enforce a bound", and an unbounded exec can hang a
+// one-shot scan on a single wedged repo).
+type Runner struct {
+	GitBudget   time.Duration
+	FetchBudget time.Duration
+}
+
+// Facts is the full git fact set for one candidate directory. The zero value
+// with both failure flags false and real counts means "read successfully";
+// callers must check the failure flags before trusting any count.
+type Facts struct {
+	Dirty       int
+	Untracked   int
+	Ignored     int
+	IgnoredCap  bool  // ignored-bytes walk hit its entry cap (lower bound)
+	IgnoredB    int64 // bytes under ignored entries
+	Stashes     int
+	Unpushed    int    // branch/tag/HEAD-reachable commits not on any remote
+	ReflogOnly  int    // commits reachable only via reflog (post-reset, pre-rebase)
+	ExpireDays  int    // days until the oldest reflog-only commit ages out (90d default expiry)
+	Branch      string // current branch name, "(detached)" on a detached HEAD
+	Upstream    string // upstream tracking ref, empty when none
+	NoRemote    bool
+	RemoteStale bool      // FETCH_HEAD older than the caller's threshold
+	LastFetch   time.Time // zero when no FETCH_HEAD exists
+	HEAD        string
+	LastCommit  time.Time
+	Children    []string // registered worktree paths (file-based enumeration, includes broken)
+	// Taxonomy. StateUnreadable outranks FactsUnavailable: the matrix's
+	// state-unreadable row must shadow facts-unavailable, not the reverse.
+	StateUnreadable  bool
+	FactsUnavailable bool
+	Why              string
+}
+
+// reflogExpiryDays matches git's default gc.reflogExpire (90 days). It is an
+// approximation for the reason detail, not a correctness claim.
+const reflogExpiryDays = 90
+
+// ignoredBytesCap bounds the per-entry size walk for ignored paths: the
+// verdict only needs presence; the byte detail must not multiply scan time on
+// repos with hundreds of ignored build dirs.
+const ignoredBytesCap = 64
+
+// Facts collects the fact set for dir.
+func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration) Facts {
+	var f Facts
+
+	// Status: repo-level failure if it cannot run.
+	out, err := r.run(dir, r.GitBudget, "status", "--porcelain", "--ignored")
+	if err != nil {
+		f.StateUnreadable = true
+		f.Why = fmt.Sprintf("git status: %v", err)
+		f.Children = fileChildren(dir)
+		return f
+	}
+	f.parseStatus(dir, out, now)
+
+	// rev-list decomposition: also repo-level when unreadable.
+	if err := r.unpushed(dir, &f); err != nil {
+		f.StateUnreadable = true
+		f.Why = fmt.Sprintf("git rev-list: %v", err)
+		f.Children = fileChildren(dir)
+		return f
+	}
+
+	// Everything below is fact-level: a failure weakens to FactsUnavailable.
+	if out, err := r.run(dir, r.GitBudget, "stash", "list"); err == nil {
+		f.Stashes = len(nonEmpty(out))
+	} else {
+		f.FactsUnavailable = true
+		f.Why = fmt.Sprintf("git stash list: %v", err)
+	}
+
+	if out, err := r.run(dir, r.GitBudget, "remote"); err == nil {
+		if len(nonEmpty(out)) == 0 {
+			f.NoRemote = true
+		}
+	} else {
+		f.FactsUnavailable = true
+		f.Why = fmt.Sprintf("git remote: %v", err)
+	}
+
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+		f.Branch = strings.TrimSpace(out)
+	} else {
+		f.FactsUnavailable = true
+		f.Why = fmt.Sprintf("branch: %v", err)
+	}
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); err == nil {
+		f.Upstream = strings.TrimSpace(out)
+	}
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "HEAD"); err == nil {
+		f.HEAD = strings.TrimSpace(firstLine(out))
+	}
+	if out, err := r.run(dir, r.GitBudget, "log", "-1", "--format=%cI"); err == nil {
+		if ts, err := time.Parse(time.RFC3339, strings.TrimSpace(firstLine(out))); err == nil {
+			f.LastCommit = ts
+		}
+	}
+
+	// Remote freshness: FETCH_HEAD lives in the COMMON dir, which a linked
+	// worktree's per-worktree --git-path does not resolve for shared files,
+	// so resolve the common dir directly (file-based, works even when the
+	// repo is otherwise broken).
+	if common, ok := gitCommonDir(dir); ok {
+		if fi, err := os.Stat(filepath.Join(common, "FETCH_HEAD")); err == nil {
+			f.LastFetch = fi.ModTime()
+			f.RemoteStale = now.Sub(fi.ModTime()) > remoteStaleAfter
+		} else {
+			// No FETCH_HEAD: the stalest state there is (cloned but never
+			// fetched, or the marker was pruned).
+			f.RemoteStale = true
+		}
+	}
+
+	f.Children = fileChildren(dir)
+	return f
+}
+
+// FetchPrune runs git fetch --prune under the fetch budget (apply-time
+// strengthening). An error means the caller demotes to remote-stale, never
+// trusts the tracking refs it was about to use.
+func (r Runner) FetchPrune(dir string) error {
+	_, err := r.run(dir, r.FetchBudget, "fetch", "--prune")
+	return err
+}
+
+// WorktreeRemove deregisters and deletes a linked worktree (apply path).
+func (r Runner) WorktreeRemove(dir string) error {
+	_, err := r.run(dir, r.GitBudget, "worktree", "remove", "--force", dir)
+	return err
+}
+
+// WorktreePrune cleans stale registrations after rm-fallback deletions.
+func (r Runner) WorktreePrune(dir string) error {
+	_, err := r.run(dir, r.GitBudget, "worktree", "prune")
+	return err
+}
+
+// RemoteURL returns origin's URL (or ""), used by the gh join.
+func (r Runner) RemoteURL(dir string) string {
+	out, err := r.run(dir, r.GitBudget, "remote", "get-url", "origin")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(firstLine(out))
+}
+
+func (r Runner) run(dir string, budget time.Duration, args ...string) (string, error) {
+	if budget <= 0 {
+		return "", fmt.Errorf("no exec budget configured; refusing to run unbounded")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir, "-c", "gc.auto=0"}, args...)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// Deliberately NOT setting GIT_OPTIONAL_LOCKS=0: lockless status would
+	// sail past a live index.lock and read a possibly-stale index, when the
+	// spec's taxonomy demands a locked index read as StateUnreadable. Taking
+	// the shared index lock briefly is the honest, fail-safe direction.
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("timeout after %s", budget)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+// parseStatus splits porcelain --ignored output into the three counts and
+// sizes the ignored entries (capped).
+func (f *Facts) parseStatus(dir, out string, now time.Time) {
+	ignored := 0
+	var ignoredPaths []string
+	for _, line := range nonEmpty(out) {
+		if len(line) < 4 {
+			continue
+		}
+		xy, path := line[:2], line[3:]
+		switch {
+		case xy == "!!":
+			ignored++
+			if len(ignoredPaths) < ignoredBytesCap {
+				ignoredPaths = append(ignoredPaths, trimQuotes(path))
+			}
+		case strings.Contains(xy, "?"):
+			f.Untracked++
+		default:
+			// Includes renames (R) and copies (C): one entry, one count.
+			f.Dirty++
+		}
+	}
+	f.Ignored = ignored
+	if len(ignoredPaths) == ignored {
+		// Under the cap: exact.
+		for _, p := range ignoredPaths {
+			f.IgnoredB += entrySize(dir, p, now)
+		}
+	} else if len(ignoredPaths) > 0 {
+		f.IgnoredCap = true
+		for _, p := range ignoredPaths {
+			f.IgnoredB += entrySize(dir, p, now)
+		}
+	}
+}
+
+func entrySize(dir, rel string, now time.Time) int64 {
+	p := filepath.Join(dir, filepath.FromSlash(rel))
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	if !fi.IsDir() {
+		return fi.Size()
+	}
+	return walk.Entry(dir, p, now).Bytes
+}
+
+// unpushed decomposes local-only commits:
+//
+//	A = rev-list --all --reflog HEAD --not --remotes   (everything local-only)
+//	B = rev-list --branches --tags HEAD --not --remotes (branch/tag/HEAD reachable)
+//	Unpushed = |B|, ReflogOnly = |A \ B|.
+//
+// Reflog-only is the post-reset / pre-rebase residue: BLOCKED-class (it is
+// real, recoverable work) but with an expiry date, because the house workflow
+// (rebase, force-push, squash-merge, prune) manufactures it constantly and
+// phantom forever-BLOCKED rows would train the user to distrust the screen.
+func (r Runner) unpushed(dir string, f *Facts) error {
+	all, err := r.revlistDates(dir, "--all", "--reflog", "HEAD")
+	if err != nil {
+		return err
+	}
+	branchReach, err := r.revlistDates(dir, "--branches", "--tags", "HEAD")
+	if err != nil {
+		return err
+	}
+	f.Unpushed = len(branchReach)
+	oldest := time.Time{}
+	for sha, date := range all {
+		if _, ok := branchReach[sha]; ok {
+			continue
+		}
+		f.ReflogOnly++
+		if oldest.IsZero() || date.Before(oldest) {
+			oldest = date
+		}
+	}
+	if f.ReflogOnly > 0 && !oldest.IsZero() {
+		days := reflogExpiryDays - int(nowSince(oldest).Hours()/24)
+		if days < 0 {
+			days = 0
+		}
+		f.ExpireDays = days
+	}
+	return nil
+}
+
+// nowSince is a seam for tests; production uses time.Since.
+var nowSince = time.Since
+
+// revlistDates runs rev-list over the given positive refs and returns
+// sha -> commit date for every local-only commit. Argument order matters:
+// positive refs first, then "--not --remotes" last, because --not negates
+// every ref that follows it (the reverse order would negate the positives too
+// and quietly return nothing).
+func (r Runner) revlistDates(dir string, refs ...string) (map[string]time.Time, error) {
+	args := append([]string{"rev-list", "--pretty=format:%H %cI"}, refs...)
+	args = append(args, "--not", "--remotes")
+	out, err := r.run(dir, r.GitBudget, args...)
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]time.Time{}
+	for _, line := range nonEmpty(out) {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue // "commit <sha>" headers from the pretty machinery
+		}
+		sha, ts := fields[0], fields[1]
+		if len(sha) < 7 || !isHex(sha) {
+			continue
+		}
+		if date, err := time.Parse(time.RFC3339, ts); err == nil {
+			m[sha] = date
+		}
+	}
+	return m, nil
+}
+
+// fileChildren enumerates registered worktrees from the common dir WITHOUT
+// exec: .git/worktrees/*/gitdir files name each worktree path, and this
+// enumeration must survive a broken parent (that is the whole point of the
+// parent-of-live-children check).
+func fileChildren(dir string) []string {
+	common, ok := gitCommonDir(dir)
+	if !ok {
+		return nil
+	}
+	wtsDir := filepath.Join(common, "worktrees")
+	entries, err := os.ReadDir(wtsDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(wtsDir, e.Name(), "gitdir"))
+		if err != nil {
+			continue
+		}
+		// The gitdir file names <worktree>/.git with forward slashes and a
+		// possibly 8.3-shortened prefix; Clean + LongPath normalize both so
+		// children compare equal to the paths the user and reap scan.
+		wtPath := strings.TrimSuffix(strings.TrimSpace(string(raw)), "/.git")
+		wtPath = strings.TrimSuffix(wtPath, `\`+`.git`)
+		wtPath = longPath(filepath.Clean(wtPath))
+		if wtPath != "" {
+			out = append(out, wtPath)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// gitCommonDir resolves the common git dir for a repo or linked worktree,
+// reading the .git file rather than exec'ing, so a broken repo still yields
+// its metadata paths.
+func gitCommonDir(dir string) (string, bool) {
+	gitPath := filepath.Join(dir, ".git")
+	if fi, err := os.Stat(gitPath); err == nil && fi.IsDir() {
+		return gitPath, true
+	}
+	raw, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", false
+	}
+	s := strings.TrimSpace(string(raw))
+	s = strings.TrimPrefix(s, "gitdir:")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	s = filepath.FromSlash(s)
+	if !filepath.IsAbs(s) {
+		s = filepath.Join(dir, s)
+	}
+	// Linked worktree gitdir: .../repo/.git/worktrees/<n>; common dir is
+	// .../repo/.git.
+	if i := strings.Index(filepath.ToSlash(s), "/worktrees/"); i >= 0 {
+		return filepath.FromSlash(filepath.ToSlash(s)[:i]), true
+	}
+	return s, true
+}
+
+func nonEmpty(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func trimQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// Available reports whether git can be executed at all.
+func Available() bool {
+	_, err := exec.LookPath("git")
+	return err == nil
+}
