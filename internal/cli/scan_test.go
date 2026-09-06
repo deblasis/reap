@@ -138,8 +138,8 @@ func TestScanTableSections(t *testing.T) {
 			t.Errorf("table missing %q", want)
 		}
 	}
-	if !strings.Contains(s, "scratch-idle") {
-		t.Error("table must show the scratch dir's reason")
+	if !strings.Contains(s, "scratch idle") {
+		t.Error("table must show the scratch dir's reason (prose form)")
 	}
 }
 
