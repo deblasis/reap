@@ -147,6 +147,13 @@ func (c Client) login() string {
 	return strings.TrimSpace(out)
 }
 
+// NewHeads builds a PRHeads from a precomputed slug -> branch-set map. It is
+// the injection point for tests and the fault-injection suite (fake gh
+// output), and for callers that cache a previous run's parsed set.
+func NewHeads(heads map[string]map[string]bool) PRHeads {
+	return PRHeads{heads: heads}
+}
+
 // Holds reports whether (repo slug, branch) has an open authored PR. Always
 // false when the set is unavailable — callers route that case to MANUAL
 // gh-unavailable themselves; Holds is only the positive matcher.
