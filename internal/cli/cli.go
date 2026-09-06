@@ -6,6 +6,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 )
 
 // Exit codes, tool-wide per the spec: 0 success, 120 usage, 122 config/state/
@@ -33,6 +34,16 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return ExitOK
 	case "scan":
 		return cmdScan(rest, stdout, stderr)
+	case "plan":
+		return cmdPlan(rest, stdout, stderr)
+	case "apply":
+		return cmdApply(rest, stdout, stderr, os.Stdin)
+	case "hold":
+		return cmdHold(rest, stdout, stderr)
+	case "unhold":
+		return cmdUnhold(rest, stdout, stderr)
+	case "holds":
+		return cmdHolds(rest, stdout, stderr)
 	case "help", "-h", "--help":
 		usage(stdout)
 		return ExitOK
@@ -56,12 +67,22 @@ func usage(w io.Writer) {
 commands:
   version    print the build version
   scan       walk configured roots and verdict every directory
+  plan       resolve the deletion set (SAFE default; --include widens)
+  apply      re-verify and delete the plan (write-ahead audit; --yes or TTY)
+  hold       pin a path against deletion (reap hold PATH [--for DUR])
+  unhold     release a pin
+  holds      list pins with days remaining
   help       this help
 
-reap scan [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj] [--json]
+reap scan  [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj] [--json]
+reap plan  [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
+           [--include CODE]... [--exclude CODE]... [--json]
+reap apply [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
+           [--include CODE]... [--exclude CODE]... [--override-manual PATH]...
+           [--yes] [--dry-run] [--json]
 
-plan, apply, discard, activity, log, quarantine, hold, unhold, holds,
-doctor land with their milestones (see the design spec's normative grammar).
+discard, activity, log, quarantine, doctor land with their milestones (see
+the design spec's normative grammar).
 `)
 }
 
