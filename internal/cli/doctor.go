@@ -67,9 +67,12 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	for _, s := range quarantine.List(stateDir) {
 		if s.Manifest == nil {
 			states["unverified"]++
+			fmt.Fprintf(stdout, "  bundle %s: unverified (no manifest; verify with git bundle verify before trusting)\n", filepath.Base(s.Dir))
 			continue
 		}
-		states[string(quarantine.Revalidate(gr, s.Manifest))]++
+		st := string(quarantine.Revalidate(gr, s.Manifest))
+		states[st]++
+		fmt.Fprintf(stdout, "  bundle %s: %s\n", filepath.Base(s.Dir), st)
 	}
 	fmt.Fprintf(stdout, "quarantine revalidation: %d verified-ok, %d at-risk, %d unverified\n",
 		states["verified-ok"], states["at-risk"], states["unverified"])
@@ -109,13 +112,14 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "jj: not on PATH (jj facts degrade to facts-unavailable)\n")
 	}
 
-	// Stray healing UNDER apply.lock (spec: heal under the lock or skip
-	// while it is held — a lockless heal can race a live probe's
-	// millisecond rename window and strand a dir that was fine).
+	// Stray healing UNDER apply.lock, HELD ACROSS the heal loop (round-3
+	// fix of the round-2 fold: releasing after TryLock left the heal racing
+	// a live probe's millisecond rename window into HardAborts). Held =>
+	// skip and say so.
 	if healLock, hlerr := lockfile.Open(lockPath); hlerr == nil {
 		free, _ := healLock.TryLock()
-		healLock.Close()
 		if !free {
+			healLock.Close()
 			fmt.Fprintf(stdout, "stray healing: SKIPPED (apply.lock held by a running apply/discard/prune)\n")
 		} else {
 			healed := 0
@@ -143,6 +147,7 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 					}
 				}
 			}
+			healLock.Close()
 			fmt.Fprintf(stdout, "stray .reap-probing dirs healed: %d, parked as .reap-orphaned: %d (restore by renaming back)\n", healed, parked)
 		}
 	}
@@ -159,8 +164,19 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		for _, e := range entries {
 			cand := filepath.Join(r, e.Name())
 			if out, gerr := gr.ForEachReapRef(cand); gerr == nil && len(out) > 0 {
-				fmt.Fprintf(stdout, "stranded refs/reap/* in %s: %d ref(s); reclaim with: git -C %s update-ref -d <ref> && git -C %s gc --prune=now\n",
-					cand, len(out), cand, cand)
+				// Reclaimable bytes: the loose-object store's size (the
+				// scoped gc's upper bound for what the stranded pins hold).
+				var objBytes int64
+				filepath.WalkDir(filepath.Join(cand, ".git", "objects"), func(p string, d os.DirEntry, err error) error {
+					if err == nil && !d.IsDir() {
+						if fi, ierr := d.Info(); ierr == nil {
+							objBytes += fi.Size()
+						}
+					}
+					return nil
+				})
+				fmt.Fprintf(stdout, "stranded refs/reap/* in %s: %d ref(s), ~%d MB objects; reclaim with: git -C %s update-ref -d <ref> && git -C %s gc --prune=now\n",
+					cand, len(out), objBytes>>20, cand, cand)
 			}
 			g := filepath.Join(r, e.Name(), ".git", "index.lock")
 			if fi, gerr := os.Stat(g); gerr == nil && time.Since(fi.ModTime()) > time.Hour {

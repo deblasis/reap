@@ -294,7 +294,7 @@ func TestWiringDiscardE2E(t *testing.T) {
 	if m.Mode != "bundle" || m.BundleBytes == 0 || m.CaptureRef == "" {
 		t.Fatalf("manifest incomplete: %+v", m)
 	}
-	if m.Classes.Dirty < 1 || m.Classes.Refs < 1 {
+	if m.Classes.DirtyFiles < 1 || m.Classes.Refs < 1 {
 		t.Fatalf("manifest classes: %+v", m.Classes)
 	}
 	if fi, err := os.Stat(filepath.Join(session, "bundle.git")); err != nil || fi.Size() == 0 {
@@ -609,6 +609,144 @@ func TestWiringQuarantineRestore(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(dest, "existing.txt")); string(b) != "x" {
 		t.Fatal("restore overwrote the destination")
+	}
+}
+
+// Delta restore survives ROUTINE REMOTE ADVANCEMENT: the remote's tips
+// moving past the recorded base is not a gone base — restore fetches the
+// remote and verifies the prerequisite object exists (round-3 fix of the
+// ls-remote-tips false refusal).
+func TestWiringRestoreRemoteAdvanced(t *testing.T) {
+	base := t.TempDir()
+	bare := filepath.Join(base, "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("pushed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	wireGit(t, repo, "remote", "add", "origin", bare)
+	wireGit(t, repo, "push", "-q", "-u", "origin", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("DIRTY-DELTA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+
+	// State dir rooted at base so the discard fixture is cheap; the repo is
+	// outside scan roots, discard takes explicit paths.
+	stateDir := filepath.Join(base, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWireConfig(t, stateDir, base)
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("discard: %d", code)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("sessions: %v", err)
+	}
+
+	// Advance the remote one commit past the recorded base.
+	adv := filepath.Join(base, "adv")
+	wireGit(t, base, "clone", "-q", bare, adv)
+	if err := os.WriteFile(filepath.Join(adv, "new.txt"), []byte("advanced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, adv, "add", "-A")
+	wireGit(t, adv, "commit", "-q", "-m", "advance")
+	wireGit(t, adv, "push", "-q", "origin", "main")
+
+	dest := filepath.Join(base, "recovered")
+	var out bytes.Buffer
+	if code := cmdQuarantine([]string{"restore", entries[0].Name(), "--to", dest}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("restore after remote advanced: %d (%s)", code, out.String())
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "f.txt")); string(b) != "DIRTY-DELTA" {
+		t.Fatal("advanced-remote delta did not restore")
+	}
+}
+
+// Empty dirs survive a bundle discard + restore cycle (the manifest records
+// them relative; restore recreates them under the destination).
+func TestWiringRestoreEmptyDirs(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "empty-holder")
+	if err := os.MkdirAll(filepath.Join(repo, "keepme"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("discard: %d", code)
+	}
+	entries, _ := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if len(entries) != 1 {
+		t.Fatalf("sessions: %d", len(entries))
+	}
+	dest := filepath.Join(t.TempDir(), "rec")
+	if code := cmdQuarantine([]string{"restore", entries[0].Name(), "--to", dest}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatal("restore failed")
+	}
+	if fi, err := os.Stat(filepath.Join(dest, "keepme")); err != nil || !fi.IsDir() {
+		t.Fatal("empty dir not recreated by restore")
+	}
+}
+
+// prune --json reports failures with the SAME exit band as text (125), not
+// a machine-readable success on partial destruction failure.
+func TestWiringPruneJSONFailure125(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	s := quarantine.SessionDir(stateDir, `C:\x\held`, time.Now().Add(-48*time.Hour))
+	if err := os.MkdirAll(filepath.Join(s, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(s, "sub", "locked.bin")
+	if err := os.WriteFile(victim, []byte("held"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-72 * time.Hour)
+	os.Chtimes(s, old, old)
+
+	// Hold the file open WITHOUT delete-sharing: RemoveAll cannot remove it.
+	held, herr := holdNoDelete(t, victim)
+	if herr != nil {
+		t.Skipf("cannot hold file: %v", herr)
+	}
+	defer held.Close()
+
+	var out bytes.Buffer
+	code := cmdQuarantine([]string{"prune", "--older-than", "24h", "--yes", "--json"}, &out, os.Stderr, os.Stdin)
+	if code != applycmd.ExitQuarantine {
+		t.Fatalf("prune --json with a failed bundle: %d (want 125), out=%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), `"failed":1`) {
+		t.Fatalf("json body must report the failure: %s", out.String())
+	}
+}
+
+// plan --exclude stashes: 'stashes' is a code the verdict engine itself
+// emits, so the closed enum must accept it (round-3 spec finding).
+func TestWiringPlanExcludeStashes(t *testing.T) {
+	_, _ = wireFixture(t)
+	if code := cmdPlan([]string{"--no-gh", "--exclude", "stashes"}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("plan --exclude stashes: %d", code)
 	}
 }
 

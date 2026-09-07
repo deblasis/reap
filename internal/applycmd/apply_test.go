@@ -122,17 +122,24 @@ func TestDeleteRemovesEverything(t *testing.T) {
 // apply.lock: exclusive (second Lock fails fast, naming the holder).
 func TestLockFailsFast(t *testing.T) {
 	dir := t.TempDir()
-	l1, err := Lock(dir)
+	l1, err := Lock(dir, "reap-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l1.Close()
-	_, err = Lock(dir)
+	_, err = Lock(dir, "reap-test-2")
 	if err == nil {
 		t.Fatal("second Lock must fail fast")
 	}
 	if !strings.Contains(err.Error(), "apply.lock") {
 		t.Fatalf("error must name the lock: %v", err)
+	}
+	// The holder body carries the real runId (round-3: it used to read
+	// runId=unknown because the id was minted after locking).
+	if raw, rerr := os.ReadFile(filepath.Join(dir, "apply.lock")); rerr == nil {
+		if !strings.Contains(string(raw), "runId=reap-test") {
+			t.Fatalf("lock body must name the run: %q", string(raw))
+		}
 	}
 }
 

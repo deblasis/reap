@@ -16,6 +16,7 @@ import (
 	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/quarantine"
@@ -193,14 +194,31 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitUsage
 	}
 
-	lock, err := applycmd.Lock(stateDir)
+	// The runId is minted BEFORE the lock so the lock body names the real
+	// run (round-2: it always read runId=unknown).
+	runID := auditlog.NewRunID()
+	lock, err := applycmd.Lock(stateDir, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap discard: %v\n", err)
 		return ExitState
 	}
 	defer lock.Close()
 
-	runID := auditlog.NewRunID()
+	// Holds and protect globs are RE-READ under the lock: a hold that
+	// landed while the operator sat at the confirm prompt (the lock was
+	// free then, and `reap hold` takes it only briefly) must not be
+	// invisible to re-verify — holds beat every rule and every flag.
+	freshHolds := applycmd.ReadHoldsSnapshot(stateDir)
+	for h := range freshHolds {
+		holdsBool[h] = true
+	}
+	for _, w := range work {
+		if applycmd.PathHeld(holdsBool, w.path) {
+			fmt.Fprintf(stderr, "reap discard: %s: refused: held by user DURING the confirm window (reap hold landed mid-run); rerun discard if this is unexpected\n", w.path)
+			refused = true
+		}
+	}
+
 	log, err := auditlog.Open(stateDir, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap discard: %v\n", err)
@@ -249,6 +267,10 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 
 	var dirBytes, bundleBytes int64
+	// The deletion-set hardlink pass accumulates AS each path is about to
+	// be deleted (a post-hoc walk has nothing to walk); one identity map
+	// gives set semantics across the whole run.
+	reclaim := dedupe.NewCounter(50000)
 	for _, w := range ordered {
 		path, cls := w.path, w.cls
 		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil}
@@ -265,12 +287,16 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return ExitState
 		}
 
-		// Fresh-verdict routing. skipWhy is the closed enum; refusal
-		// messages name their class.
+		// Fresh-verdict routing. skipWhy and the --json skipped[].why stay
+		// enum-clean; refusal prose rides the Note field. All capture and
+		// deletion routing below uses the FRESH classification (rv.Class):
+		// a dir whose class changed between waves (jj colocated mid-run,
+		// .git swapped) must not be captured with wave-0's assumptions.
+		cls = rv.Class
 		refuse := func(msg, code string) {
 			fmt.Fprintf(stderr, "reap discard: %s: refused: %s\n", path, msg)
 			refused = true
-			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: msg})
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipVerdictChanged, Note: msg})
 			ok := false
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipVerdictChanged,
 				Verdict: rv.Verdict.Verdict, ReasonCode: code, OK: &ok, Quarantine: nil}); rc >= 0 {
@@ -310,6 +336,8 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if rv.Verdict.BlockedClassFact == "" {
 			if rv.Verdict.Verdict == verdict.Safe {
 				refuse("SAFE; reap plan/apply is the deletion path for this dir", rv.Verdict.Code)
+			} else if rv.Verdict.Verdict == verdict.Active {
+				refuse(fmt.Sprintf("ACTIVE (%s); let it idle past the activity window — discard is the BLOCKED resolver, not the activity override", rv.Verdict.Code), rv.Verdict.Code)
 			} else {
 				refuse(fmt.Sprintf("no BLOCKED-class fact (verdict %s: %s); run reap plan --include %s or reap apply --override-manual",
 					rv.Verdict.Verdict, rv.Verdict.Code, rv.Verdict.Code), rv.Verdict.Code)
@@ -369,24 +397,32 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 
 		// Quarantine (unless loudly declined): a fresh, collision-proof
-		// session per path.
+		// session per path (an external same-name creator between the
+		// stat and the exclusive Mkdir retries once with a suffixed name).
 		qPath := ""
 		var qManifest *quarantine.Manifest
 		if !*noQuarantine {
-			session := quarantine.FreshSessionDir(stateDir, path, time.Now())
 			colocated := cls.Kind == classify.KindJJRepo && cls.GitBackend
 			var m *quarantine.Manifest
 			var qerr error
-			if !cls.GitBackend {
-				// A non-git BLOCKED dir (ignored-content scratch): plain-copy.
-				m, qerr = quarantine.WritePlainCopy(session, path, capBytes)
-			} else {
-				m, qerr = quarantine.Snapshot(session, path, gr, quarantine.Options{
-					Mode: "bundle", CapBytes: capBytes, RunID: runID, JJ: jr, Colocated: colocated})
+			session := ""
+			for attempt := 0; attempt < 2; attempt++ {
+				session = quarantine.FreshSessionDir(stateDir, path, time.Now())
+				if !cls.GitBackend {
+					// A non-git BLOCKED dir (ignored-content scratch): plain-copy.
+					m, qerr = quarantine.WritePlainCopy(session, path, capBytes)
+				} else {
+					m, qerr = quarantine.Snapshot(session, path, gr, quarantine.Options{
+						Mode: "bundle", CapBytes: capBytes, RunID: runID, JJ: jr, Colocated: colocated})
+				}
+				if qerr == nil || !isSessionExistsErr(qerr) {
+					break
+				}
 			}
 			if qerr != nil {
 				var tooLarge *quarantine.ErrTooLarge
 				var busy *quarantine.ErrGitBusy
+				var ver *quarantine.ErrVerify
 				switch {
 				case errors.As(qerr, &tooLarge):
 					fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, qerr)
@@ -395,28 +431,48 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				case errors.As(qerr, &busy):
 					fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, qerr)
 					skip(applycmd.SkipGitBusy)
-				default:
-					var ver *quarantine.ErrVerify
-					if errors.As(qerr, &ver) {
-						// Hard error: the captured content provably lives at
-						// refs/reap/* in the still-existing source dir.
-						fmt.Fprintf(stderr, "reap discard: %s: bundle verify FAILED — the captured content provably lives at refs/reap/* inside %s (dir untouched); recover manually before discarding\n", path, path)
-						_ = log.Append(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipSnapshotOvercap,
-							Verdict: rv.Verdict.Verdict, ReasonCode: "verify-failed", OK: boolPtr(false), Quarantine: nil})
-						return applycmd.ExitQuarantine
+				case errors.As(qerr, &ver):
+					// Hard error naming WHERE the captured content provably
+					// lives: the actual pinned refs, not just the namespace.
+					refs, _ := gr.ForEachReapRef(path)
+					named := strings.Join(refs, ", ")
+					if named == "" {
+						named = "refs/reap/*"
 					}
+					fmt.Fprintf(stderr, "reap discard: %s: bundle verify FAILED — the captured content provably lives at %s inside %s (dir untouched); recover manually before discarding\n", path, named, path)
+					ok := false
+					_ = log.Append(auditlog.Line{Event: "result", Path: path, Mode: "verify-failed", OK: &ok,
+						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,
+						Residue: "bundle verify failed; content at " + named})
+					return applycmd.ExitQuarantine
+				default:
+					// Generic capture failure: quarantine-family refusal,
+					// 125 band, dir untouched (a skip line's closed enum has
+					// no bucket for it; a result ok=false line records it).
 					fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, qerr)
-					skip(applycmd.SkipGitBusy)
+					exitQuarantine = true
+					ok := false
+					if rc := appendOrAbort(auditlog.Line{Event: "result", Path: path, OK: &ok,
+						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,
+						Residue: "capture failed: " + qerr.Error()}); rc >= 0 {
+						return rc
+					}
 				}
 				continue
 			}
 			qPath = session
 			qManifest = m
+			if m != nil {
+				// The preflight window narrows as the run consumes the
+				// volume: later paths check against what is actually left.
+				qFree -= uint64(m.BundleBytes)
+			}
 		}
 
 		// Manifest capture BEFORE Delete (the M2 lesson): after removal the
-		// path cannot be read.
+		// path cannot be read. The dedupe pass walks it now too.
 		manifest := walk.CappedManifest(path)
+		reclaim.Add(path)
 
 		deleteMode, derr := applycmd.Delete(path, cls, applycmd.Deleter{Git: gr, JJ: jr})
 		if derr != nil {
@@ -472,16 +528,29 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
 	} else {
-		// The two-number truth: freed now vs freed once the quarantine is
-		// pruned (the bundle is the kept-back part of the deletion).
-		freedNow := dirBytes - bundleBytes
+		// The two-number truth, derived from the deletion-set hardlink
+		// pass: hardlinked content shared within the set (zig lane caches)
+		// reclaims once, not per dir. Skipped pass -> logical + caveat.
+		reclaimExpected := reclaim.Expected
+		if reclaim.Over() {
+			reclaimExpected = dirBytes
+		}
+		freedNow := reclaimExpected - bundleBytes
 		if freedNow < 0 {
 			freedNow = 0
 		}
-		fmt.Fprintf(stdout, "discarded %d dirs; freed ~%.1f GB now (dir %.1f GB, bundle %.1f GB kept); %.1f GB more once the quarantine is pruned\n",
-			len(summary.Deleted), float64(freedNow)/(1<<30), float64(dirBytes)/(1<<30), float64(bundleBytes)/(1<<30), float64(bundleBytes)/(1<<30))
+		caveat := ""
+		if reclaim.Over() {
+			caveat = " (logical; hardlink pass skipped)"
+		}
+		fmt.Fprintf(stdout, "discarded %d dirs; freed ~%.1f GB now (dir %.1f GB, bundle %.1f GB kept%s); %.1f GB more once the quarantine is pruned\n",
+			len(summary.Deleted), float64(freedNow)/(1<<30), float64(dirBytes)/(1<<30), float64(bundleBytes)/(1<<30), caveat, float64(bundleBytes)/(1<<30))
 		for _, s := range summary.Skipped {
-			fmt.Fprintf(stdout, "  skipped %s: %s\n", s.Path, s.Why)
+			note := s.Note
+			if note == "" {
+				note = s.Why
+			}
+			fmt.Fprintf(stdout, "  skipped %s: %s\n", s.Path, note)
 		}
 	}
 	switch {
@@ -509,6 +578,12 @@ func planEntriesOf(work []discardWork) []applycmd.PlanEntry {
 		out = append(out, applycmd.PlanEntry{Path: w.path, Kind: string(w.cls.Kind), ParentRepo: w.cls.ParentRepo, SizeBytes: w.size})
 	}
 	return out
+}
+
+// isSessionExistsErr reports a Snapshot refusal caused by the session dir
+// already existing (an external creator won the name race).
+func isSessionExistsErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "a same-named session exists")
 }
 
 func dirExists(p string) bool {
@@ -703,8 +778,16 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 		if r.PastRetention {
 			mark = "  [past retention: reap quarantine prune]"
 		}
-		fmt.Fprintf(stdout, "%6d MB  %3dd  %s  %s source=%s state=%s%s\n  restore: reap quarantine restore %s\n",
-			r.Bytes>>20, r.AgeDays, filepath.Base(r.Session), shape, r.Source, stateLabel(r.State), mark, filepath.Base(r.Session))
+		base := ""
+		if r.SelfContained != nil && !*r.SelfContained && r.BaseSHA != "" {
+			short := r.BaseSHA
+			if len(short) > 10 {
+				short = short[:10]
+			}
+			base = " base=" + short
+		}
+		fmt.Fprintf(stdout, "%6d MB  %3dd  %s  %s%s source=%s state=%s%s\n  restore: reap quarantine restore %s\n",
+			r.Bytes>>20, r.AgeDays, filepath.Base(r.Session), shape, base, r.Source, stateLabel(r.State), mark, filepath.Base(r.Session))
 	}
 	return ExitOK
 }
@@ -744,7 +827,7 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 	}
 	// apply.lock is held for the whole of apply, discard AND prune: a prune
 	// racing a discard must not delete the session that run just wrote.
-	lock, lerr := applycmd.Lock(stateDir)
+	lock, lerr := applycmd.Lock(stateDir, "prune")
 	if lerr != nil {
 		fmt.Fprintf(stderr, "reap quarantine prune: %v\n", lerr)
 		return ExitState
@@ -784,15 +867,26 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		fmt.Fprintln(stdout, "nothing to prune")
 		return ExitOK
 	}
-	atRisk := false
+	atRisk, unverified := false, false
 	for _, v := range victims {
-		if v.state == quarantine.AtRisk {
+		switch v.state {
+		case quarantine.AtRisk:
 			atRisk = true
+		case quarantine.Unverified:
+			unverified = true
 		}
 	}
+	// Prune copy follows the revalidation states exactly (spec): at-risk
+	// gets the loud warning, unverified gets the offline caveat, verified-ok
+	// gets neither.
 	warning := "recovery for these discards ends here"
 	if atRisk {
 		warning = "DELETING ENDS THE LAST RECOVERABLE COPY (at least one bundle's base is gone from its remote)"
+		if unverified {
+			warning += "; could not verify the base of others (offline?)"
+		}
+	} else if unverified {
+		warning = "recovery for these discards ends here; could not verify the base (offline?); if the base is gone, deleting ends recovery"
 	}
 	fmt.Fprintf(stdout, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s. Proceed? [y/N] ",
 		len(victims), float64(totalBytes)/(1<<30), oldest, warning)
@@ -824,28 +918,35 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		}
 		pruned++
 	}
+	// The exit band is computed ONCE, after either output format: --json
+	// changes only the format, never the choreography (round-2: it exited
+	// 0 on per-bundle failures).
+	exit := ExitOK
+	if failed > 0 {
+		exit = applycmd.ExitQuarantine
+	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
 		_ = enc.Encode(map[string]any{"pruned": pruned, "failed": failed, "bytes": totalBytes})
-		return ExitOK
+		return exit
 	}
 	fmt.Fprintf(stdout, "pruned %d session(s)\n", pruned)
-	if failed > 0 {
-		return applycmd.ExitQuarantine
-	}
-	return ExitOK
+	return exit
 }
 
 // quarantineRestore is the first-class recovery command, mode-dispatched
-// from the manifest: bundle sessions fetch the base (per the manifest)
-// then the pinned refs and materialize the capture; plain-copy sessions
-// copy the files back. Recovery never deletes or overwrites anything at
-// the destination: a non-empty --to PATH is a usage error naming what is
-// there, and missing prerequisites name the exact SHAs needed.
+// from the manifest: bundle sessions FETCH THE BASE FIRST (a delta whose
+// base is merely advanced, not gone, still restores — tips-contains was
+// the wrong predicate and refused routine advancement), then the pinned
+// refs and the capture; plain-copy sessions copy the files back. Recovery
+// never deletes or overwrites anything at the destination. Runs under
+// apply.lock: a confirmed prune racing this fetch would delete the
+// session mid-restore.
 func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer) int {
 	// Manual scan (flags may appear before or after the session id —
 	// flag.Parse stops at the first positional).
 	var id, to string
+	asJSON := false
 	positional := argsForSub(args)
 	for i := 0; i < len(positional); i++ {
 		a := positional[i]
@@ -855,13 +956,28 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 			i++
 		case strings.HasPrefix(a, "--to="):
 			to = strings.TrimPrefix(a, "--to=")
+		case a == "--json":
+			asJSON = true
 		case id == "":
 			id = a
 		}
 	}
 	if id == "" {
-		fmt.Fprintln(stderr, "usage: reap quarantine restore <session> [--to PATH]")
+		fmt.Fprintln(stderr, "usage: reap quarantine restore <session> [--to PATH] [--json]")
 		return ExitUsage
+	}
+	lock, lerr := applycmd.Lock(stateDir, "restore")
+	if lerr != nil {
+		fmt.Fprintf(stderr, "reap quarantine restore: %v\n", lerr)
+		return ExitState
+	}
+	defer lock.Close()
+	emit := func(v any) {
+		if asJSON {
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(v)
+		}
 	}
 	var session *quarantine.Session
 	listing := quarantine.List(stateDir)
@@ -876,7 +992,7 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		return ExitUsage
 	}
 	if session.Manifest == nil {
-		fmt.Fprintf(stderr, "reap quarantine restore: %s: manifest unreadable; bundle: %s (git fetch '<bundle>' 'refs/reap/*:refs/reap/*' manually)\n",
+		fmt.Fprintf(stderr, "reap quarantine restore: %s: manifest unreadable; bundle: %s (verify with git bundle verify, then git fetch '<bundle>' 'refs/reap/*:refs/reap/*' manually)\n",
 			id, filepath.Join(session.Dir, "bundle.git"))
 		return ExitState
 	}
@@ -896,34 +1012,45 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 			return ExitState
 		}
 		fmt.Fprintf(stdout, "restored %s -> %s (plain copy)\n", id, dest)
+		emit(map[string]any{"session": id, "to": dest, "mode": "plain-copy"})
 		return ExitOK
 	}
-	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		fmt.Fprintf(stderr, "reap quarantine restore: %v\n", err)
 		return ExitState
 	}
 	wireInitRestore(stderr, dest)
 	bundle := filepath.Join(session.Dir, "bundle.git")
-	// Delta bundles need their base first: fetch it from the recorded
-	// remote; a failure names the exact prerequisite SHAs, not a raw git error.
-	if !m.SelfContained && m.Origin != "" && m.BaseSHA != "" {
-		if out, ferr := gr.LSRemote(m.Origin); ferr != nil || !strings.Contains(out, m.BaseSHA) {
-			note := "could not reach the remote"
-			if ferr == nil {
-				note = "the remote no longer advertises the base"
-			}
-			fmt.Fprintf(stderr, "reap quarantine restore: delta bundle needs prerequisite commit %s from %s: %s; obtain that commit (clone/fetch the remote at the recorded base state) then: git -C %s fetch %s 'refs/reap/*:refs/reap/*'\n",
-				m.BaseSHA, m.Origin, note, dest, bundle)
+	// Delta bundles: FETCH the remote first, then verify each recorded
+	// prerequisite EXISTS in the destination (cat-file -e). The remote's
+	// tips having moved past the base is routine advancement, not a gone
+	// base — refuse only when the object is truly absent, naming the
+	// exact SHAs.
+	var prereqs []string
+	if !m.SelfContained {
+		if m.BaseSHA != "" {
+			prereqs = append(prereqs, m.BaseSHA)
+		}
+		for _, b := range m.BaseBases {
+			prereqs = append(prereqs, b.SHA)
+		}
+	}
+	if len(prereqs) > 0 && m.Origin != "" {
+		if err := fetchRemote(dest, m.Origin); err != nil {
+			fmt.Fprintf(stderr, "reap quarantine restore: fetching base from %s: %v (prerequisites: %s)\n",
+				m.Origin, err, strings.Join(prereqs, ", "))
 			return ExitState
 		}
-		if err := fetchRemote(dest, m.Origin); err != nil {
-			fmt.Fprintf(stderr, "reap quarantine restore: fetching base from %s: %v (prerequisite: %s)\n", m.Origin, err, m.BaseSHA)
-			return ExitState
+		for _, sha := range prereqs {
+			if err := execGit(dest, "cat-file", "-e", sha+"^{commit}"); err != nil {
+				fmt.Fprintf(stderr, "reap quarantine restore: prerequisite commit %s is absent from %s (the remote no longer carries it); obtain it, then: git -C %s fetch %s 'refs/reap/*:refs/reap/*'\n",
+					sha, m.Origin, dest, bundle)
+				return ExitState
+			}
 		}
 	}
 	if err := fetchBundle(dest, bundle); err != nil {
-		fmt.Fprintf(stderr, "reap quarantine restore: fetching bundle: %v (prerequisite: %s)\n", err, m.BaseSHA)
+		fmt.Fprintf(stderr, "reap quarantine restore: fetching bundle: %v (prerequisites: %s)\n", err, strings.Join(prereqs, ", "))
 		return ExitState
 	}
 	if m.CaptureRef != "" {
@@ -933,9 +1060,12 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		}
 	}
 	for _, d := range m.EmptyDirs {
-		_ = os.MkdirAll(filepath.Join(dest, d), 0o755)
+		if err := os.MkdirAll(filepath.Join(dest, d), 0o755); err != nil {
+			fmt.Fprintf(stderr, "reap quarantine restore: recreating empty dir %s: %v\n", d, err)
+		}
 	}
 	fmt.Fprintf(stdout, "restored %s -> %s (capture ref %s materialized; pinned refs under refs/reap/*)\n", id, dest, m.CaptureRef)
+	emit(map[string]any{"session": id, "to": dest, "mode": "bundle", "captureRef": m.CaptureRef})
 	return ExitOK
 }
 

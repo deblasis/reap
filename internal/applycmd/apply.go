@@ -86,10 +86,13 @@ type Summary struct {
 	FreeGain      uint64        `json:"freeBytesReclaimed"`
 }
 
-// SkippedPath names why a planned path survived.
+// SkippedPath names why a planned path survived. Why carries the closed
+// skipWhy enum value in machine output; Note carries refusal prose (the
+// enum must stay parseable by machines).
 type SkippedPath struct {
 	Path string `json:"path"`
 	Why  string `json:"why"`
+	Note string `json:"note,omitempty"`
 }
 
 // ExcludedRef is a below-floor path kept out of the plan (never a skip).
@@ -623,8 +626,9 @@ func removeContentsBeforeVCS(path string) error {
 
 // Lock takes apply.lock exclusively; a held lock fails fast naming the
 // holder (PID + runId written into the lock body — the spec asks for
-// both).
-func Lock(stateDir string) (*lockfile.File, error) {
+// both). The runId is MINTED BY THE CALLER before locking so the body
+// carries the real run, not "unknown" (the round-2 finding).
+func Lock(stateDir, runID string) (*lockfile.File, error) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -642,7 +646,7 @@ func Lock(stateDir string) (*lockfile.File, error) {
 		holder := readLockHolder(path)
 		return nil, fmt.Errorf("another reap apply/discard holds apply.lock (holder: %s); fail-fast, retry when it exits", holder)
 	}
-	_ = os.WriteFile(path, []byte(fmt.Sprintf("pid=%d runId=%s", os.Getpid(), "unknown")), 0o644)
+	_ = os.WriteFile(path, []byte(fmt.Sprintf("pid=%d runId=%s", os.Getpid(), runID)), 0o644)
 	return l, nil
 }
 

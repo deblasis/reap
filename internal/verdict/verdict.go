@@ -517,7 +517,7 @@ func (in Input) activeHours() time.Duration {
 // validate against (unknown codes are usage errors, not silent no-ops).
 var reasonCodes = map[string]bool{
 	"active": true, "incoda-live": true, "jj-active": true, "scratch-fresh": true,
-	"scratch-recent": true, "scratch-idle": true, "dirty-files": true,
+	"scratch-recent": true, "scratch-idle": true, "dirty-files": true, "stashes": true,
 	"unpushed-commits": true, "unpushed-reflog": true, "no-remote": true,
 	"open-pr": true, "jj-unpushed": true, "ignored-content": true,
 	"remote-stale": true, "jj-remote-stale": true, "orphaned-worktree": true,

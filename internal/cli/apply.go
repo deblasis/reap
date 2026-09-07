@@ -18,6 +18,7 @@ import (
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
+	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/report"
 	"github.com/deblasis/reap/internal/verdict"
 	"github.com/deblasis/reap/internal/walk"
@@ -220,7 +221,7 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 // carve-out rows are REFUSED on --override-manual/--include: their only
 // sanctioned path is a TTY-only hardened confirm (spec, M3); the round-1
 // probe deleted only-copy work under plain --yes.
-func resolvePlan(cands []candidate, include, exclude, overrideManual []string, minGB float64) (plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string, err error) {
+func resolvePlan(cands []candidate, include, exclude, overrideManual []string, minGB float64, carveOut bool) (plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string, err error) {
 	if e := validateCodes(include, exclude); e != nil {
 		return nil, nil, nil, e
 	}
@@ -242,11 +243,16 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		case c.vd.Verdict == verdict.Safe:
 			take = true
 		case c.vd.OrphanedCarveOut && (inc[c.vd.Code] || ovr[config.Canonical(c.entry.Path)]):
-			counts := "counts unknowable, parent gone"
-			if c.vd.BlockedClassFact != "" {
-				counts = c.vd.BlockedClassFact
+			if !carveOut {
+				counts := "counts unknowable, parent gone"
+				if c.vd.BlockedClassFact != "" {
+					counts = c.vd.BlockedClassFact
+				}
+				return nil, nil, nil, &carveOutRefusal{path: c.entry.Path, counts: counts}
 			}
-			return nil, nil, nil, &carveOutRefusal{path: c.entry.Path, counts: counts}
+			// The carve-out, unlocked only for a live TTY (the hardened
+			// confirm + capped plain-copy snapshot happen in cmdApply).
+			take, widened = true, true
 		case inc[c.vd.Code] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
 			take, widened = true, true
 		case ovr[config.Canonical(c.entry.Path)] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
@@ -295,6 +301,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 }
 
 // carveOutRefusal is the orphaned carve-out refusal: 120 from plan, 121
+// non-interactive with --yes; a live TTY re-resolves with the carve-out
 // from non-TTY apply --yes, counts always in the message (spec interim).
 type carveOutRefusal struct{ path, counts string }
 
@@ -410,7 +417,7 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	}
 	now := time.Now()
 	cands, _ := core.run(now)
-	plan, below, _, err := resolvePlan(cands, include, exclude, nil, *minGB)
+	plan, below, _, err := resolvePlan(cands, include, exclude, nil, *minGB, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap plan: %v\n", err)
 		return ExitUsage
@@ -463,15 +470,32 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		return applycmd.ExitRootMissing
 	}
-	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB)
+	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB, false)
+	carveOutActive := false
 	if err != nil {
 		var co *carveOutRefusal
-		if errors.As(err, &co) && *yes && !applycmd.IsTerminal(stdin, stdout) {
+		if errors.As(err, &co) {
+			if !applycmd.IsTerminal(stdin, stdout) {
+				// Agents are barred from the carve-out: the hardened
+				// confirm is TTY-only, --yes does not unlock it.
+				fmt.Fprintf(stderr, "reap apply: %v\n", co)
+				if *yes {
+					return applycmd.ExitNotTTY
+				}
+				return ExitUsage
+			}
+			// A live TTY: re-resolve WITH the carve-out; the hardened
+			// confirm (below, after the plan confirm) gates the deletion.
+			plan, below, byCode, err = resolvePlan(cands, include, exclude, overrideManual, *minGB, true)
+			if err != nil {
+				fmt.Fprintf(stderr, "reap apply: %v\n", err)
+				return ExitUsage
+			}
+			carveOutActive = true
+		} else {
 			fmt.Fprintf(stderr, "reap apply: %v\n", err)
-			return applycmd.ExitNotTTY
+			return ExitUsage
 		}
-		fmt.Fprintf(stderr, "reap apply: %v\n", err)
-		return ExitUsage
 	}
 
 	// The dry-run tie: delegate to the exact plan renderer — byte-identical
@@ -492,16 +516,49 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	if !proceed {
 		return ccode
 	}
+	// The carve-out's own hardened confirm: a second, explicit gate that
+	// --yes never satisfies, naming each orphan and the capped plain-copy
+	// quarantine taken before its deletion.
+	if carveOutActive {
+		for _, p := range plan {
+			if p.Orphaned {
+				fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB) — parent gone, counts unverifiable; a capped plain-copy quarantine is taken first\n", p.Path, float64(p.SizeBytes)/(1<<30))
+			}
+		}
+		fmt.Fprint(stdout, "carve-out deletion (recovery = the plain copy only). Type y to confirm: ")
+		var answer string
+		if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
+			fmt.Fprintln(stdout, "\ndeclined")
+			return ExitOK
+		}
+		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+			fmt.Fprintln(stdout, "declined")
+			return ExitOK
+		}
+	}
 
-	// Exclusive lock for the whole run.
-	lock, err := applycmd.Lock(stateDir)
+	// Exclusive lock for the whole run. The runId is minted FIRST so the
+	// lock body names the real run; holds are RE-READ under the lock — a
+	// hold that landed while the operator sat at the confirm prompt (the
+	// lock was free then) must reach re-verify: holds beat every flag.
+	runID := auditlog.NewRunID()
+	lock, err := applycmd.Lock(stateDir, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap apply: %v\n", err)
 		return ExitState
 	}
 	defer lock.Close()
+	freshHolds := applycmd.ReadHoldsSnapshot(stateDir)
+	for h := range freshHolds {
+		core.holds[h] = true
+	}
+	for _, p := range plan {
+		if applycmd.PathHeld(core.holds, p.Path) {
+			fmt.Fprintf(stderr, "reap apply: %s: held by user DURING the confirm window (reap hold landed mid-run); rerun apply if this is unexpected\n", p.Path)
+			return ExitState
+		}
+	}
 
-	runID := auditlog.NewRunID()
 	log, err := auditlog.Open(stateDir, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap apply: %v\n", err)
@@ -556,13 +613,32 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 			continue
 		}
+		// The carve-out rows: a capped plain-copy quarantine BEFORE the
+		// deletion (the orphan has no git backend to bundle; the plain
+		// copy is its only recovery).
+		var qPtrVal *string
+		if p.Orphaned {
+			session := quarantine.FreshSessionDir(stateDir, p.Path, time.Now())
+			capBytes := int64(core.cfg.Thresholds.QuarantineCapGB * float64(1<<30))
+			if _, qerr := quarantine.WritePlainCopy(session, p.Path, capBytes); qerr != nil {
+				fmt.Fprintf(stderr, "reap apply: %s: carve-out quarantine failed: %v (dir untouched)\n", p.Path, qerr)
+				ok := false
+				if rc := appendOrAbort(auditlog.Line{Event: "result", Path: p.Path, OK: &ok,
+					Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,
+					Residue: "carve-out plain-copy failed: " + qerr.Error()}); rc >= 0 {
+					return rc
+				}
+				continue
+			}
+			qPtrVal = &session
+		}
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
 			// Deregistration failure is a deletion failure (spec's exit
 			// band: 124, path named) — not a skip: skipWhy is the spec's
 			// closed enum and the dir is still standing either way.
 			ok := false
-			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: nil})
+			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: qPtrVal})
 			fmt.Fprintf(stderr, "reap apply: deletion failed: %s: %v\n", p.Path, err)
 			return applycmd.ExitDeleteFail
 		}
@@ -573,7 +649,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// shape's fields were all dead) + capped manifest for non-clean
 		// deletions (spec: gone is never contents unknown).
 		result := auditlog.Line{Event: "result", Path: p.Path, Mode: mode, SizeBytes: p.SizeBytes,
-			Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil}
+			Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtrVal}
 		if rv.Git != nil {
 			result.Branch = rv.Git.Branch
 			result.Dirty, result.Untracked = rv.Git.Dirty, rv.Git.Untracked
@@ -681,7 +757,7 @@ func cmdHold(args []string, stdout, stderr io.Writer) int {
 		return ExitUsage
 	}
 	stateDir, _ := config.StateDir()
-	lock, err := applycmd.Lock(stateDir)
+	lock, err := applycmd.Lock(stateDir, "hold")
 	if err != nil {
 		fmt.Fprintf(stderr, "reap hold: %v\n", err)
 		return ExitState
@@ -713,7 +789,7 @@ func cmdUnhold(args []string, stdout, stderr io.Writer) int {
 		return ExitUsage
 	}
 	stateDir, _ := config.StateDir()
-	lock, err := applycmd.Lock(stateDir)
+	lock, err := applycmd.Lock(stateDir, "unhold")
 	if err != nil {
 		fmt.Fprintf(stderr, "reap unhold: %v\n", err)
 		return ExitState

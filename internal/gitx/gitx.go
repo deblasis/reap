@@ -667,16 +667,22 @@ func (r Runner) UpdateRef(dir, ref, sha string) error {
 	return err
 }
 
-// LocalOnlyTip is one branch/tag tip not on any remote.
+// LocalOnlyTip is one branch/tag tip not on any remote. Peeled is the
+// commit SHA an annotated tag points AT (equal to SHA for lightweight tags
+// and branches): membership tests against the unpushed COMMIt set must use
+// Peeled — %(objectname) of an annotated tag is the tag OBJECT, which never
+// appears in rev-list output, and comparing it silently skips every
+// annotated-tag pin (the round-2 live data-loss probe).
 type LocalOnlyTip struct {
-	Ref string
-	SHA string
+	Ref    string
+	SHA    string // the ref's own object (tag object for annotated tags)
+	Peeled string // the commit it dereferences to ("" when it dereferences to nothing)
 }
 
-// LocalOnlyTips enumerates local branch and tag tips (the caller subtracts
+// LocalOnlyTips enumerates local branch and tag tips (the caller filters
 // remote-reachable ones before pinning).
 func (r Runner) LocalOnlyTips(dir string) ([]LocalOnlyTip, error) {
-	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname) %(objectname)",
+	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname) %(objectname) %(*objectname)",
 		"refs/heads", "refs/tags")
 	if err != nil {
 		return nil, err
@@ -684,10 +690,14 @@ func (r Runner) LocalOnlyTips(dir string) ([]LocalOnlyTip, error) {
 	var all []LocalOnlyTip
 	for _, line := range nonEmpty(out) {
 		fields := strings.Fields(line)
-		if len(fields) != 2 {
+		if len(fields) < 2 {
 			continue
 		}
-		all = append(all, LocalOnlyTip{Ref: fields[0], SHA: fields[1]})
+		t := LocalOnlyTip{Ref: fields[0], SHA: fields[1]}
+		if len(fields) >= 3 {
+			t.Peeled = fields[2]
+		}
+		all = append(all, t)
 	}
 	return all, nil
 }
@@ -724,17 +734,72 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 	return m
 }
 
-// ReflogOnlyCommits returns commits reachable only via reflog entries
-// (post-reset / pre-rebase generations): the entire unpushed-reflog BLOCKED
-// class. These die with the repo unless pinned — reflogs are never packed
-// by bundles — so quarantine pins every one as refs/reap/reflog-N.
-func (r Runner) ReflogOnlyCommits(dir string) []string {
-	args := []string{"rev-list", "--exclude=refs/jj/*", "--reflog", "HEAD", "--not", "--branches", "--tags", "--remotes"}
-	out, err := r.run(dir, r.GitBudget, args...)
+// ReflogOnlyCommits returns REFLOG ENTRY TIPS not reachable from any branch,
+// tag or remote (post-reset / pre-rebase generations): the unpushed-reflog
+// BLOCKED class. Entry tips, not the full rev-list enumeration: every commit
+// reachable from an entry rides into the bundle under that entry's pin
+// (<base>..<tip>), which bounds both the pin count and the command line —
+// a rev-list of a stale reflog-heavy repo mints thousands of refs and blows
+// the Windows command-line bound (the round-2 reliability finding). Errors
+// PROPAGATE: pinning nothing on unreadable evidence is the completeness lie
+// the manifest must never tell.
+func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
+	out, err := r.run(dir, r.GitBudget, "reflog", "show", "--format=%H", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	entries := nonEmpty(out)
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	// Reachable-from-refs set, once (branches, tags, remotes).
+	args := []string{"rev-list", "--exclude=refs/jj/*", "--branches", "--tags", "--remotes"}
+	out, err = r.run(dir, r.GitBudget, args...)
+	if err != nil {
+		return nil, err
+	}
+	reachable := map[string]bool{}
+	for _, sha := range nonEmpty(out) {
+		reachable[sha] = true
+	}
+	var tips []string
+	for _, sha := range entries {
+		if !reachable[sha] {
+			tips = append(tips, sha)
+		}
+	}
+	return tips, nil
+}
+
+// ReflogEntryDates maps each HEAD reflog entry's commit to its commit date
+// (RFC3339), for days-to-expiry reporting in the manifest.
+func (r Runner) ReflogEntryDates(dir string) map[string]string {
+	out, err := r.run(dir, r.GitBudget, "reflog", "show", "--format=%H %cI", "HEAD")
 	if err != nil {
 		return nil
 	}
-	return nonEmpty(out)
+	m := map[string]string{}
+	for _, line := range nonEmpty(out) {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			m[fields[0]] = fields[1]
+		}
+	}
+	return m
+}
+
+// DiskUsage prices the objects the given rev-list ranges would carry
+// (rev-list --disk-usage), so the caller can refuse BEFORE writing a bundle
+// that would blow the cap or the volume.
+func (r Runner) DiskUsage(dir string, ranges []string) (int64, error) {
+	args := append([]string{"rev-list", "--disk-usage"}, ranges...)
+	out, err := r.run(dir, r.GitBudget, args...)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	fmt.Sscanf(strings.TrimSpace(out), "%d", &n)
+	return n, nil
 }
 
 // UpstreamRef resolves the current branch's upstream-tracking ref (empty
@@ -825,7 +890,8 @@ func (r Runner) SaveIndex(dir string) (string, error) {
 	return backup, nil
 }
 
-// RestoreBackup restores a SaveIndex backup and removes it.
+// RestoreBackup restores a SaveIndex backup atomically (temp + rename: a
+// crash mid-write must not tear the live index) and removes the backup.
 func (r Runner) RestoreBackup(dir, backup string) error {
 	if backup == "" {
 		return nil
@@ -838,7 +904,11 @@ func (r Runner) RestoreBackup(dir, backup string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(g, "index"), data, 0o644); err != nil {
+	tmp := filepath.Join(g, "index.reap-restore")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(g, "index")); err != nil {
 		return err
 	}
 	return os.Remove(backup)

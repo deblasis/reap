@@ -56,7 +56,7 @@ func TestSnapshotCompleteness(t *testing.T) {
 	}
 
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
@@ -123,7 +123,7 @@ func TestCaptureRefContainsIgnored(t *testing.T) {
 	gitRun(t, repo, "add", "-A")
 	gitRun(t, repo, "commit", "-q", "-m", "ig")
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
@@ -142,7 +142,7 @@ func TestPlainCopy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "a.bin"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := WritePlainCopy(session, src, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestSnapshotPinsReflogAndTags(t *testing.T) {
 	}
 
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle", RunID: "reap-test"})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
@@ -268,7 +268,7 @@ func TestSnapshotDeltaBase(t *testing.T) {
 	}
 
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
@@ -309,7 +309,7 @@ func TestSnapshotGitBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	_, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
 	var busy *ErrGitBusy
 	if err == nil || !errors.As(err, &busy) {
@@ -362,7 +362,7 @@ func TestSnapshotStagedStatePreserved(t *testing.T) {
 	gitRun(t, repo, "add", "staged.txt") // the operator's staged state
 
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	if _, err := Snapshot(t.TempDir(), repo, gr, Options{Mode: "bundle"}); err != nil {
+	if _, err := Snapshot(filepath.Join(t.TempDir(), "s"), repo, gr, Options{Mode: "bundle"}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	out := gitRun(t, repo, "status", "--porcelain")
@@ -408,7 +408,7 @@ func TestSnapshotColocatedJJ(t *testing.T) {
 		}
 	}
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
-	session := t.TempDir()
+	session := filepath.Join(t.TempDir(), "s")
 	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle", JJ: jjx.Runner{Budget: 60 * time.Second}, Colocated: true})
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
@@ -419,5 +419,251 @@ func TestSnapshotColocatedJJ(t *testing.T) {
 	}
 	if m.Classes.JJChanges < 1 {
 		t.Fatalf("jj changes not counted: %+v", m.Classes)
+	}
+}
+
+// The round-2 live data-loss probe as a fixture: a repo whose ONLY ref to
+// unpushed work is an ANNOTATED tag. The tag-object SHA never appears in
+// the unpushed commit set, so membership must test the peeled target —
+// the tagged commit must be recoverable from the bundle by name.
+func TestSnapshotAnnotatedTagOnly(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "base")
+	if err := os.WriteFile(filepath.Join(repo, "tagged.txt"), []byte("TAGGED-ONLY-WORK"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "tagged work")
+	gitRun(t, repo, "tag", "-a", "v1", "-m", "release")
+	// Point main back at the base: the tagged commit is reachable ONLY via
+	// the annotated tag.
+	gitRun(t, repo, "reset", "-q", "--hard", "HEAD~1")
+	if _, err := os.Stat(filepath.Join(repo, "tagged.txt")); !os.IsNotExist(err) {
+		t.Fatal("fixture: tagged.txt should be reset away")
+	}
+
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	session := filepath.Join(t.TempDir(), "s")
+	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	refs := gitRun(t, repo, "for-each-ref", "--format=%(refname)", "refs/reap")
+	if !strings.Contains(refs, "refs/reap/tag-v1") {
+		t.Fatalf("annotated tag pin missing:\n%s", refs)
+	}
+	if m.Classes.Tags < 1 {
+		t.Fatalf("tag count: %+v", m.Classes)
+	}
+	rec := t.TempDir()
+	gitRun(t, rec, "init", "-q", "-b", "main")
+	gitRun(t, rec, "fetch", "-q", filepath.Join(session, "bundle.git"), "refs/reap/*:refs/reap/*")
+	shown := gitRun(t, rec, "show", "refs/reap/tag-v1:tagged.txt")
+	if !strings.Contains(shown, "TAGGED-ONLY-WORK") {
+		t.Fatalf("annotated-tag target NOT recoverable: %q", shown)
+	}
+}
+
+// A QUIET repo must not report index interleaving: the restore's own write
+// is un-done (mtime put back), and the interlock compares the mid-window
+// observation, not the post-restore one (round-3 fix of the always-true
+// fold).
+func TestSnapshotInterleaveFalseQuiet(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx := filepath.Join(repo, ".git", "index")
+	before, _ := os.Stat(idx)
+
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	m, err := Snapshot(filepath.Join(t.TempDir(), "s"), repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if m.Interleaved {
+		t.Fatal("quiet repo reported index interleaving (false signal)")
+	}
+	// The capture must not freshen the index mtime: a refused discard must
+	// not flip the dir ACTIVE for 48h.
+	after, _ := os.Stat(idx)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("index mtime changed across capture: %v -> %v", before.ModTime(), after.ModTime())
+	}
+}
+
+// A pre-existing session dir is a same-name race: refusal naming it, never
+// an overwrite of that dir's recovery.
+func TestSnapshotSessionExistsRefusal(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "one")
+	session := filepath.Join(t.TempDir(), "taken")
+	if err := os.MkdirAll(session, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(session, "bundle.git"), []byte("PRECIOUS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	_, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
+	if err == nil || !strings.Contains(err.Error(), "same-named session") {
+		t.Fatalf("want same-named-session refusal, got %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(session, "bundle.git")); string(b) != "PRECIOUS" {
+		t.Fatal("existing session was overwritten")
+	}
+}
+
+// Capture-time base revalidation: a base force-pushed away on the remote
+// produces the SELF-CONTAINED form — restorable from the bundle alone.
+func TestSnapshotBaseGoneSelfContained(t *testing.T) {
+	base := t.TempDir()
+	bare := filepath.Join(base, "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, bare, "init", "-q", "--bare", "-b", "main")
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("pushed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "one")
+	gitRun(t, repo, "remote", "add", "origin", bare)
+	gitRun(t, repo, "push", "-q", "-u", "origin", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("DIRTY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force the remote's history away: the recorded base is gone. The
+	// bare's HEAD must move off main FIRST (it guards the current branch
+	// from deletion).
+	clone := filepath.Join(base, "clone")
+	gitRun(t, base, "clone", "-q", bare, clone)
+	if err := os.WriteFile(filepath.Join(clone, "other.txt"), []byte("orphan history"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, clone, "add", "-A")
+	gitRun(t, clone, "commit", "-q", "--allow-empty", "-m", "unrelated root")
+	gitRun(t, clone, "branch", "-M", "other")
+	gitRun(t, clone, "push", "-q", "origin", "other")
+	gitRun(t, bare, "symbolic-ref", "HEAD", "refs/heads/other")
+	gitRun(t, clone, "push", "-q", "origin", "--delete", "main")
+
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	session := filepath.Join(t.TempDir(), "s")
+	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !m.SelfContained {
+		t.Fatalf("base gone at capture must fall back self-contained: %+v", m)
+	}
+	// Restorable from the bundle ALONE (no remote base fetch).
+	rec := t.TempDir()
+	gitRun(t, rec, "init", "-q", "-b", "main")
+	gitRun(t, rec, "fetch", "-q", filepath.Join(session, "bundle.git"), "refs/reap/*:refs/reap/*")
+	shown := gitRun(t, rec, "show", m.CaptureRef+":f.txt")
+	if !strings.Contains(shown, "DIRTY") {
+		t.Fatalf("self-contained fallback not restorable standalone: %q", shown)
+	}
+}
+
+// Revalidate's three states, pinned: advertised base = verified-ok; base
+// absent from a reachable remote = at-risk; unreachable remote =
+// unverified (never conflated with at-risk).
+func TestRevalidateStates(t *testing.T) {
+	base := t.TempDir()
+	bare := filepath.Join(base, "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, bare, "init", "-q", "--bare", "-b", "main")
+	seed := filepath.Join(base, "seed")
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, seed, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(seed, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, seed, "add", "-A")
+	gitRun(t, seed, "commit", "-q", "-m", "x")
+	gitRun(t, seed, "push", "-q", bare, "main")
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 30 * time.Second}
+	tip := gitRun(t, bare, "rev-parse", "HEAD")
+
+	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: bare}); v != VerifiedOK {
+		t.Fatalf("advertised base: %v", v)
+	}
+	if v := Revalidate(gr, &Manifest{BaseSHA: strings.Repeat("0", 40), Origin: bare}); v != AtRisk {
+		t.Fatalf("gone base: %v", v)
+	}
+	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: filepath.Join(base, "no-such-remote.git")}); v != Unverified {
+		t.Fatalf("unreachable remote: %v", v)
+	}
+	if v := Revalidate(gr, &Manifest{SelfContained: true}); v != VerifiedOK {
+		t.Fatalf("self-contained: %v", v)
+	}
+}
+
+// Empty dirs are recorded RELATIVE and restore recreates them under the
+// destination (bundle mode — the round-2 absolute-path fold was broken
+// exactly here).
+func TestSnapshotEmptyDirsRelative(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, "emptydir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "one")
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	m, err := Snapshot(filepath.Join(t.TempDir(), "s"), repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	found := false
+	for _, d := range m.EmptyDirs {
+		if d == "emptydir" {
+			found = true
+		}
+		if filepath.IsAbs(d) {
+			t.Fatalf("absolute empty-dir path recorded: %q", d)
+		}
+	}
+	if !found {
+		t.Fatalf("empty dir not recorded: %v", m.EmptyDirs)
 	}
 }

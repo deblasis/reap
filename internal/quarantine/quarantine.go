@@ -24,9 +24,11 @@
 package quarantine
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -41,34 +43,44 @@ import (
 // Manifest is the completeness record stored beside every bundle: what the
 // snapshot holds, per class, so a discard log line proves recoverability.
 type Manifest struct {
-	Created     time.Time `json:"created"`
-	RunID       string    `json:"runId,omitempty"` // reverse lookup from reap.log
-	Source      string    `json:"source"`
-	Mode        string    `json:"mode"` // bundle | plain-copy
-	Origin      string    `json:"origin,omitempty"`   // remote URL a delta bundle depends on
-	BaseRef     string    `json:"baseRef,omitempty"`  // the pinned base ref ("" = self-contained)
-	BaseSHA     string    `json:"baseSha,omitempty"`  // base commit SHA (prerequisite proof)
-	SelfContained bool    `json:"selfContained"`      // true = restorable with no remote
-	BundleBytes int64     `json:"bundleBytes,omitempty"`
-	CaptureRef  string    `json:"captureRef,omitempty"` // refs/reap/capture-*
-	Classes     Classes   `json:"classes"`
-	Entries     []Entry   `json:"entries,omitempty"` // plain-copy file list
-	EmptyDirs   []string  `json:"emptyDirs,omitempty"`
-	Interleaved bool      `json:"indexInterleaved,omitempty"` // concurrent git touched the index mid-capture
+	Created       time.Time  `json:"created"`
+	RunID         string     `json:"runId,omitempty"` // reverse lookup from reap.log
+	Source        string     `json:"source"`
+	Mode          string     `json:"mode"` // bundle | plain-copy
+	Origin        string     `json:"origin,omitempty"` // remote URL a delta bundle depends on
+	BaseRef       string     `json:"baseRef,omitempty"`
+	BaseSHA       string     `json:"baseSha,omitempty"`
+	BaseBases     []BaseInfo `json:"baseBases,omitempty"` // per-branch-union bases (branch -> base)
+	SelfContained bool       `json:"selfContained"`
+	BundleBytes   int64      `json:"bundleBytes,omitempty"`
+	CaptureRef    string     `json:"captureRef,omitempty"` // refs/reap/capture-*
+	Classes       Classes    `json:"classes"`
+	Entries       []Entry    `json:"entries,omitempty"` // plain-copy file list
+	EmptyDirs     []string  `json:"emptyDirs,omitempty"` // RELATIVE to the source root
+	Interleaved   bool       `json:"indexInterleaved,omitempty"`
+}
+
+// BaseInfo is one per-branch delta base (the per-branch-union tier).
+type BaseInfo struct {
+	Branch string `json:"branch"`
+	Ref    string `json:"ref"`
+	SHA    string `json:"sha"`
 }
 
 // Classes records what the snapshot provably contains, per category.
 type Classes struct {
-	Refs           int   `json:"refs"`
-	ReflogTips     int   `json:"reflogTips"`
-	ReflogExpireD  int   `json:"reflogExpireDays,omitempty"`
-	StashGens      int   `json:"stashGenerations"`
-	JJChanges      int   `json:"jjChanges"`
-	Dirty          int   `json:"dirtyBytes"`
-	UntrackedFiles int   `json:"untrackedFiles"`
-	UntrackedBytes int64 `json:"untrackedBytes"`
-	IgnoredFiles   int   `json:"ignoredFiles"`
-	IgnoredBytes   int64 `json:"ignoredBytes"`
+	Refs             int   `json:"refs"`             // branch tips pinned
+	Tags             int   `json:"tags"`             // tag tips pinned
+	ReflogTips       int   `json:"reflogTips"`
+	ReflogExpireD    int   `json:"reflogExpireDays,omitempty"`
+	StashGens        int   `json:"stashGenerations"`
+	JJChanges        int   `json:"jjChanges"`
+	DirtyFiles       int   `json:"dirtyFiles"`
+	DirtyBytes       int64 `json:"dirtyBytes"`
+	UntrackedFiles   int   `json:"untrackedFiles"`
+	UntrackedBytes   int64 `json:"untrackedBytes"`
+	IgnoredFiles     int   `json:"ignoredFiles"`
+	IgnoredBytes     int64 `json:"ignoredBytes"`
 }
 
 // Entry is one plain-copy file (name + size), capped in count.
@@ -77,11 +89,13 @@ type Entry struct {
 	Size int64  `json:"size"`
 }
 
-// ErrTooLarge reports the snapshot exceeded the cap (dir untouched).
+// ErrTooLarge reports the snapshot exceeded the cap (dir untouched). The
+// copy names the config key: when the cap binds, the operator's remedy is
+// quarantine-cap-gb.
 type ErrTooLarge struct{ Need, Cap int64 }
 
 func (e *ErrTooLarge) Error() string {
-	return fmt.Sprintf("quarantine would need ~%d MB, cap is %d MB", e.Need>>20, e.Cap>>20)
+	return fmt.Sprintf("quarantine would need ~%d MB, cap is %d MB (quarantine-cap-gb)", e.Need>>20, e.Cap>>20)
 }
 
 // ErrVerify reports the bundle failed verification (dir untouched).
@@ -142,10 +156,10 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 
 	// The session dir must exist up front: `git bundle create` writes
 	// <bundle>.lock BESIDE its destination. Created EXCLUSIVELY (Mkdir, not
-	// MkdirAll): a same-name race from another process must fail loudly,
-	// never overwrite a live session.
-	if err := os.Mkdir(sessionDir, 0o755); err != nil && !os.IsExist(err) {
-		return nil, err
+	// MkdirAll): an existing dir of the same name is ANOTHER SESSION —
+	// proceeding would overwrite that dir's only recovery copy.
+	if err := os.Mkdir(sessionDir, 0o755); err != nil {
+		return nil, fmt.Errorf("session dir %s: %w (a same-named session exists; refusing to overwrite)", sessionDir, err)
 	}
 
 	// Capture-start git-busy check (the spec's step 3 interlock): a live
@@ -174,15 +188,24 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 	}
 
 	// 3. THE BUNDLE IS THE QUARANTINE. refs/reap/* pins live inside the
-	//    source repo and die with it; materialize every pinned ref into the
-	//    session dir as an explicit <base>..<ref> range list, verify it
-	//    against the repo that still exists, and fsync before the caller
-	//    may delete anything.
+	//    source repo and die with it; price the ranges, then materialize
+	//    every pinned ref into the session dir as an explicit <base>..<ref>
+	//    range list, verify it against the repo that still exists, and
+	//    fsync before the caller may delete anything. Pricing runs BEFORE
+	//    the write: an over-cap projection refuses without transiently
+	//    dumping the payload onto the volume this tool protects.
 	bundle := filepath.Join(sessionDir, "bundle.git")
 	ranges, err := bundleRanges(gitRunner, source, m, append([]string{m.CaptureRef}, pins...))
 	if err != nil {
 		removeSession(sessionDir)
 		return nil, err
+	}
+	if opts.CapBytes > 0 {
+		projected, derr := gitRunner.DiskUsage(source, ranges)
+		if derr == nil && projected > opts.CapBytes {
+			removeSession(sessionDir)
+			return nil, &ErrTooLarge{Need: projected, Cap: opts.CapBytes}
+		}
 	}
 	if err := gitRunner.BundleCreateRanges(source, bundle, ranges); err != nil {
 		removeSession(sessionDir)
@@ -243,9 +266,10 @@ func syncFile(path string) error {
 	return f.Sync()
 }
 
-// findEmptyDirs lists empty directories under root (capped): git trees
-// cannot represent them, so the manifest records them and restore
-// recreates them.
+// findEmptyDirs lists empty directories under root (capped), as paths
+// RELATIVE to root: git trees cannot represent them, so the manifest
+// records them and restore recreates them under the destination — absolute
+// paths there produced invalid joins (the round-2 live probe).
 func findEmptyDirs(root string, cap int) []string {
 	var out []string
 	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -261,7 +285,9 @@ func findEmptyDirs(root string, cap int) []string {
 		}
 		entries, rerr := os.ReadDir(p)
 		if rerr == nil && len(entries) == 0 && len(out) < cap {
-			out = append(out, p)
+			if rel, rerr := filepath.Rel(root, p); rerr == nil {
+				out = append(out, rel)
+			}
 		}
 		return nil
 	})
@@ -350,12 +376,36 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	if rerr := restore(); rerr != nil {
 		return rerr
 	}
-	// Interlock: a concurrent git that wrote the index mid-window would
-	// have been silently restored over — surface it instead (spec step 3).
-	if post := indexMtime(dir); !preMtime.IsZero() && !post.IsZero() && !post.Equal(preMtime) {
-		m.Interleaved = true
+	// Interlock, for real this time (round-3): mtimes cannot carry the
+	// signal — `git add` itself rewrites the index mid-window, so mtime
+	// comparisons fire on every capture, and a pre-restore content check
+	// sees only reap's own all-staged index. The one honest, observable
+	// window is AFTER the restore: if the index on disk differs from the
+	// backup bytes we just wrote there, a concurrent git wrote during the
+	// capture window — surface it instead of silently restoring over it.
+	// The restore's own mtime bump is UNDONE so a refused discard does not
+	// flip the dir ACTIVE for 48h (the exact feedback loop Reverify fixes
+	// for FETCH_HEAD).
+	if backup != "" {
+		if saved, serr := os.ReadFile(backup); serr == nil {
+			if cur, cerr := os.ReadFile(filepath.Join(gitDirOf(dir), "index")); cerr == nil && !bytes.Equal(saved, cur) {
+				m.Interleaved = true
+			}
+		}
+	}
+	if g, ok := gitDirForPath(dir); ok && !preMtime.IsZero() {
+		_ = os.Chtimes(filepath.Join(g, "index"), preMtime, preMtime)
 	}
 	return nil
+}
+
+// gitDirOf resolves the worktree's own git dir or "" when absent.
+func gitDirOf(dir string) string {
+	g, ok := gitDirForPath(dir)
+	if !ok {
+		return ""
+	}
+	return g
 }
 
 // pinTips pins every recoverable LOCAL-ONLY tip under refs/reap/*, named
@@ -372,17 +422,24 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 		return nil
 	}
 
-	// Branch and tag tips: only those carrying local-only commits (a tip
-	// fully on a remote is recoverable by re-cloning). When the unpushed
-	// set cannot be computed, EVERYTHING is pinned — the completeness
-	// direction.
+	// Branch and tag tips: only those whose PEELD commit carries local-only
+	// work (a tip fully on a remote is recoverable by re-cloning). An
+	// annotated tag's %(objectname) is the tag OBJECT — membership against
+	// the unpushed COMMIt set must use the peeled target, or every
+	// annotated-tag pin silently drops (the round-2 live data loss). When
+	// the unpushed set cannot be computed, EVERYTHING is pinned — the
+	// completeness direction.
 	tips, err := r.LocalOnlyTips(dir)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate tips: %w", err)
 	}
 	unpushed := r.UnpushedCommits(dir)
 	for _, tip := range tips {
-		if unpushed != nil && !unpushed[tip.SHA] {
+		member := tip.Peeled
+		if member == "" {
+			member = tip.SHA
+		}
+		if unpushed != nil && !unpushed[member] && !unpushed[tip.SHA] {
 			continue
 		}
 		var ref string
@@ -394,22 +451,53 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 		default:
 			continue
 		}
+		// Pin the ref's OWN object: for an annotated tag that carries the
+		// tag object AND (via the bundle range) its target chain.
 		if perr := pin(ref, tip.SHA); perr != nil {
 			return nil, perr
 		}
-		m.Classes.Refs++
+		if strings.HasPrefix(tip.Ref, "refs/tags/") {
+			m.Classes.Tags++
+		} else {
+			m.Classes.Refs++
+		}
 	}
 
 	// Reflog-only generations: post-reset / pre-rebase commits reachable
 	// from NO ref — the entire unpushed-reflog BLOCKED class. Reflogs are
-	// never packed by bundles, so each one gets a named pin.
-	reflogTips := r.ReflogOnlyCommits(dir)
+	// never packed by bundles, so each ENTRY TIP gets a named pin (the
+	// chain under it rides along in the bundle range). Unreadable evidence
+	// FAILS the capture: pinning nothing while claiming completeness is
+	// the manifest's one forbidden lie.
+	reflogTips, rerr := r.ReflogOnlyCommits(dir)
+	if rerr != nil {
+		return nil, fmt.Errorf("enumerate reflog entries: %w", rerr)
+	}
 	for i, sha := range reflogTips {
 		if perr := pin(fmt.Sprintf("refs/reap/reflog-%d", i), sha); perr != nil {
 			return nil, perr
 		}
 	}
 	m.Classes.ReflogTips = len(reflogTips)
+	// Days-to-expiry from the OLDEST reflog-only entry tip (90d default
+	// expiry, same approximation the verdict's detail uses).
+	if dates := r.ReflogEntryDates(dir); len(dates) > 0 {
+		oldest := time.Time{}
+		for _, sha := range reflogTips {
+			if ds, ok := dates[sha]; ok {
+				if d, perr := time.Parse(time.RFC3339, ds); perr == nil && (oldest.IsZero() || d.Before(oldest)) {
+					oldest = d
+				}
+			}
+		}
+		if !oldest.IsZero() {
+			days := 90 - int(time.Since(oldest).Hours()/24)
+			if days < 0 {
+				days = 0
+			}
+			m.Classes.ReflogExpireD = days
+		}
+	}
 
 	// Stash generations pinned individually (bundles pack refs, not
 	// reflogs; a bare refs/stash pin would carry only the newest).
@@ -452,14 +540,20 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 // bundleRanges selects the delta base per the spec's pinned order — the
 // current branch's upstream-tracking ref, else origin/HEAD, else a
 // per-branch upstream union — and returns the literal <base>..<ref> list
-// (a bare ref = a full, self-contained history). No usable base at all
-// (no remotes) means the self-contained full form, recorded in the
-// manifest for recovery and revalidation.
+// (a bare ref = a full, self-contained history). Two capture-time
+// decisions per the spec: (1) the base must still be ADVERTISED by the
+// recorded remote (one ls-remote) — a base that is not advertised may be
+// gone (force-push/squash-merge), and shipping a delta whose recovery
+// depends on it would be a bundle that verifies yet never restores; the
+// safe fallback in both the gone and the merely-advanced case is the
+// self-contained form (bigger, but complete either way; if that exceeds
+// the cap, the caller refuses with the dir still on disk). (2) per-branch
+// bases are RECORDED with their SHAs so revalidation and restore can name
+// real prerequisites.
 func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]string, error) {
 	m.Origin = r.RemoteURL(dir)
 	if m.Origin == "" {
 		if remotes := r.Remotes(dir); len(remotes) > 0 {
-			// Deterministic pick: sorted first remote URL.
 			names := make([]string, 0, len(remotes))
 			for name := range remotes {
 				names = append(names, name)
@@ -480,38 +574,70 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		}
 		return out
 	}
+	selfContained := func() ([]string, error) {
+		m.BaseRef, m.BaseSHA, m.BaseBases, m.SelfContained = "", "", nil, true
+		return rangesFor(""), nil
+	}
+	// Capture-time revalidation: no remote to ask, or base not advertised
+	// (gone OR merely advanced — indistinguishable without a fetch, and
+	// self-contained is correct in both) -> self-contained form.
+	baseAdvertised := func(ref, sha string) bool {
+		if m.Origin == "" || sha == "" {
+			return m.Origin == "" // no remote at all: self-contained by shape
+		}
+		out, err := r.LSRemote(m.Origin)
+		if err != nil {
+			// Offline at capture time: the base cannot be confirmed —
+			// self-contained, never an unverifiable delta.
+			return false
+		}
+		return strings.Contains(out, sha)
+	}
 
 	if up := r.UpstreamRef(dir); up != "" && r.ResolveRef(dir, up) != "" {
-		m.BaseRef, m.BaseSHA, m.SelfContained = up, r.ResolveRef(dir, up), false
+		sha := r.ResolveRef(dir, up)
+		if !baseAdvertised(up, sha) {
+			return selfContained()
+		}
+		m.BaseRef, m.BaseSHA, m.SelfContained = up, sha, false
 		return rangesFor(up), nil
 	}
 	if sha := r.ResolveRef(dir, "refs/remotes/origin/HEAD"); sha != "" {
+		if !baseAdvertised("refs/remotes/origin/HEAD", sha) {
+			return selfContained()
+		}
 		m.BaseRef, m.BaseSHA, m.SelfContained = "refs/remotes/origin/HEAD", sha, false
 		return rangesFor("refs/remotes/origin/HEAD"), nil
 	}
-	// Per-branch union: branches with their own upstream price against it;
-	// everything else is carried whole. BaseRef records the shape.
+	// Per-branch union: branches with their own upstream price against it
+	// (each base recorded); everything else is carried whole.
 	if ups := r.BranchUpstreams(dir); len(ups) > 0 {
 		m.BaseRef, m.SelfContained = "per-branch", false
 		out := make([]string, 0, len(refs))
 		for _, ref := range refs {
-			base := ""
+			base, baseSHA := "", ""
 			if strings.HasPrefix(ref, "refs/reap/unpushed-") {
-				if up, ok := ups[strings.TrimPrefix(ref, "refs/reap/unpushed-")]; ok && r.ResolveRef(dir, up) != "" {
-					base = up
+				if up, ok := ups[strings.TrimPrefix(ref, "refs/reap/unpushed-")]; ok {
+					baseSHA = r.ResolveRef(dir, up)
+					if baseSHA != "" {
+						base = up
+					}
 				}
 			}
 			if base != "" {
+				m.BaseBases = append(m.BaseBases, BaseInfo{
+					Branch: strings.TrimPrefix(ref, "refs/reap/unpushed-"), Ref: base, SHA: baseSHA})
 				out = append(out, base+".."+ref)
 			} else {
 				out = append(out, ref)
 			}
 		}
+		if len(m.BaseBases) > 0 && m.BaseSHA == "" {
+			m.BaseSHA = m.BaseBases[0].SHA
+		}
 		return out, nil
 	}
-	// No usable base: self-contained full histories.
-	m.BaseRef, m.BaseSHA, m.SelfContained = "", "", true
-	return rangesFor(""), nil
+	return selfContained()
 }
 
 func (m *Manifest) account(r gitx.Runner, dir string) error {
@@ -519,7 +645,8 @@ func (m *Manifest) account(r gitx.Runner, dir string) error {
 	if err != nil {
 		return fmt.Errorf("status for manifest accounting: %w", err)
 	}
-	m.Classes.Dirty = st.Dirty
+	m.Classes.DirtyFiles = st.Dirty
+	m.Classes.DirtyBytes = st.DirtyBytes
 	m.Classes.UntrackedFiles = st.Untracked
 	m.Classes.UntrackedBytes = st.UntrackedBytes
 	m.Classes.IgnoredFiles = st.Ignored
@@ -611,11 +738,22 @@ func copyTree(src, dst string) error {
 			}
 			return os.Symlink(link, target)
 		}
-		data, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
+		// Streamed, not buffered whole: a near-cap single file must not
+		// spike RSS by its size.
+		in, oerr := os.Open(p)
+		if oerr != nil {
+			return oerr
 		}
-		return os.WriteFile(target, data, 0o644)
+		defer in.Close()
+		out, cerr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if cerr != nil {
+			return cerr
+		}
+		if _, cerr = io.Copy(out, in); cerr != nil {
+			out.Close()
+			return cerr
+		}
+		return out.Close()
 	})
 }
 
@@ -687,32 +825,39 @@ const (
 	Unverified RestoreVerdict = "unverified"
 )
 
-// Revalidate checks a delta bundle's base against its recorded remote with
-// one ls-remote: the base SHA still advertised = verified-ok; the remote
-// reachable but the base not among its advertised tips = at-risk (likely
-// force-push/squash-merge — recovery through the remote is ending);
-// unreachable remote = unverified (offline/auth — NOT at-risk). One
-// ls-remote cannot prove ancestry, so "advertised" is the approximation
-// the spec's budget allows; self-contained bundles are verified-ok by
-// construction.
+// Revalidate checks a delta bundle's base(s) against its recorded remote
+// with one ls-remote: every recorded base SHA still advertised =
+// verified-ok; the remote reachable but a base not among its advertised
+// tips = at-risk (likely force-push/squash-merge — recovery through the
+// remote is ending); unreachable remote = unverified (offline/auth — NOT
+// at-risk). One ls-remote cannot prove ancestry, so "advertised" is the
+// approximation the spec's budget allows (restore itself fetch-then-
+// verifies and never refuses on advancement); self-contained bundles are
+// verified-ok by construction.
 func Revalidate(r gitx.Runner, m *Manifest) RestoreVerdict {
 	if m == nil {
 		return Unverified
 	}
-	if m.SelfContained || m.BaseSHA == "" {
+	if m.SelfContained || (m.BaseSHA == "" && len(m.BaseBases) == 0) {
 		return VerifiedOK
 	}
 	out, err := r.LSRemote(m.Origin)
 	if err != nil {
 		return Unverified
 	}
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == m.BaseSHA {
-			return VerifiedOK
+	bases := map[string]bool{m.BaseSHA: true}
+	for _, b := range m.BaseBases {
+		bases[b.SHA] = true
+	}
+	for sha := range bases {
+		if sha == "" {
+			continue
+		}
+		if !strings.Contains(out, sha) {
+			return AtRisk
 		}
 	}
-	return AtRisk
+	return VerifiedOK
 }
 
 // Bytes measures a session dir's size on disk.

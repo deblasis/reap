@@ -97,6 +97,12 @@ func (l *Log) Append(line Line) error {
 		f.Close()
 		return fmt.Errorf("audit append failed (apply must abort): %w", err)
 	}
+	// The ledger is the recovery story: a power cut right after a deletion
+	// must not lose its tail while the deletion stands.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("audit append failed (apply must abort): %w", err)
+	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("audit append failed (apply must abort): %w", err)
 	}
