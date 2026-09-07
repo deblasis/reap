@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/deblasis/reap/internal/applycmd"
+	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/quarantine"
 )
@@ -972,6 +973,153 @@ func TestWiringDiscardIgnoranceRemedy(t *testing.T) {
 	}
 	if !strings.Contains(e.String(), "fix the tool") && !strings.Contains(e.String(), "unreadable") {
 		t.Fatalf("ignorance remedy copy missing: %q", e.String())
+	}
+}
+
+// The scan/plan/apply AGREEMENT harness (spec L512-513, '(tested)'):
+// over one mixed fixture tree, the SAFE set scan reports equals the plan's
+// dir set - guarding the hand-synced pipelines against the drift class
+// that born the round-9 major.
+func TestWiringScanPlanAgreement(t *testing.T) {
+	root, _ := wireFixture(t)
+	// A clean-pushed repo beside the scratch dir: two shapes, one tree.
+	repo := filepath.Join(root, "pushed")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	bare := filepath.Join(t.TempDir(), "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	wireGit(t, repo, "remote", "add", "origin", bare)
+	wireGit(t, repo, "push", "-q", "origin", "main")
+	ageTree(t, repo, 30*24*time.Hour)
+
+	var scanOut bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &scanOut, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	var rep struct {
+		Entries []struct {
+			Path    string `json:"path"`
+			Verdict string `json:"verdict"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(scanOut.Bytes(), &rep); err != nil {
+		t.Fatalf("scan json: %v", err)
+	}
+	safeSet := map[string]bool{}
+	for _, e := range rep.Entries {
+		if e.Verdict == "SAFE" {
+			safeSet[filepath.Clean(e.Path)] = true
+		}
+	}
+	var planOut bytes.Buffer
+	if code := cmdPlan([]string{"--no-gh"}, &planOut, os.Stderr); code != ExitOK {
+		t.Fatalf("plan: %d", code)
+	}
+	if len(safeSet) == 0 {
+		t.Fatal("fixture produced no SAFE rows")
+	}
+	for p := range safeSet {
+		if !strings.Contains(planOut.String(), p) {
+			t.Fatalf("SAFE dir %s missing from plan (scan/plan disagree):\n%s", p, planOut.String())
+		}
+	}
+	// And nothing in the plan is outside the SAFE set (the default plan
+	// widens nothing).
+	for _, line := range strings.Split(planOut.String(), "\n") {
+		for p := range safeSet {
+			_ = p
+			break
+		}
+		if strings.Contains(line, "GB  ") && !strings.Contains(line, "dry-run") {
+			found := false
+			for p := range safeSet {
+				if strings.Contains(line, p) {
+					found = true
+					break
+				}
+			}
+			if !found && strings.TrimSpace(line) != "" {
+				t.Fatalf("plan lists a non-SAFE dir by default:\n%s", line)
+			}
+		}
+	}
+}
+
+// The mid-run floor stop, driven through the FreeBytes seam (round 12; the
+// seam was built in round 9 and never exercised). One orphan: the plain
+// copy succeeds, the mid-run recheck trips, the dir STANDS with its
+// session kept and a skip line on the ledger, exit 125.
+func TestWiringCarveOutFloorStop(t *testing.T) {
+	restore := applycmd.ForceTerminal(true)
+	defer restore()
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, d := range []string{root, stateDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	ph := filepath.Join(base, "ph")
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", ph).CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	wt := filepath.Join(root, "orph")
+	if out, err := exec.Command("git", "-C", ph, "worktree", "add", "-q", wt).CombinedOutput(); err != nil {
+		t.Skipf("worktree add: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "only.txt"), []byte("PRECIOUS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(ph)
+	ageTree(t, wt, 30*24*time.Hour)
+
+	// FreeBytes drops below the floor after the preflight reads (Confirm's
+	// floor + freeBefore pass; the mid-run recheck after the plain copy
+	// trips).
+	orig := auditlog.FreeBytes
+	calls := 0
+	auditlog.FreeBytes = func(path string) uint64 {
+		calls++
+		if calls <= 2 {
+			return orig(path)
+		}
+		return 1 << 20 // 1 MB: below every floor
+	}
+	t.Cleanup(func() { auditlog.FreeBytes = orig })
+
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt}, os.Stdout, os.Stderr, answerStdin(t, "y\ny\n")); code != applycmd.ExitQuarantine {
+		t.Fatalf("floor-stop run: %d (want 125)", code)
+	}
+	// The dir stands with its session kept on disk and on the ledger.
+	if _, serr := os.Stat(wt); serr != nil {
+		t.Fatal("floor-stopped orphan was deleted")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(raw), "free space below floor") {
+		t.Fatalf("floor-stop skip line missing:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), `"quarantinePath":"`) {
+		t.Fatalf("skip line must carry the kept session's pointer:\n%s", raw)
+	}
+	sessions, _ := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if len(sessions) != 1 {
+		t.Fatalf("kept session: %d", len(sessions))
 	}
 }
 

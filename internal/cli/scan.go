@@ -353,11 +353,17 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 			e.ReasonCode = v.Code
 			// The reason must not say "parent gone" when the parent is
 			// alive: this shape is DEREGISTERED (the forget-then-rm crash
-			// window), not parent-less. KEEP rows keep the rail's own
-			// story (held-by-user), not the flavor's.
+			// window), not parent-less. Every other code (KEEP rails,
+			// ACTIVE) keeps its own story - including a non-empty reason
+			// (round 12: the if-only form left held rows with a BLANK one).
 			if v.Code == "orphaned-workspace" {
 				e.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
 				v.Hint = "deregistered workspace (parent alive, this dir is out of its registry); reap apply --override-manual asks a TTY-only hardened confirm"
+			} else {
+				e.Reason = v.Reason
+			}
+			if v.BlockedClassFact != "" {
+				e.Reason += fmt.Sprintf(" (also: %s)", v.BlockedClassFact)
 			}
 			e.Hint = v.Hint
 			e.Held = in.Held

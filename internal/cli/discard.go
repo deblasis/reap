@@ -315,7 +315,13 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			refuse("KEEP (held / protected / reparse); KEEP paths refuse unconditionally", rv.Verdict.Code)
 			continue
 		case cls.Kind == classify.KindGitWorktreeOrphaned || cls.Kind == classify.KindJJWorkspaceOrphaned:
-			refuse("orphaned worktree/workspace: capture needs a readable git backend and the parent is gone; the only deletion path is reap apply --override-manual (TTY-only hardened confirm)", rv.Verdict.Code)
+			// Flavor-aware (round 12: the sixth copy site): the
+			// deregistered workspace's parent is ALIVE one directory up.
+			orphanCopy := "orphaned worktree/workspace: capture needs a readable git backend and the parent is gone; the only deletion path is reap apply --override-manual (TTY-only hardened confirm)"
+			if rv.Verdict.Flavor == verdict.FlavorDeregistered {
+				orphanCopy = "deregistered workspace (parent alive, this dir is out of its registry); the deletion path is reap apply --override-manual (TTY-only hardened confirm), or re-register it in the parent"
+			}
+			refuse(orphanCopy, rv.Verdict.Code)
 			continue
 		case rv.SkipWhy == applycmd.SkipParentLive || rv.Verdict.Code == "parent-of-live-children":
 			skip(applycmd.SkipParentLive)

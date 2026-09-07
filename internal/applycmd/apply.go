@@ -347,6 +347,7 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 		}
 	}
 	restoreFetchHead()
+	flavorDeregistered := false
 	if classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace {
 		f := d.JJ.Facts(path, now, remoteStale)
 		// WORKSPACE-shaped only (the parent resolved alive at classify).
@@ -360,11 +361,19 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 			in.Kind = classInfo.Kind
 			in.GitBackend = false
 			in.JJ = nil
+			flavorDeregistered = true
 		} else {
 			in.JJ = &f
 		}
 	}
 	v := verdict.Decide(in)
+	if flavorDeregistered {
+		v.Flavor = verdict.FlavorDeregistered
+		if v.Code == "orphaned-workspace" {
+			v.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
+			v.Hint = "deregistered workspace (parent alive, this dir is out of its registry); reap apply --override-manual asks a TTY-only hardened confirm"
+		}
+	}
 
 	// Ignorance-class fresh verdicts (gh died mid-run etc.) report as
 	// ignorance, not verdict-changed (round 2: the histogram misled).

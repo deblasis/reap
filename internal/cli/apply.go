@@ -642,7 +642,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 			counts := countsFor(p.Flavor)
 			if p.OrphanCounts != "" {
-				counts = p.OrphanCounts + " (parent present but broken)"
+				counts = p.OrphanCounts + countsSuffixFor(p.Flavor)
 			}
 			gitdir := ""
 			if p.ParentRepo != "" {
@@ -853,9 +853,13 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				// The consent lands on the ledger NOW, before the deletion
 				// it authorizes (write-ahead: a crash after Delete must be
 				// distinguishable from a deleted-with-snapshot run).
+				ocCounts := countsFor(p.Flavor)
+				if p.OrphanCounts != "" {
+					ocCounts = p.OrphanCounts + countsSuffixFor(p.Flavor)
+				}
 				if rc := appendOrAbort(auditlog.Line{Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
 					Verdict: p.Verdict, ReasonCode: p.Code, Manifest: rv.Manifest,
-					Residue: "hardened confirm shown; over-cap consent accepted: recovery is the file manifest only"}); rc >= 0 {
+					Residue: "hardened confirm shown (counts: " + ocCounts + "); over-cap consent accepted: recovery is the file manifest only"}); rc >= 0 {
 					return rc
 				}
 			default:
@@ -996,10 +1000,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 // was needed).
 func droppedWidenings(cands []candidate, include, overrideManual []string, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string) []string {
 	planned := map[string]bool{}
-	plannedCodes := map[string]bool{}
 	for _, p := range plan {
 		planned[config.Canonical(p.Path)] = true
-		plannedCodes[p.Code] = true
 	}
 	excluded := map[string]bool{}
 	for _, b := range below {
@@ -1059,6 +1061,16 @@ func countsFor(flavor string) string {
 		return "deregistered workspace (parent alive, this dir is out of its registry)"
 	}
 	return "counts unknowable, parent gone"
+}
+
+// countsSuffixFor qualifies KNOWABLE counts per flavor (round 12): the
+// default orphan's parent is broken; the deregistered shape's is alive
+// and merely no longer lists this dir.
+func countsSuffixFor(flavor string) string {
+	if flavor == verdict.FlavorDeregistered {
+		return " (parent alive, this dir is out of its registry)"
+	}
+	return " (parent present but broken)"
 }
 
 func sumExcluded(below []applycmd.ExcludedRef) int64 {
