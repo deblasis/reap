@@ -165,7 +165,7 @@ func TestReverifyTripwireSkipsFreshDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil, nil)
 	if rv.SkipWhy != SkipActiveTripwire || rv.Verdict.Verdict != "ACTIVE" {
 		t.Fatalf("fresh dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
@@ -184,7 +184,7 @@ func TestReverifyProtectedSkips(t *testing.T) {
 	}
 	cfg := config.Default()
 	protected := []string{"**/cand/**"}
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, protected, nil, nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, protected, nil, nil, nil)
 	if rv.SkipWhy != SkipVerdictChanged || rv.Verdict.Verdict != "KEEP" {
 		t.Fatalf("protected dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
@@ -207,7 +207,7 @@ func TestReverifyFreshCodeMustMatchPlan(t *testing.T) {
 	old := time.Now().Add(-40 * 24 * time.Hour)
 	_ = os.Chtimes(target, old, old)
 	cfg := config.Default()
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil, nil)
 	if rv.SkipWhy != SkipVerdictChanged {
 		t.Fatalf("drifted code: skip=%q verdict=%s/%s (must skip verdict-changed)", rv.SkipWhy, rv.Verdict.Verdict, rv.Verdict.Code)
 	}
@@ -216,14 +216,18 @@ func TestReverifyFreshCodeMustMatchPlan(t *testing.T) {
 // Confirm: the free-space floor REFUSES (round-1: print-only), non-TTY
 // without --yes exits 121, dry-run never asks.
 func TestConfirmFloorsAndRefusals(t *testing.T) {
-	var out strings.Builder
-	// Floor refusal: 256MB required, 1MB free.
-	proceed, code := Confirm(&out, nil, []PlanEntry{{Path: "x", SizeBytes: 1}}, nil, 256<<20, 1<<20, Options{Yes: true})
+	var out, errOut strings.Builder
+	// Floor refusal: 256MB required, 1MB free. Refusal copy goes to STDERR
+	// (round 3: it printed to stdout unlike every other refusal).
+	proceed, code := Confirm(&out, nil, []PlanEntry{{Path: "x", SizeBytes: 1}}, nil, 256<<20, 1<<20, Options{Yes: true, ErrOut: &errOut})
 	if proceed || code != ExitState {
 		t.Fatalf("floor: proceed=%v code=%d", proceed, code)
 	}
-	if !strings.Contains(out.String(), "preflight refused") {
-		t.Fatalf("refusal copy: %q", out.String())
+	if !strings.Contains(errOut.String(), "preflight refused") {
+		t.Fatalf("refusal copy on stderr: %q", errOut.String())
+	}
+	if strings.Contains(out.String(), "preflight refused") {
+		t.Fatalf("refusal leaked to stdout: %q", out.String())
 	}
 	// Non-TTY without --yes: 121.
 	out.Reset()

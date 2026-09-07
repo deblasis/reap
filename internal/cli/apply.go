@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -94,6 +95,11 @@ type candidate struct {
 	entry report.Entry
 	vd    verdict.Verdict
 	cls   classify.Info
+	// planChildren are the scan-time live children, captured for the
+	// parent-of-live-children in-run unlock: after worktree-remove prunes
+	// the registration, the FRESH enumeration is empty, so the unlock must
+	// compare against what the plan saw (round 3's end-to-end proof).
+	planChildren []string
 }
 
 // run walks the roots and verdicts every candidate.
@@ -109,13 +115,13 @@ func (c *scanCore) run(now time.Time) ([]candidate, []string) {
 		if info.IsReparse {
 			continue // KEEP rails never enter plans
 		}
-		e, v, cls := c.build(info, now)
-		out = append(out, candidate{entry: e, vd: v, cls: cls})
+		e, v, cls, pc := c.build(info, now)
+		out = append(out, candidate{entry: e, vd: v, cls: cls, planChildren: pc})
 	}
 	return out, unreadableRoots
 }
 
-func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdict.Verdict, classify.Info) {
+func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdict.Verdict, classify.Info, []string) {
 	e := report.Entry{
 		Path:         info.Path,
 		Zone:         info.Root,
@@ -181,7 +187,14 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 	if v.OrphanedCarveOut && v.BlockedClassFact != "" {
 		e.Reason = e.Reason + fmt.Sprintf(" (also: %s)", v.BlockedClassFact)
 	}
-	return e, v, cls
+	var planChildren []string
+	if in.Git != nil {
+		planChildren = append(planChildren, in.Git.Children...)
+	}
+	if in.JJ != nil {
+		planChildren = append(planChildren, in.JJ.Children...)
+	}
+	return e, v, cls, planChildren
 }
 
 // resolvePlan applies SAFE-default + include/exclude/override selection,
@@ -211,7 +224,11 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		case c.vd.Verdict == verdict.Safe:
 			take = true
 		case c.vd.OrphanedCarveOut && (inc[c.vd.Code] || ovr[config.Canonical(c.entry.Path)]):
-			return nil, nil, nil, fmt.Errorf("%s is an orphaned carve-out row: deletable only via the TTY-only hardened confirm (ships with M3); refusing under --include/--override-manual", c.entry.Path)
+			counts := "counts unknowable, parent gone"
+			if c.vd.BlockedClassFact != "" {
+				counts = c.vd.BlockedClassFact
+			}
+			return nil, nil, nil, &carveOutRefusal{path: c.entry.Path, counts: counts}
 		case inc[c.vd.Code] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
 			take, widened = true, true
 		case ovr[config.Canonical(c.entry.Path)] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
@@ -228,11 +245,17 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			below = append(below, applycmd.ExcludedRef{Path: c.entry.Path, Size: c.entry.SizeBytes})
 			continue
 		}
-		plan = append(plan, applycmd.PlanEntry{
+		pe := applycmd.PlanEntry{
 			Path: c.entry.Path, Verdict: c.vd.Verdict, Code: c.vd.Code,
 			SizeBytes: c.entry.SizeBytes, Widened: widened, Kind: string(c.cls.Kind),
 			ParentRepo: c.cls.ParentRepo, Orphaned: c.vd.OrphanedCarveOut,
-		})
+		}
+		if c.vd.Code == "parent-of-live-children" {
+			for _, ch := range c.planChildren {
+				pe.PlanChildren = append(pe.PlanChildren, ch)
+			}
+		}
+		plan = append(plan, pe)
 	}
 	for _, code := range include {
 		used := false
@@ -251,6 +274,14 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		}
 	}
 	return plan, below, excludedByCode, nil
+}
+
+// carveOutRefusal is the orphaned carve-out refusal: 120 from plan, 121
+// from non-TTY apply --yes, counts always in the message (spec interim).
+type carveOutRefusal struct{ path, counts string }
+
+func (e *carveOutRefusal) Error() string {
+	return fmt.Sprintf("%s is an orphaned carve-out row (%s): deletable only via the TTY-only hardened confirm (ships with M3); refusing under --include/--override-manual", e.path, e.counts)
 }
 
 // validateCodes checks include/exclude against the closed reasonCode enum.
@@ -399,6 +430,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB)
 	if err != nil {
+		var co *carveOutRefusal
+		if errors.As(err, &co) && *yes && !applycmd.IsTerminal(stdin, stdout) {
+			fmt.Fprintf(stderr, "reap apply: %v\n", err)
+			return applycmd.ExitNotTTY
+		}
 		fmt.Fprintf(stderr, "reap apply: %v\n", err)
 		return ExitUsage
 	}
@@ -417,7 +453,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	minFree := uint64(core.cfg.Thresholds.MinFreeMB) << 20
 	free := auditlog.FreeBytes(stateDir)
 	widened := planWidenedCodes(plan)
-	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes})
+	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes, ErrOut: stderr})
 	if !proceed {
 		return ccode
 	}
@@ -470,7 +506,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if rc := appendOrAbort(intent); rc >= 0 {
 			return rc
 		}
-		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun)
+		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun, p.PlanChildren)
 		if rv.SkipWhy != "" {
 			if strings.HasPrefix(rv.SkipWhy, "PROBE-STRANDED:") {
 				fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.SkipWhy)
@@ -487,11 +523,26 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
+			if strings.Contains(err.Error(), "deregistration failed") {
+				// Spec: jj forget failure routes MANUAL — a skip, not a run
+				// abort (round-3: this replace silently no-oped last fold).
+				summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipDeregister})
+				summary.SkippedBytes += p.SizeBytes
+				ok := false
+				if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipDeregister,
+					Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, OK: &ok, Quarantine: nil}); rc >= 0 {
+					return rc
+				}
+				continue
+			}
 			ok := false
 			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: nil})
 			fmt.Fprintf(stderr, "reap apply: deletion failed: %s: %v\n", p.Path, err)
 			return applycmd.ExitDeleteFail
 		}
+		// The in-run deletion set feeds the both-clean unlock (round-3: the
+		// map existed but was never written — dead wiring).
+		deletedInRun[config.Canonical(p.Path)] = true
 		// Full audit enrichment from the fresh facts (round-1: the line
 		// shape's fields were all dead) + capped manifest for non-clean
 		// deletions (spec: gone is never contents unknown).

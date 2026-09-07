@@ -59,14 +59,15 @@ const (
 
 // PlanEntry is one path the plan proposes to delete.
 type PlanEntry struct {
-	Path       string `json:"path"`
-	Verdict    string `json:"verdict"`
-	Code       string `json:"reasonCode"`
-	SizeBytes  int64  `json:"sizeBytes"`
-	Widened    bool   `json:"widened"`
-	Kind       string `json:"kind"`
-	ParentRepo string `json:"parentRepoPath,omitempty"`
-	Orphaned   bool   `json:"orphanedCarveOut,omitempty"`
+	Path         string   `json:"path"`
+	Verdict      string   `json:"verdict"`
+	Code         string   `json:"reasonCode"`
+	SizeBytes    int64    `json:"sizeBytes"`
+	Widened      bool     `json:"widened"`
+	Kind         string   `json:"kind"`
+	ParentRepo   string   `json:"parentRepoPath,omitempty"`
+	Orphaned     bool     `json:"orphanedCarveOut,omitempty"`
+	PlanChildren []string `json:"-"` // scan-time live children; unlock-only
 }
 
 // Summary is the run's end state (apply --json body and summary source).
@@ -132,11 +133,14 @@ func IsTerminal(in *os.File, out io.Writer) bool {
 	return in != nil && isTerminalFd(in)
 }
 
-// Options carries the confirm-shaping flags.
+// Options carries the confirm-shaping flags plus the stderr stream for
+// refusal copy (round 3: the preflight refusal printed to stdout unlike
+// every other refusal).
 type Options struct {
 	Yes    bool
 	DryRun bool
 	JSON   bool
+	ErrOut io.Writer
 }
 
 // Confirm prints the plan, enforces the free-space floor, and asks.
@@ -152,9 +156,11 @@ func Confirm(out io.Writer, in *os.File, plan []PlanEntry, widenedCodes []string
 	}
 	fmt.Fprintln(out)
 	// The floor is a refusal, not a print: it exists so the audit append
-	// can never wedge (spec).
+	// can never wedge (spec). Refusal copy goes to stderr.
 	if minFree > 0 && free < minFree {
-		fmt.Fprintf(out, "preflight refused: %d MB free required, %d MB free\n", minFree/(1<<20), free/(1<<20))
+		if opts.ErrOut != nil {
+			fmt.Fprintf(opts.ErrOut, "preflight refused: %d MB free required, %d MB free\n", minFree/(1<<20), free/(1<<20))
+		}
 		return false, ExitState
 	}
 	if minFree > 0 {
@@ -253,7 +259,7 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 // parent-of-live-children row whose children all went in this run is the
 // SPEC'S EXPECTED UNLOCK when it re-verdicts SAFE — not drift (round 2:
 // the match gate alone made the both-clean family structurally undeletable).
-func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool) ReverifyResult {
+func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool, planChildren []string) ReverifyResult {
 	now := time.Now()
 	remoteStale := time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 
@@ -336,10 +342,13 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	switch {
 	case widened:
 		if v.Verdict != verdict.Manual || v.Code != plannedCode {
-			// The in-run unlock: a widened parent-of-live-children row whose
-			// children all went in this run re-verdicts SAFE — proceed.
+			// The in-run unlock: a widened parent-of-live-children row that
+			// re-verdicts SAFE and whose PLAN-TIME children all went in this
+			// run. The fresh enumeration is empty post-deregistration, so the
+			// comparison is against what the plan saw (round 3's proof that
+			// the fresh-set variant was structurally false).
 			if plannedCode == "parent-of-live-children" && v.Verdict == verdict.Safe &&
-				allChildrenDeletedInRun(classInfo, in, deletedInRun) {
+				allPlanChildrenDeleted(planChildren, deletedInRun) {
 				break
 			}
 			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
@@ -384,28 +393,18 @@ func isIgnoranceCodeLocal(code string) bool {
 	return false
 }
 
-// allChildrenDeletedInRun reports whether every live registered child of
-// the path went in this run's deletion set (the in-set unlock).
-func allChildrenDeletedInRun(classInfo classify.Info, in verdict.Input, deletedInRun map[string]bool) bool {
-	children := 0
-	gone := 0
-	if in.Git != nil {
-		children += len(in.Git.Children)
-		for _, c := range in.Git.Children {
-			if deletedInRun[config.Canonical(c)] {
-				gone++
-			}
+// allPlanChildrenDeleted reports whether every PLAN-TIME live child went in
+// this run's deletion set (the in-set unlock).
+func allPlanChildrenDeleted(planChildren []string, deletedInRun map[string]bool) bool {
+	if len(planChildren) == 0 {
+		return false
+	}
+	for _, ch := range planChildren {
+		if !deletedInRun[config.Canonical(ch)] {
+			return false
 		}
 	}
-	if in.JJ != nil {
-		children += len(in.JJ.Children)
-		for _, c := range in.JJ.Children {
-			if deletedInRun[config.Canonical(c)] {
-				gone++
-			}
-		}
-	}
-	return children > 0 && children == gone
+	return true
 }
 
 var errProbeInUse = errors.New("dir is in use (rename refused)")
