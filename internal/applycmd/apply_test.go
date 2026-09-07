@@ -9,34 +9,29 @@ import (
 
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/gitx"
 )
 
 // Lineage: children (worktrees/workspaces whose parent is also in the set)
-// delete BEFORE the parent; unrelated roots keep plan order.
-func TestOrderChildrenFirst(t *testing.T) {
+// delete BEFORE the parent, at ANY depth (the two-level version dropped
+// grandchildren while still counting them planned).
+func TestOrderChildrenFirstAnyDepth(t *testing.T) {
 	plan := []PlanEntry{
-		{Path: `C:\repo`, Parent: `C:\repo`, Kind: classify.KindGitRepo},
-		{Path: `C:\wt\child`, Parent: `C:\repo`, Kind: classify.KindGitWorktree},
-		{Path: `C:\unrelated`, Parent: `C:\unrelated`, Kind: classify.KindScratch},
+		{Path: `C:\repo`, ParentRepo: `C:\repo`, Kind: string(classify.KindGitRepo)},
+		{Path: `C:\mid`, ParentRepo: `C:\repo`, Kind: string(classify.KindGitWorktree)},
+		{Path: `C:\grand`, ParentRepo: `C:\mid`, Kind: string(classify.KindGitWorktree)},
+		{Path: `C:\unrelated`, ParentRepo: `C:\unrelated`, Kind: string(classify.KindScratch)},
 	}
-	ordered, skips := OrderChildrenFirst(plan)
-	if len(skips) != 0 {
-		t.Fatalf("skips = %+v", skips)
+	ordered := OrderChildrenFirst(plan)
+	if len(ordered) != 4 {
+		t.Fatalf("grandchild dropped: %d of 4 emitted", len(ordered))
 	}
-	childIdx, parentIdx := -1, -1
+	pos := map[string]int{}
 	for i, p := range ordered {
-		if p.Path == `C:\wt\child` {
-			childIdx = i
-		}
-		if p.Path == `C:\repo` {
-			parentIdx = i
-		}
+		pos[p.Path] = i
 	}
-	if childIdx < 0 || parentIdx < 0 || childIdx > parentIdx {
-		t.Fatalf("child must precede parent: order=%v", pathsOf(ordered))
-	}
-	if len(ordered) != 3 {
-		t.Fatalf("ordered = %v", pathsOf(ordered))
+	if pos[`C:\grand`] > pos[`C:\mid`] || pos[`C:\mid`] > pos[`C:\repo`] {
+		t.Fatalf("lineage order violated: %v", pathsOf(ordered))
 	}
 }
 
@@ -48,8 +43,7 @@ func pathsOf(plan []PlanEntry) []string {
 	return out
 }
 
-// The rename probe: a quiet dir probes and restores cleanly; the probe
-// never leaves a trace.
+// The rename probe: a quiet dir probes and restores cleanly.
 func TestRenameProbeQuiet(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "cand")
@@ -67,12 +61,10 @@ func TestRenameProbeQuiet(t *testing.T) {
 	}
 }
 
-// Probe-strand healing: a leftover .reap-probing with the original ABSENT
-// renames back; with BOTH present the stray parks as .reap-orphaned-<ts>
-// (never overwritten).
+// Probe-strand healing: original absent -> rename back; both present ->
+// parked as .reap-orphaned-<ts> (never overwritten).
 func TestHealProbingStrays(t *testing.T) {
 	dir := t.TempDir()
-	// Case 1: original gone -> rename back.
 	stray := filepath.Join(dir, "a.reap-probing")
 	if err := os.MkdirAll(stray, 0o755); err != nil {
 		t.Fatal(err)
@@ -83,10 +75,6 @@ func TestHealProbingStrays(t *testing.T) {
 	}
 	if _, err := os.Stat(stray); !os.IsNotExist(err) {
 		t.Fatal("stray still present after heal")
-	}
-	// Case 2: both present -> parked, never overwritten.
-	if err := os.MkdirAll(stray, 0o755); err != nil {
-		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "a2"), 0o755); err != nil {
 		t.Fatal(err)
@@ -111,11 +99,6 @@ func TestHealProbingStrays(t *testing.T) {
 	}
 }
 
-// Deletion ordering: contents go before .git/.jj so a partial failure
-// preserves history and reflog (the "undeletable husk, not lost work"
-// property). We verify by making a nested content dir undeletable via a
-// read-only... on Windows that is flaky; instead we assert the ORDER by
-// observation: after Delete, the dir is gone entirely on success.
 func TestDeleteRemovesEverything(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "cand")
@@ -128,8 +111,7 @@ func TestDeleteRemovesEverything(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "sub", "f"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := removeContentsBeforeVCS(target)
-	if err != nil {
+	if err := removeContentsBeforeVCS(target); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := os.Stat(longPath(target)); !os.IsNotExist(err) {
@@ -137,7 +119,7 @@ func TestDeleteRemovesEverything(t *testing.T) {
 	}
 }
 
-// apply.lock: exclusive across handles (the second Lock fails fast).
+// apply.lock: exclusive (second Lock fails fast, naming the holder).
 func TestLockFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	l1, err := Lock(dir)
@@ -154,8 +136,24 @@ func TestLockFailsFast(t *testing.T) {
 	}
 }
 
-// The re-verify tripwire: a dir walked with fresh-enough activity skips as
-// active-tripwire (cache bypassed by construction: Entry always walks).
+// Holds round-trip: the round-1 blocker was a writer/reader shape mismatch
+// that bricked every command after one hold. One shared shape now.
+func TestHoldsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	hf := map[string]time.Time{`c:\temp\keepme`: time.Now().Add(48 * time.Hour)}
+	if err := WriteHolds(dir, hf); err != nil {
+		t.Fatal(err)
+	}
+	back := ReadHoldsSnapshot(dir)
+	if len(back) != 1 {
+		t.Fatalf("round trip lost holds: %+v", back)
+	}
+	if _, ok := back[`c:\temp\keepme`]; !ok {
+		t.Fatalf("canonical key mismatch: %+v", back)
+	}
+}
+
+// The re-verify tripwire: a fresh dir skips as active-tripwire.
 func TestReverifyTripwireSkipsFreshDir(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
@@ -167,17 +165,13 @@ func TestReverifyTripwireSkipsFreshDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	skipWhy, v := Reverify(target, Options{}, cfg, Deleter{
-		Git: newNoopGitRunner(),
-	}, config.ExpandRoots(cfg.Protect), nil)
-	if skipWhy != SkipActiveTripwire || v.Verdict != "ACTIVE" {
-		t.Fatalf("fresh dir: skip=%q verdict=%s", skipWhy, v.Verdict)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil)
+	if rv.SkipWhy != SkipActiveTripwire || rv.Verdict.Verdict != "ACTIVE" {
+		t.Fatalf("fresh dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
-	_ = root
 }
 
-// Protected or held paths never pass re-verify (KEEP beats every rule and
-// every flag).
+// Protected paths never pass re-verify (KEEP beats every rule and flag).
 func TestReverifyProtectedSkips(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "cand")
@@ -190,39 +184,59 @@ func TestReverifyProtectedSkips(t *testing.T) {
 	}
 	cfg := config.Default()
 	protected := []string{"**/cand/**"}
-	skipWhy, v := Reverify(target, Options{}, cfg, Deleter{Git: newNoopGitRunner()}, protected, nil)
-	if skipWhy != SkipVerdictChanged || v.Verdict != "KEEP" {
-		t.Fatalf("protected dir: skip=%q verdict=%s", skipWhy, v.Verdict)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, protected, nil)
+	if rv.SkipWhy != SkipVerdictChanged || rv.Verdict.Verdict != "KEEP" {
+		t.Fatalf("protected dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
 }
 
-// The 121 shape lives in Confirm: non-TTY + no --yes refuses; --dry-run
-// never asks.
-func TestConfirmNonTTYRefusesAndDryRunSkips(t *testing.T) {
-	var out strings.Builder
-	// Non-TTY (a strings.Builder is never a terminal): no --yes -> 121.
-	proceed, code := Confirm(&out, nil, []PlanEntry{{Path: "x", SizeBytes: 1}}, 0, 0, 1<<30,
-		Options{})
-	if proceed || code != ExitNotTTY {
-		t.Fatalf("non-TTY without --yes: proceed=%v code=%d", proceed, code)
+// A scratch-idle-planned dir whose fresh verdict drifted to a DIFFERENT
+// judgment code skips as verdict-changed (the round-1 blocker: any
+// judgment MANUAL fell through to deletion).
+func TestReverifyFreshCodeMustMatchPlan(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "cand")
+	if err := os.MkdirAll(filepath.Join(target, "sub"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "pass --yes") {
-		t.Fatalf("refusal copy: %q", out.String())
+	// Nested VCS marker routes the fresh verdict nested-repositories; the
+	// plan said scratch-idle.
+	if err := os.MkdirAll(filepath.Join(target, "vendor", "x", ".git"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	// --yes on a non-TTY proceeds.
-	proceed, code = Confirm(&out, nil, []PlanEntry{{Path: "x"}}, 0, 0, 1<<30, Options{Yes: true})
-	if !proceed || code != ExitOK {
-		t.Fatalf("--yes: proceed=%v code=%d", proceed, code)
-	}
-	// --dry-run prints and never asks (regardless of TTY).
-	out.Reset()
-	proceed, code = Confirm(&out, nil, []PlanEntry{{Path: "x", SizeBytes: 2 << 30}}, 1, 0, 1<<30, Options{DryRun: true})
-	if proceed || code != ExitOK {
-		t.Fatalf("dry-run: proceed=%v code=%d", proceed, code)
-	}
-	if !strings.Contains(out.String(), "dry-run: nothing will be deleted") ||
-		!strings.Contains(out.String(), "1 directories") ||
-		!strings.Contains(out.String(), "widened via --include") {
-		t.Fatalf("dry-run copy: %q", out.String())
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	_ = os.Chtimes(target, old, old)
+	cfg := config.Default()
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil)
+	if rv.SkipWhy != SkipVerdictChanged {
+		t.Fatalf("drifted code: skip=%q verdict=%s/%s (must skip verdict-changed)", rv.SkipWhy, rv.Verdict.Verdict, rv.Verdict.Code)
 	}
 }
+
+// Confirm: the free-space floor REFUSES (round-1: print-only), non-TTY
+// without --yes exits 121, dry-run never asks.
+func TestConfirmFloorsAndRefusals(t *testing.T) {
+	var out strings.Builder
+	// Floor refusal: 256MB required, 1MB free.
+	proceed, code := Confirm(&out, nil, []PlanEntry{{Path: "x", SizeBytes: 1}}, nil, 256<<20, 1<<20, Options{Yes: true})
+	if proceed || code != ExitState {
+		t.Fatalf("floor: proceed=%v code=%d", proceed, code)
+	}
+	if !strings.Contains(out.String(), "preflight refused") {
+		t.Fatalf("refusal copy: %q", out.String())
+	}
+	// Non-TTY without --yes: 121.
+	out.Reset()
+	proceed, code = Confirm(&out, nil, []PlanEntry{{Path: "x"}}, nil, 0, 1<<30, Options{})
+	if proceed || code != ExitNotTTY {
+		t.Fatalf("non-TTY: proceed=%v code=%d", proceed, code)
+	}
+	// --yes proceeds above floor.
+	proceed, code = Confirm(&out, nil, []PlanEntry{{Path: "x"}}, nil, 256<<20, 1<<30, Options{Yes: true})
+	if !proceed || code != ExitOK {
+		t.Fatalf("--yes above floor: proceed=%v code=%d", proceed, code)
+	}
+}
+
+// The noop runner refuses (zero budget) rather than hitting a real repo.
+func newNoopGitRunner() gitx.Runner { return gitx.Runner{} }

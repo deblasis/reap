@@ -14,9 +14,11 @@
 package walk
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,6 +44,47 @@ type DirInfo struct {
 	// nested-repositories in the verdict matrix.
 	NestedVCS []string
 }
+
+// cappedManifestBytes bounds the top-level manifest written into audit
+// lines for non-clean deletions: proof of what was there, not a copy.
+const cappedManifestBytes = 64 << 10
+
+// CappedManifest lists a directory's top-level entries (name + size, dir
+// marked) as JSON, capped: the audit line's "gone is never contents
+// unknown" contract without unbounded ledger growth.
+func CappedManifest(path string) []byte {
+	entries, err := os.ReadDir(longPathLocal(path))
+	if err != nil {
+		return []byte(`{"error":"unreadable"}`)
+	}
+	var sb strings.Builder
+	sb.WriteString(`{"entries":[`)
+	first := true
+	for _, e := range entries {
+		if !first {
+			sb.WriteString(",")
+		}
+		first = false
+		size := int64(0)
+		if fi, err := e.Info(); err == nil && !e.IsDir() {
+			size = fi.Size()
+		}
+		name := strings.ReplaceAll(e.Name(), `"`, `\"`)
+		kind := "file"
+		if e.IsDir() {
+			kind = "dir"
+		}
+		fmt.Fprintf(&sb, `{"name":"%s","kind":"%s","size":%d}`, name, kind, size)
+		if sb.Len() > cappedManifestBytes {
+			sb.WriteString(`,{"truncated":true}`)
+			break
+		}
+	}
+	sb.WriteString(`]}`)
+	return []byte(sb.String())
+}
+
+func longPathLocal(p string) string { return p }
 
 // Entry sizes one directory tree. It never crosses reparse points (junctions,
 // symlinks): a junction under the tree can loop, escape to protected paths, or

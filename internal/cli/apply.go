@@ -54,7 +54,6 @@ func newScanCore(args []string, stderr io.Writer) (*scanCore, int) {
 		fmt.Fprintf(stderr, "reap: %v\n", err)
 		return nil, ExitState
 	}
-	// --roots narrowing (validated against configured roots)
 	var rootsFlag []string
 	for i, a := range args {
 		if a == "--roots" && i+1 < len(args) {
@@ -103,26 +102,11 @@ type candidate struct {
 	cls   classify.Info
 }
 
-// run walks the roots and verdicts every candidate (the scan core minus
-// rendering; scan renders, plan/apply select).
+// run walks the roots and verdicts every candidate.
 func (c *scanCore) run(now time.Time) ([]candidate, []string) {
 	infos := walk.Roots(c.roots, now, 8)
 	var unreadableRoots []string
 	var out []candidate
-	type job struct {
-		info walk.DirInfo
-		res  chan candidate
-	}
-	jobs := make(chan job)
-	var collect chan candidate
-	collect = make(chan candidate, len(infos))
-	go func() {
-		for range jobs {
-		}
-	}()
-	_ = collect
-	// Sequential is fine for correctness here; the scan command keeps its
-	// parallel pool for display speed. plan/apply re-verify per path anyway.
 	for _, info := range infos {
 		if info.Root == info.Path {
 			unreadableRoots = append(unreadableRoots, info.Path)
@@ -145,6 +129,7 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 		SizePartial:  info.Partial,
 		LastActivity: &info.MaxMtime,
 		AgeDays:      int(now.Sub(info.MaxMtime).Hours() / 24),
+		ClampedFiles: info.Clamped,
 	}
 	cls := classify.Dir(info.Path)
 	e.Kind = string(cls.Kind)
@@ -199,13 +184,21 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 	e.BlockedClassFact = v.BlockedClassFact
 	e.OrphanedCarveOut = v.OrphanedCarveOut
 	e.OpenPR = v.OpenPRSlug != ""
+	if v.OrphanedCarveOut && v.BlockedClassFact != "" {
+		e.Reason = e.Reason + fmt.Sprintf(" (also: %s)", v.BlockedClassFact)
+	}
 	return e, v, cls
 }
 
-// resolvePlan applies the SAFE-default + include/exclude/override selection.
-func resolvePlan(cands []candidate, include, exclude, overrideManual []string) ([]applycmd.PlanEntry, []string, error) {
-	var plan []applycmd.PlanEntry
-	var excluded []string
+// resolvePlan applies SAFE-default + include/exclude/override selection,
+// the --min-gb planning floor, and closed-enum validation. Orphaned
+// carve-out rows are REFUSED on --override-manual/--include: their only
+// sanctioned path is a TTY-only hardened confirm (spec, M3); the round-1
+// probe deleted only-copy work under plain --yes.
+func resolvePlan(cands []candidate, include, exclude, overrideManual []string, minGB float64) (plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string, err error) {
+	if e := validateCodes(include, exclude); e != nil {
+		return nil, nil, nil, e
+	}
 	inc := map[string]bool{}
 	for _, c := range include {
 		inc[c] = true
@@ -219,11 +212,12 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string) (
 		ovr[config.Canonical(p)] = true
 	}
 	for _, c := range cands {
-		take := false
-		widened := false
+		take, widened := false, false
 		switch {
 		case c.vd.Verdict == verdict.Safe:
 			take = true
+		case c.vd.OrphanedCarveOut && (inc[c.vd.Code] || ovr[config.Canonical(c.entry.Path)]):
+			return nil, nil, nil, fmt.Errorf("%s is an orphaned carve-out row: deletable only via the TTY-only hardened confirm (ships with M3); refusing under --include/--override-manual", c.entry.Path)
 		case inc[c.vd.Code] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
 			take, widened = true, true
 		case ovr[config.Canonical(c.entry.Path)] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
@@ -233,22 +227,19 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string) (
 			continue
 		}
 		if exc[c.vd.Code] {
-			excluded = append(excluded, c.entry.Path)
+			excludedByCode = append(excludedByCode, c.entry.Path)
 			continue
 		}
-		// Judgment-class ignorance codes can never be widened into (the
-		// class maps say so; a code that resolves only to ignorance rows is
-		// a usage error naming it).
-		if widened && isIgnoranceCode(c.vd.Code) {
-			return nil, nil, fmt.Errorf("--include %s selects ignorance-class rows (never deletable); the paths are held: %s", c.vd.Code, c.entry.Path)
+		if minGB > 0 && float64(c.entry.SizeBytes)/(1<<30) < minGB {
+			below = append(below, applycmd.ExcludedRef{Path: c.entry.Path, Size: c.entry.SizeBytes})
+			continue
 		}
 		plan = append(plan, applycmd.PlanEntry{
 			Path: c.entry.Path, Verdict: c.vd.Verdict, Code: c.vd.Code,
-			SizeBytes: c.entry.SizeBytes, Widened: widened, Kind: c.cls.Kind, Parent: c.cls.ParentRepo,
+			SizeBytes: c.entry.SizeBytes, Widened: widened, Kind: string(c.cls.Kind),
+			ParentRepo: c.cls.ParentRepo, Orphaned: c.vd.OrphanedCarveOut,
 		})
 	}
-	// Validate include codes that matched nothing deletable: a code whose
-	// every match was BLOCKED-class must error by name (spec).
 	for _, code := range include {
 		used := false
 		for _, p := range plan {
@@ -257,36 +248,92 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string) (
 			}
 		}
 		if !used {
-			blockedMatch := false
 			for _, c := range cands {
-				if c.vd.Code == code && c.vd.BlockedClassFact != "" {
-					blockedMatch = true
+				if c.vd.Code == code && (c.vd.BlockedClassFact != "" || c.vd.Verdict == verdict.Blocked ||
+					c.vd.Verdict == verdict.Active || c.vd.Verdict == verdict.Keep) {
+					return nil, nil, nil, fmt.Errorf("--include %s matched only non-deletable rows (e.g. %s: %s)", code, c.entry.Path, c.vd.Verdict)
 				}
-			}
-			if blockedMatch {
-				return nil, nil, fmt.Errorf("--include %s matched only BLOCKED-class paths (never deletable)", code)
 			}
 		}
 	}
-	return plan, excluded, nil
+	return plan, below, excludedByCode, nil
 }
 
-func isIgnoranceCode(code string) bool {
-	switch code {
-	case "facts-unavailable", "state-unreadable", "remote-stale", "jj-remote-stale", "gh-unavailable", "unknown-kind":
-		return true
+// validateCodes checks include/exclude against the closed reasonCode enum.
+func validateCodes(include, exclude []string) error {
+	all := append(append([]string{}, include...), exclude...)
+	for _, c := range all {
+		if !verdict.IsReasonCode(c) {
+			return fmt.Errorf("--include/--exclude %q is not a reasonCode (closed enum; scan --json lists codes)", c)
+		}
 	}
-	return false
+	return nil
 }
 
-// cmdPlan implements both `reap plan` and `reap apply --dry-run`
-// (byte-identical output is the spec's tie between them).
+// renderPlanText is THE plan renderer: cmdPlan and cmdApply --dry-run both
+// call it, byte-identically (the spec's tie; round 1 proved two renderers
+// drift within one review cycle).
+func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, widened []string) {
+	var total int64
+	for _, p := range plan {
+		total += p.SizeBytes
+	}
+	fmt.Fprintf(w, "reap will permanently delete %d directories, %.1f GB logical (not recycled)", len(plan), float64(total)/(1<<30))
+	if len(widened) > 0 {
+		fmt.Fprintf(w, "; %d widened via %s", len(widened), strings.Join(dedupeStrings(widened), ","))
+	}
+	fmt.Fprintln(w)
+	for _, p := range plan {
+		fmt.Fprintf(w, "%8.1f GB  %s  [%s]\n", float64(p.SizeBytes)/(1<<30), p.Path, p.Code)
+	}
+	if len(below) > 0 {
+		fmt.Fprintf(w, "%d below --min-gb floor (excluded, not listed)\n", len(below))
+	}
+	fmt.Fprintln(w, "dry-run: nothing will be deleted")
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func planWidenedCodes(plan []applycmd.PlanEntry) []string {
+	var out []string
+	for _, p := range plan {
+		if p.Widened {
+			out = append(out, p.Code)
+		}
+	}
+	return out
+}
+
+func renderPlanJSON(w io.Writer, now time.Time, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef) int {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(struct {
+		Generated string                 `json:"generated"`
+		Planned   []applycmd.PlanEntry   `json:"planned"`
+		BelowMin  []applycmd.ExcludedRef `json:"excludedBelowFloor"`
+	}{now.Format(time.RFC3339), plan, below}); err != nil {
+		return ExitState
+	}
+	return ExitOK
+}
+
+// cmdPlan implements `reap plan`.
 func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	rootsFlag := multiFlag{}
 	fs.Var(&rootsFlag, "roots", "narrow to these configured roots")
-	fs.Float64("min-gb", 0, "planning floor (GB)")
+	minGB := fs.Float64("min-gb", 0, "planning floor (GB)")
 	fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
 	fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
 	include := multiFlag{}
@@ -303,32 +350,15 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	}
 	now := time.Now()
 	cands, _ := core.run(now)
-	plan, _, err := resolvePlan(cands, include, exclude, nil)
+	plan, below, _, err := resolvePlan(cands, include, exclude, nil, *minGB)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap plan: %v\n", err)
 		return ExitUsage
 	}
 	if *asJSON {
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		type planJSON struct {
-			Generated string               `json:"generated"`
-			Planned   []applycmd.PlanEntry `json:"planned"`
-		}
-		if err := enc.Encode(planJSON{Generated: now.Format(time.RFC3339), Planned: plan}); err != nil {
-			return ExitState
-		}
-		return ExitOK
+		return renderPlanJSON(stdout, now, plan, below)
 	}
-	var total int64
-	for _, p := range plan {
-		total += p.SizeBytes
-	}
-	fmt.Fprintf(stdout, "reap will permanently delete %d directories, %.1f GB logical (not recycled)\n", len(plan), float64(total)/(1<<30))
-	for _, p := range plan {
-		fmt.Fprintf(stdout, "%8.1f GB  %s  [%s]\n", float64(p.SizeBytes)/(1<<30), p.Path, p.Code)
-	}
-	fmt.Fprintln(stdout, "dry-run: nothing will be deleted")
+	renderPlanText(stdout, plan, below, planWidenedCodes(plan))
 	return ExitOK
 }
 
@@ -338,7 +368,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	fs.SetOutput(stderr)
 	rootsFlag := multiFlag{}
 	fs.Var(&rootsFlag, "roots", "narrow to these configured roots")
-	fs.Float64("min-gb", 0, "planning floor (GB)")
+	minGB := fs.Float64("min-gb", 0, "planning floor (GB)")
 	fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
 	fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
 	include := multiFlag{}
@@ -349,7 +379,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	fs.Var(&overrideManual, "override-manual", "relax the MANUAL gate for exactly this path (repeatable)")
 	asJSON := fs.Bool("json", false, "emit the machine schema")
 	yes := fs.Bool("yes", false, "confirm non-interactively")
-	dryRun := fs.Bool("dry-run", false, "print the re-verified plan and exit (byte-identical to plan)")
+	dryRun := fs.Bool("dry-run", false, "print the plan and exit (byte-identical to reap plan)")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
@@ -364,25 +394,36 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return code
 	}
 	now := time.Now()
-	cands, _ := core.run(now)
-	plan, excluded, err := resolvePlan(cands, include, exclude, overrideManual)
+	cands, unreadableRoots := core.run(now)
+	// Root-missing is 123 in the apply family (read-only commands never
+	// emit family codes).
+	if len(unreadableRoots) > 0 {
+		for _, u := range unreadableRoots {
+			fmt.Fprintf(stderr, "reap apply: unreadable/missing root: %s\n", u)
+		}
+		return applycmd.ExitRootMissing
+	}
+	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap apply: %v\n", err)
 		return ExitUsage
 	}
 
-	// Preflight: min-free-mb floor (audit growth + rotation headroom).
+	// The dry-run tie: delegate to the exact plan renderer — byte-identical
+	// in text AND json (round-1 blocker).
+	if *dryRun {
+		if *asJSON {
+			return renderPlanJSON(stdout, now, plan, below)
+		}
+		renderPlanText(stdout, plan, below, planWidenedCodes(plan))
+		return ExitOK
+	}
+
+	// Preflight floor: a refusal, not a print.
 	minFree := uint64(core.cfg.Thresholds.MinFreeMB) << 20
 	free := auditlog.FreeBytes(stateDir)
-	widenedCount := 0
-	for _, p := range plan {
-		if p.Widened {
-			widenedCount++
-		}
-	}
-	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widenedCount, minFree, free, applycmd.Options{
-		DryRun: *dryRun, Yes: *yes, JSON: *asJSON,
-	})
+	widened := planWidenedCodes(plan)
+	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes})
 	if !proceed {
 		return ccode
 	}
@@ -403,67 +444,103 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	freeBefore := auditlog.FreeBytes(stateDir)
 
-	// Lineage: children before parents; parent whose live children are
-	// outside the set gets skipped.
-	ordered, parentSkips := applycmd.OrderChildrenFirst(plan)
-	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan), Excluded: excluded}
-	for _, s := range parentSkips {
-		summary.Skipped = append(summary.Skipped, s)
-	}
-
-	d := applycmd.Deleter{
-		Git: gitx.Runner{GitBudget: core.gitBudget, FetchBudget: core.fetchBudget},
-		JJ:  jjx.Runner{Budget: core.jjBudget},
-	}
-	hardAbort := ""
-	for _, p := range ordered {
-		intent := auditlog.Line{
-			Event: "intent", Path: p.Path, Kind: string(p.Kind), SizeBytes: p.SizeBytes,
-			Verdict: p.Verdict, ReasonCode: p.Code,
-			Quarantine: nil,
-		}
-		if err := log.Append(intent); err != nil {
+	ordered := applycmd.OrderChildrenFirst(plan)
+	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan),
+		Widened: widenedPaths(plan), ExcludedBelow: below, ExcludedCodes: byCode}
+	// The envelope is written on EVERY exit path from here (deferred):
+	// aborts mid-run leave an auditable session record.
+	defer func() {
+		_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(plan),
+			Deleted: len(summary.Deleted), Skipped: len(summary.Skipped),
+			FreeBefore: freeBefore, FreeAfter: auditlog.FreeBytes(stateDir), Quarantine: nil})
+	}()
+	appendOrAbort := func(line auditlog.Line) int {
+		if err := log.Append(line); err != nil {
 			fmt.Fprintf(stderr, "reap apply: HARD ABORT: %v\n", err)
 			return ExitState
 		}
-		skipWhy, fresh := applycmd.Reverify(p.Path, applycmd.Options{}, core.cfg, d, core.protectExpanded, core.holds)
-		if skipWhy != "" {
-			if strings.HasPrefix(skipWhy, "PROBE-STRANDED:") {
-				fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", skipWhy)
+		return -1
+	}
+
+	d := applycmd.Deleter{
+		Git:     gitx.Runner{GitBudget: core.gitBudget, FetchBudget: core.fetchBudget},
+		JJ:      jjx.Runner{Budget: core.jjBudget},
+		PRHeads: core.prHeads,
+	}
+	for _, p := range ordered {
+		intent := auditlog.Line{
+			Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
+			Verdict: p.Verdict, ReasonCode: p.Code, Quarantine: nil,
+		}
+		if rc := appendOrAbort(intent); rc >= 0 {
+			return rc
+		}
+		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds)
+		if rv.SkipWhy != "" {
+			if strings.HasPrefix(rv.SkipWhy, "PROBE-STRANDED:") {
+				fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.SkipWhy)
 				return ExitState
 			}
-			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: skipWhy})
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: rv.SkipWhy})
+			summary.SkippedBytes += p.SizeBytes
 			ok := false
-			_ = log.Append(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: skipWhy, Verdict: fresh.Verdict, ReasonCode: fresh.Code, OK: &ok, Quarantine: nil})
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: rv.SkipWhy,
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, OK: &ok, Quarantine: nil}); rc >= 0 {
+				return rc
+			}
 			continue
 		}
-		mode, err := applycmd.Delete(p.Path, classify.Dir(p.Path), d, log, intent)
+		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
 			ok := false
 			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: nil})
 			fmt.Fprintf(stderr, "reap apply: deletion failed: %s: %v\n", p.Path, err)
 			return applycmd.ExitDeleteFail
 		}
+		// Full audit enrichment from the fresh facts (round-1: the line
+		// shape's fields were all dead) + capped manifest for non-clean
+		// deletions (spec: gone is never contents unknown).
+		result := auditlog.Line{Event: "result", Path: p.Path, Mode: mode, SizeBytes: p.SizeBytes,
+			Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil}
+		if rv.Git != nil {
+			result.Branch = rv.Git.Branch
+			result.Dirty, result.Untracked = rv.Git.Dirty, rv.Git.Untracked
+			result.Stashes, result.Ignored = rv.Git.Stashes, rv.Git.Ignored
+			result.HeadSHA = rv.Git.HEAD
+			if !rv.Git.LastCommit.IsZero() {
+				result.LastCommitTs = rv.Git.LastCommit.Format(time.RFC3339)
+			}
+		}
+		if p.ParentRepo != "" {
+			result.ParentRepo = p.ParentRepo
+		}
+		for _, c := range cands {
+			if c.entry.Path == p.Path {
+				result.Origin = c.entry.Origin
+			}
+		}
+		if p.Code != "clean-pushed" {
+			result.Manifest = walk.CappedManifest(p.Path)
+		}
 		ok := true
-		if err := log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, SizeBytes: p.SizeBytes, Quarantine: nil}); err != nil {
-			fmt.Fprintf(stderr, "reap apply: HARD ABORT: %v\n", err)
-			return ExitState
+		result.OK = &ok
+		if rc := appendOrAbort(result); rc >= 0 {
+			return rc
 		}
 		summary.Deleted = append(summary.Deleted, p.Path)
-		if p.Widened {
-			summary.Widened = append(summary.Widened, p.Path)
-		}
+		summary.DeletedBytes += p.SizeBytes
 	}
 
 	freeAfter := auditlog.FreeBytes(stateDir)
-	summary.FreeGain = freeAfter - freeBefore
-	_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(plan), Deleted: len(summary.Deleted),
-		Skipped: len(summary.Skipped), FreeBefore: freeBefore, FreeAfter: freeAfter, Quarantine: nil})
-	_ = hardAbort
-
-	fmt.Fprintf(stdout, "deleted %d dirs, excluded %d (below floor), skipped %d: %s\n",
-		len(summary.Deleted), len(excluded), len(summary.Skipped), summarizeSkips(summary.Skipped))
-	if *asJSON {
+	if freeAfter > freeBefore {
+		summary.FreeGain = freeAfter - freeBefore // saturating: underflow observed live in round 1
+	}
+	if !*asJSON {
+		fmt.Fprintf(stdout, "deleted %d dirs (%.1f GB), excluded %d (%.1f GB below floor), skipped %d (%.1f GB): %s\n",
+			len(summary.Deleted), float64(summary.DeletedBytes)/(1<<30),
+			len(below), float64(sumExcluded(below))/(1<<30),
+			len(summary.Skipped), float64(summary.SkippedBytes)/(1<<30), summarizeSkips(summary.Skipped))
+	} else {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
@@ -474,6 +551,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	return applycmd.ExitOK
 }
 
+func sumExcluded(below []applycmd.ExcludedRef) int64 {
+	var t int64
+	for _, b := range below {
+		t += b.Size
+	}
+	return t
+}
+
 func pathsOf(plan []applycmd.PlanEntry) []string {
 	out := make([]string, len(plan))
 	for i, p := range plan {
@@ -482,7 +567,20 @@ func pathsOf(plan []applycmd.PlanEntry) []string {
 	return out
 }
 
+func widenedPaths(plan []applycmd.PlanEntry) []string {
+	var out []string
+	for _, p := range plan {
+		if p.Widened {
+			out = append(out, p.Path)
+		}
+	}
+	return out
+}
+
 func summarizeSkips(skips []applycmd.SkippedPath) string {
+	if len(skips) == 0 {
+		return "none"
+	}
 	counts := map[string]int{}
 	for _, s := range skips {
 		counts[s.Why]++
@@ -524,10 +622,24 @@ func cmdHold(args []string, stdout, stderr io.Writer) int {
 	}
 	abs, _ := filepath.Abs(fs.Arg(0))
 	hf[config.Canonical(abs)] = time.Now().Add(dur)
-	return writeHolds(stateDir, hf, stdout)
+	if err := applycmd.WriteHolds(stateDir, hf); err != nil {
+		fmt.Fprintf(stderr, "reap hold: %v\n", err)
+		return ExitState
+	}
+	fmt.Fprintf(stdout, "%d hold(s) recorded\n", len(hf))
+	return ExitOK
 }
 
 func cmdUnhold(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("unhold", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "usage: reap unhold PATH")
+		return ExitUsage
+	}
 	stateDir, _ := config.StateDir()
 	lock, err := applycmd.Lock(stateDir)
 	if err != nil {
@@ -536,20 +648,15 @@ func cmdUnhold(args []string, stdout, stderr io.Writer) int {
 	}
 	defer lock.Close()
 	hf := applycmd.ReadHoldsSnapshot(stateDir)
-	abs, _ := filepath.Abs(args[len(args)-1])
-	delete(hf, config.Canonical(abs))
-	return writeHolds(stateDir, hf, stdout)
-}
-
-func writeHolds(stateDir string, hf map[string]time.Time, stdout io.Writer) int {
-	raw, err := json.MarshalIndent(hf, "", "  ")
-	if err != nil {
-		return ExitState
+	abs, _ := filepath.Abs(fs.Arg(0))
+	canonical := config.Canonical(abs)
+	if _, ok := hf[canonical]; !ok {
+		fmt.Fprintf(stderr, "reap unhold: no hold on %s\n", fs.Arg(0))
+		return ExitUsage
 	}
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return ExitState
-	}
-	if err := config.AtomicWrite(filepath.Join(stateDir, "holds.json"), raw, 0o644); err != nil {
+	delete(hf, canonical)
+	if err := applycmd.WriteHolds(stateDir, hf); err != nil {
+		fmt.Fprintf(stderr, "reap unhold: %v\n", err)
 		return ExitState
 	}
 	fmt.Fprintf(stdout, "%d hold(s) recorded\n", len(hf))
@@ -560,12 +667,13 @@ func cmdHolds(args []string, stdout, stderr io.Writer) int {
 	stateDir, _ := config.StateDir()
 	hf := applycmd.ReadHoldsSnapshot(stateDir)
 	asJSON := hasFlag(args, "--json")
+	now := time.Now()
 	if asJSON {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		out := map[string]map[string]any{}
 		for p, exp := range hf {
-			days := int(time.Until(exp).Hours() / 24)
+			days := int(now.Sub(exp).Hours() / 24 * -1)
 			_, exists := os.Stat(p)
 			out[p] = map[string]any{"expires": exp.Format(time.RFC3339), "daysRemaining": days, "pathExists": exists == nil}
 		}

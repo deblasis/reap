@@ -111,15 +111,19 @@ func (l *Log) rotateIfNeeded() error {
 	if fi.Size() < rotationBound {
 		return nil
 	}
-	// Whole-file rotation: reap.log -> reap.log.1 (previous .1 is dropped;
-	// the envelope lines carry per-session summaries, so recent history
-	// stays readable without unbounded growth). A rotation failure is not
-	// fatal — the ledger stays correct, just over the soft bound until a
-	// later append rotates it.
-	_ = os.Remove(l.path + ".1")
+	// Chained rotation: reap.log.1 -> .2 -> ... (bounded at maxGenerations);
+	// `reap log` reads all rotations oldest-first per the spec, so history
+	// stays multi-generation rather than a single overwritten slot.
+	for i := maxGenerations; i >= 2; i-- {
+		_ = os.Rename(l.path+"."+fmt.Sprint(i-1), l.path+"."+fmt.Sprint(i))
+	}
 	_ = os.Rename(l.path, l.path+".1")
 	return nil
 }
+
+// maxGenerations bounds the rotation chain: reap.log + .1..N. History is
+// bounded but multi-generation (the ledger is the recovery story).
+const maxGenerations = 5
 
 // NewRunID mints a readable run identifier.
 func NewRunID() string {

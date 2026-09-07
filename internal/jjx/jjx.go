@@ -179,6 +179,36 @@ func (r Runner) WorkspaceForget(parent, name string) error {
 	return err
 }
 
+// WorkspaceListNames resolves workspace name -> working-copy path from the
+// parent's registry (the dir base need not equal the registered name).
+func (r Runner) WorkspaceListNames(parent string) map[string]string {
+	out, err := r.run(parent, "workspace", "list")
+	if err != nil {
+		return nil
+	}
+	m := map[string]string{}
+	for _, line := range nonEmpty(out) {
+		i := strings.Index(line, ": ")
+		if i < 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:i])
+		fields := strings.Fields(line[i+2:])
+		if len(fields) == 0 || name == "" || name == "default" {
+			continue
+		}
+		p := fields[0]
+		if p == "." || p == "(deleted)" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(parent, p)
+		}
+		m[name] = filepath.Clean(p)
+	}
+	return m
+}
+
 func (r Runner) run(dir string, args ...string) (string, error) {
 	return r.runFlags([]string{"--ignore-working-copy"}, dir, args...)
 }

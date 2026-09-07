@@ -1,13 +1,15 @@
 // Package applycmd implements `reap plan` and `reap apply`: the deletion
 // pipeline. The spec's choreography, in order: print the plan (naming
-// widened codes and counts), preflight free space, require TTY-confirm or
-// --yes (never infer from EOF; 121 when non-interactive without --yes),
-// take apply.lock, then per path — re-verify the verdict seconds before
-// deletion with cache-bypassed fresh facts (fetch --prune under its own
-// budget, fresh walk tripwire, rename in-use probe), skip and log anything
-// that changed, delete children before parents, contents before .git/.jj,
-// deregister before removal, write the audit trail ahead of every deletion,
-// and end with the deleted/excluded/skipped summary and exit band.
+// widened codes and counts), preflight free space (refusing below the
+// floor), require TTY-confirm or --yes (never infer from EOF; 121 when
+// non-interactive without --yes), take apply.lock, then per path —
+// re-verify the verdict seconds before deletion at FULL scan strength
+// (same facts, same gh join, fresh walk tripwire, fetch --prune, rename
+// in-use probe), require the fresh verdict to MATCH the planned one, skip
+// and log anything that changed, delete children before parents, contents
+// before .git/.jj, deregister before removal, write the audit trail ahead
+// of every deletion, and end with the deleted/excluded/skipped summary
+// and exit band.
 package applycmd
 
 import (
@@ -20,9 +22,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/lockfile"
@@ -32,7 +34,7 @@ import (
 
 // Exit band (spec): 0 fully executed; 2 executed with skips; 120 usage;
 // 121 not interactive; 122 config/state/lock; 123 root missing; 124
-// deletion failed (path named).
+// deletion failed (path named); 125 quarantine/prune failure.
 const (
 	ExitOK          = 0
 	ExitWithSkips   = 2
@@ -41,6 +43,7 @@ const (
 	ExitState       = 122
 	ExitRootMissing = 123
 	ExitDeleteFail  = 124
+	ExitQuarantine  = 125
 )
 
 // skipWhy values (spec's closed enum).
@@ -51,42 +54,34 @@ const (
 	SkipVerdictChanged = "verdict-changed"
 	SkipParentLive     = "parent-of-live-children"
 	SkipIgnorance      = "ignorance-unreadable"
+	SkipDeregister     = "deregistration-failed"
 )
 
 // PlanEntry is one path the plan proposes to delete.
 type PlanEntry struct {
-	Path      string
-	Verdict   string // SAFE, or MANUAL via widening/override
-	Code      string
-	SizeBytes int64
-	Widened   bool
-	Kind      classify.Kind
-	Parent    string // classify-resolved parent repo (lineage ordering)
+	Path       string `json:"path"`
+	Verdict    string `json:"verdict"`
+	Code       string `json:"reasonCode"`
+	SizeBytes  int64  `json:"sizeBytes"`
+	Widened    bool   `json:"widened"`
+	Kind       string `json:"kind"`
+	ParentRepo string `json:"parentRepoPath,omitempty"`
+	Orphaned   bool   `json:"orphanedCarveOut,omitempty"`
 }
 
-// Options carries the shared scan-shaping flags (scan, plan, apply accept
-// the same set, so the reviewed view and the executed set cannot differ).
-type Options struct {
-	Roots            []string
-	MinGB            float64
-	NoGH, NoJJ       bool
-	Include, Exclude []string
-	OverrideManual   []string
-	JSON             bool
-	Yes              bool
-	DryRun           bool
-}
-
-// Summary is the run's end state (the --json body for apply, and the
-// printed summary's source).
+// Summary is the run's end state (apply --json body and summary source).
 type Summary struct {
-	RunID    string        `json:"runId"`
-	Planned  []string      `json:"planned"`
-	Widened  []string      `json:"widened"`
-	Deleted  []string      `json:"deleted"`
-	Skipped  []SkippedPath `json:"skipped"`
-	Excluded []string      `json:"excluded"`
-	FreeGain uint64        `json:"freeBytesReclaimed"`
+	RunID         string        `json:"runId"`
+	Planned       []string      `json:"planned"`
+	Widened       []string      `json:"widened"`
+	Deleted       []string      `json:"deleted"`
+	Skipped       []SkippedPath `json:"skipped"`
+	ExcludedBelow []ExcludedRef `json:"excludedBelowFloor"`
+	ExcludedCodes []string      `json:"excludedByCode"`
+	DeletedBytes  int64         `json:"deletedBytes"`
+	ExcludedBytes int64         `json:"excludedBytes"`
+	SkippedBytes  int64         `json:"skippedBytes"`
+	FreeGain      uint64        `json:"freeBytesReclaimed"`
 }
 
 // SkippedPath names why a planned path survived.
@@ -95,34 +90,69 @@ type SkippedPath struct {
 	Why  string `json:"why"`
 }
 
-// Deleter is the fact-collection seam the re-verify uses. cmdScan's shared
-// core fills it; tests inject fixed facts.
-type Deleter struct {
-	Git gitx.Runner
-	JJ  jjx.Runner
+// ExcludedRef is a below-floor path kept out of the plan (never a skip).
+type ExcludedRef struct {
+	Path string `json:"path"`
+	Size int64  `json:"sizeBytes"`
 }
 
-// IsTerminal reports whether w is an interactive TTY. Windows ConHost and
-// modern terminals report true for console handles only.
-func IsTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
+// Deleter carries the tool runners plus the once-per-run gh fact set, so
+// re-verify runs at exactly scan strength (the round-1 blocker: without
+// the gh join, every git repo re-verdicted gh-unavailable and apply could
+// never delete the clean-pushed class; worse, a partial fix without the
+// slug join would have silently dropped the open-PR gate at deletion
+// time).
+type Deleter struct {
+	Git     gitx.Runner
+	JJ      jjx.Runner
+	PRHeads *ghx.PRHeads
+}
+
+// ReverifyResult carries everything the audit intent line needs: the fresh
+// verdict plus the facts it came from.
+type ReverifyResult struct {
+	SkipWhy string
+	Verdict verdict.Verdict
+	Git     *gitx.Facts
+	Class   classify.Info
+}
+
+// IsTerminal reports whether BOTH stdin and stdout are interactive: a
+// piped answer into a TTY session must not auto-confirm, and a redirected
+// stdout with a live stdin must not falsely 121.
+func IsTerminal(in *os.File, out io.Writer) bool {
+	f, ok := out.(*os.File)
+	if !ok || !isTerminalFd(f) {
 		return false
 	}
-	return isTerminalFd(f)
+	return in != nil && isTerminalFd(in)
 }
 
-// Confirm prints the plan and asks. Returns (proceed, exitCode).
-func Confirm(out io.Writer, in *os.File, plan []PlanEntry, widened int, minFree uint64, free uint64, opts Options) (bool, int) {
+// Options carries the confirm-shaping flags.
+type Options struct {
+	Yes    bool
+	DryRun bool
+	JSON   bool
+}
+
+// Confirm prints the plan, enforces the free-space floor, and asks.
+// Returns (proceed, exitCode).
+func Confirm(out io.Writer, in *os.File, plan []PlanEntry, widenedCodes []string, minFree, free uint64, opts Options) (bool, int) {
 	var totalBytes int64
 	for _, p := range plan {
 		totalBytes += p.SizeBytes
 	}
 	fmt.Fprintf(out, "reap will permanently delete %d directories, %.1f GB logical (not recycled)", len(plan), float64(totalBytes)/(1<<30))
-	if widened > 0 {
-		fmt.Fprintf(out, "; %d widened via --include", widened)
+	if len(widenedCodes) > 0 {
+		fmt.Fprintf(out, "; %d widened via %s", len(widenedCodes), strings.Join(dedupe(widenedCodes), ","))
 	}
 	fmt.Fprintln(out)
+	// The floor is a refusal, not a print: it exists so the audit append
+	// can never wedge (spec).
+	if minFree > 0 && free < minFree {
+		fmt.Fprintf(out, "preflight refused: %d MB free required, %d MB free\n", minFree/(1<<20), free/(1<<20))
+		return false, ExitState
+	}
 	if minFree > 0 {
 		fmt.Fprintf(out, "preflight: %d MB free required, %d MB free\n", minFree/(1<<20), free/(1<<20))
 	}
@@ -131,7 +161,7 @@ func Confirm(out io.Writer, in *os.File, plan []PlanEntry, widened int, minFree 
 		return false, ExitOK
 	}
 	if !opts.Yes {
-		if !IsTerminal(out) {
+		if !IsTerminal(in, out) {
 			fmt.Fprintln(out, "reap apply deletes permanently; pass --yes to confirm when not interactive")
 			return false, ExitNotTTY
 		}
@@ -151,39 +181,71 @@ func Confirm(out io.Writer, in *os.File, plan []PlanEntry, widened int, minFree 
 	return true, ExitOK
 }
 
-// OrderChildrenFirst sorts the plan so lineage children (worktrees, jj
-// workspaces) delete before their parents, and a parent whose live children
-// outside the set exist is dropped from the plan (with a skip entry) — the
-// spec's parent-of-live-children unlock rule.
-func OrderChildrenFirst(plan []PlanEntry) ([]PlanEntry, []SkippedPath) {
-	inSet := map[string]bool{}
-	byParent := map[string][]PlanEntry{}
-	var roots, out []PlanEntry
-	for _, p := range plan {
-		inSet[config.Canonical(p.Path)] = true
-	}
-	var skips []SkippedPath
-	for _, p := range plan {
-		if p.Parent != "" && config.Canonical(p.Parent) != config.Canonical(p.Path) && inSet[config.Canonical(p.Parent)] {
-			byParent[config.Canonical(p.Parent)] = append(byParent[config.Canonical(p.Parent)], p)
-		} else {
-			roots = append(roots, p)
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
 		}
 	}
-	// Children first: every entry whose parent is in the set goes before
-	// that parent. Depth is at most two in practice (workspace -> repo).
-	for _, parent := range roots {
-		out = append(out, byParent[config.Canonical(parent.Path)]...)
-		out = append(out, parent)
-	}
-	return out, skips
+	return out
 }
 
-// Reverify re-runs the deletion-time checks for one path: cache-bypassed
-// fresh walk (tripwire), fresh git facts with fetch --prune, the rename
-// in-use probe. Returns a skipWhy ("" = proceed) and the fresh verdict for
-// the audit intent line.
-func Reverify(path string, opts Options, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool) (skipWhy string, fresh verdict.Verdict) {
+// OrderChildrenFirst emits every plan entry in lineage order — children
+// before parents, at any depth (a grandchild chain was silently dropped by
+// the two-level version; planned-but-never-emitted is the worst shape a
+// plan can have).
+func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
+	// Depth = number of ancestors also in the set; emit ascending depth.
+	inSet := map[string]int{}
+	for i, p := range plan {
+		inSet[config.Canonical(p.Path)] = i
+	}
+	depth := make([]int, len(plan))
+	for i, p := range plan {
+		d := 0
+		cur := p.ParentRepo
+		visited := map[int]bool{i: true}
+		for cur != "" {
+			j, ok := inSet[config.Canonical(cur)]
+			if !ok || visited[j] {
+				break // self-parenting roots terminate here
+			}
+			visited[j] = true
+			d++
+			cur = plan[j].ParentRepo
+		}
+		depth[i] = d
+	}
+	order := make([]int, len(plan))
+	for i := range order {
+		order[i] = i
+	}
+	// DESCENDING depth: children (deeper) delete first. The test caught the
+	// ascending version deleting the parent before its own child.
+	for i := 0; i < len(order); i++ {
+		for j := i + 1; j < len(order); j++ {
+			if depth[order[j]] > depth[order[i]] {
+				order[i], order[j] = order[j], order[i]
+			}
+		}
+	}
+	out := make([]PlanEntry, 0, len(plan))
+	for _, i := range order {
+		out = append(out, plan[i])
+	}
+	return out
+}
+
+// Reverify re-runs the deletion-time checks for one PLANNED path at full
+// strength: fresh facts including the gh join and remote slugs, fresh walk
+// tripwire, fetch --prune, the rename in-use probe, and — the round-1
+// blocker fold — the fresh verdict must MATCH the plan: a SAFE row must
+// re-verdict SAFE (clean-pushed), a widened row must carry the same
+// reasonCode, and any drift (including parent-of-live-children) skips.
+func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool) ReverifyResult {
 	now := time.Now()
 	remoteStale := time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 
@@ -194,10 +256,10 @@ func Reverify(path string, opts Options, cfg config.Config, d Deleter, protectEx
 	// Fresh walk: lastActivity NEVER from cache (the spec's structural rule).
 	info := walk.Entry(filepath.Dir(path), path, now)
 	if info.Partial {
-		return SkipIgnorance, verdict.Verdict{Verdict: verdict.Manual, Code: "state-unreadable"}
+		return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: verdict.Verdict{Verdict: verdict.Manual, Code: "state-unreadable"}}
 	}
 	if now.Sub(info.MaxMtime) < 2*time.Hour {
-		return SkipActiveTripwire, verdict.Verdict{Verdict: verdict.Active, Code: "active"}
+		return ReverifyResult{SkipWhy: SkipActiveTripwire, Verdict: verdict.Verdict{Verdict: verdict.Active, Code: "active"}}
 	}
 
 	classInfo := classify.Dir(path)
@@ -207,17 +269,26 @@ func Reverify(path string, opts Options, cfg config.Config, d Deleter, protectEx
 		GitBackend: classInfo.GitBackend, Thresholds: cfg.Thresholds, Now: now,
 		Held:      heldUnder(holds, path),
 		Protected: protected(path, protectExpanded),
+		PRHeads:   d.PRHeads,
 	}
 	if classInfo.GitBackend || (classInfo.Kind == classify.KindGitWorktreeOrphaned && classInfo.ParentRepo != "") {
 		// Apply-time strengthening: prune stale remote-tracking refs before
 		// computing unpushed (offline/timeout -> remote-stale MANUAL, never
-		// trust of stale refs).
-		if err := d.Git.FetchPrune(path); err != nil {
+		// trust of stale refs). Budget check first: budget<=0 means fetch
+		// disabled, which is NOT an error.
+		if err := d.Git.FetchPrune(path); err != nil && d.Git.FetchBudget > 0 {
 			f := gitx.Facts{StateUnreadable: true, Why: fmt.Sprintf("fetch --prune: %v", err)}
 			in.Git = &f
-		} else {
-			f := d.Git.Facts(path, now, remoteStale)
-			in.Git = &f
+			res := ReverifyResult{Verdict: verdict.Decide(in), Class: classInfo}
+			res.SkipWhy = SkipIgnorance
+			return res
+		}
+		f := d.Git.Facts(path, now, remoteStale)
+		in.Git = &f
+		for _, url := range d.Git.Remotes(path) {
+			if slug := ghx.SlugFromURL(url); slug != "" {
+				in.RemoteSlugs = append(in.RemoteSlugs, slug)
+			}
 		}
 	}
 	if classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace {
@@ -226,27 +297,22 @@ func Reverify(path string, opts Options, cfg config.Config, d Deleter, protectEx
 	}
 	v := verdict.Decide(in)
 
-	// BLOCKED-class or ignorance: never deletable by re-verify.
+	// MATCH gate: the fresh verdict must equal the planned one.
 	if v.BlockedClassFact != "" && !v.OrphanedCarveOut {
-		return SkipVerdictChanged, v
+		return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
 	}
-	switch v.Verdict {
-	case verdict.Safe:
-		// proceed
-	case verdict.Manual:
-		// Widened/overridden judgment rows only; check the caller included
-		// this path (the caller filters by code; ignorance rows skip).
-		if _, ign := map[string]bool{
-			"facts-unavailable": true, "state-unreadable": true, "remote-stale": true,
-			"jj-remote-stale": true, "gh-unavailable": true, "unknown-kind": true,
-		}[v.Code]; ign {
-			return SkipIgnorance, v
+	if v.Code == "parent-of-live-children" {
+		return ReverifyResult{SkipWhy: SkipParentLive, Verdict: v, Git: in.Git, Class: classInfo}
+	}
+	switch {
+	case widened:
+		if v.Verdict != verdict.Manual || v.Code != plannedCode {
+			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
 		}
-	default: // ACTIVE / KEEP / BLOCKED displayed
-		if v.Verdict == verdict.Blocked {
-			return SkipVerdictChanged, v
+	default: // SAFE-planned
+		if v.Verdict != verdict.Safe {
+			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
 		}
-		return SkipVerdictChanged, v
 	}
 
 	// Rename in-use probe: deterministic sibling, \\?\ long-safe paths,
@@ -254,22 +320,22 @@ func Reverify(path string, opts Options, cfg config.Config, d Deleter, protectEx
 	// into an abort naming the new path.
 	if err := renameProbe(path); err != nil {
 		if errors.Is(err, errProbeInUse) {
-			return SkipInUseProbe, v
+			return ReverifyResult{SkipWhy: SkipInUseProbe, Verdict: v, Git: in.Git, Class: classInfo}
 		}
-		// Restore failed: the dir is stranded under the probe name. This is
-		// a hard abort, not a skip: surface it loudly.
-		return "PROBE-STRANDED:" + err.Error(), v
+		return ReverifyResult{SkipWhy: "PROBE-STRANDED:" + err.Error(), Verdict: v, Git: in.Git, Class: classInfo}
 	}
-	return "", v
+	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo}
 }
 
 var errProbeInUse = errors.New("dir is in use (rename refused)")
 
 func longPath(p string) string {
-	if strings.HasPrefix(p, `\\?\`) {
-		return p
+	if len(p) > 240 || strings.HasPrefix(p, `\\?\`) {
+		if !strings.HasPrefix(p, `\\?\`) {
+			return `\\?\` + p
+		}
 	}
-	return `\\?\` + p
+	return p
 }
 
 func renameProbe(path string) error {
@@ -293,7 +359,7 @@ func renameProbe(path string) error {
 	return nil
 }
 
-// HealProbingStrands heals .reap-probing leftovers in dir: original absent ->
+// HealProbingStrays heals .reap-probing leftovers in dir: original absent ->
 // rename back; both present -> park the stray as .reap-orphaned-<ts>.
 func HealProbingStrays(dir string) {
 	entries, err := os.ReadDir(dir)
@@ -316,34 +382,51 @@ func HealProbingStrays(dir string) {
 	}
 }
 
-// Delete removes one path: deregister first (worktree remove / jj workspace
-// forget), then rm with contents-before-.git/.jj ordering, with the audit
-// write-ahead bracketing. mode names how it went for the result line.
-func Delete(path string, classInfo classify.Info, d Deleter, log *auditlog.Log, intent auditlog.Line) (mode string, err error) {
+// Delete removes one path: deregister first (worktree remove FROM THE
+// PARENT — git -C on the doomed worktree makes it git's own cwd, so the
+// remove reliably fails after deregistering, which is how the round-1
+// probe caught it — jj workspace forget must succeed), then rm with
+// contents-before-VCS ordering. The audit lines are written by the CALLER
+// (intent before, result after): the round-1 Delete wrote its own
+// mislabeled line on one branch and ignored its error.
+func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err error) {
 	mode = "rm"
 	if classInfo.Kind == classify.KindGitWorktree && classInfo.ParentRepo != "" {
-		if err := d.Git.WorktreeRemove(path); err == nil {
-			mode = "worktree-remove"
-			ok := true
-			intent.Mode = mode
-			intent.OK = &ok
-			_ = log.Append(intent) // result semantics: full removal below skipped
-			return mode, nil
+		if err := d.Git.WorktreeRemoveFrom(path, classInfo.ParentRepo); err == nil {
+			return "worktree-remove", nil
 		}
-		// fall through to rm + prune later
+		// Fall through to rm; prune the stale registration after.
+		if err := removeContentsBeforeVCS(path); err != nil {
+			return mode, err
+		}
+		_ = d.Git.WorktreePrune(classInfo.ParentRepo)
+		return "worktree-remove+rm", nil
 	}
 	if (classInfo.Kind == classify.KindJJWorkspace || classInfo.Kind == classify.KindJJRepo) && classInfo.ParentRepo != "" {
-		if err := d.JJ.WorkspaceForget(classInfo.ParentRepo, filepath.Base(path)); err == nil {
-			mode = "jj-forget+rm"
+		if err := d.JJ.WorkspaceForget(classInfo.ParentRepo, workspaceName(classInfo.ParentRepo, path)); err != nil {
+			// Spec: forget must succeed before rm; failure routes MANUAL.
+			return mode, fmt.Errorf("%w: jj workspace forget: %v", errDeregister, err)
 		}
-		// forget failure does NOT block: the working copy removal is the
-		// point; the parent's stale registration is healed by `jj` later or
-		// surfaced by scan (children existence-checked).
+		mode = "jj-forget+rm"
 	}
 	if err := removeContentsBeforeVCS(path); err != nil {
 		return mode, err
 	}
 	return mode, nil
+}
+
+var errDeregister = errors.New("deregistration failed")
+
+// workspaceName resolves the jj workspace name from the parent's registry
+// (the dir base need not equal the registered name — the round-1 find).
+func workspaceName(parent, path string) string {
+	f := jjx.Runner{}.WorkspaceListNames(parent)
+	for name, p := range f {
+		if config.Canonical(p) == config.Canonical(path) {
+			return name
+		}
+	}
+	return filepath.Base(path)
 }
 
 // removeContentsBeforeVCS deletes everything except the VCS metadata first,
@@ -367,12 +450,14 @@ func removeContentsBeforeVCS(path string) error {
 }
 
 // Lock takes apply.lock exclusively; a held lock fails fast naming the
-// holder PID.
+// holder (PID + runId written into the lock body — the spec asks for
+// both).
 func Lock(stateDir string) (*lockfile.File, error) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return nil, err
 	}
-	l, err := lockfile.Open(filepath.Join(stateDir, "apply.lock"))
+	path := filepath.Join(stateDir, "apply.lock")
+	l, err := lockfile.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -382,9 +467,19 @@ func Lock(stateDir string) (*lockfile.File, error) {
 	}
 	if !ok {
 		l.Close()
-		return nil, fmt.Errorf("another reap apply/discard holds apply.lock (fail-fast; retry when it exits)")
+		holder := readLockHolder(path)
+		return nil, fmt.Errorf("another reap apply/discard holds apply.lock (holder: %s); fail-fast, retry when it exits", holder)
 	}
+	_ = os.WriteFile(path, []byte(fmt.Sprintf("pid=%d runId=%s", os.Getpid(), "unknown")), 0o644)
 	return l, nil
+}
+
+func readLockHolder(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 // ReadHoldsSnapshot is the shared lenient read for display commands.
@@ -406,12 +501,33 @@ func ReadHoldsSnapshot(stateDir string) map[string]time.Time {
 	return out
 }
 
+// WriteHolds is the single writer of holds.json, in the exact shape every
+// reader expects ({canonicalPath: {"expires": RFC3339}}) — the round-1
+// blocker was a writer/reader shape mismatch that bricked the tool.
+func WriteHolds(stateDir string, hf map[string]time.Time) error {
+	out := map[string]struct {
+		Expires time.Time `json:"expires"`
+	}{}
+	for p, exp := range hf {
+		out[config.Canonical(p)] = struct {
+			Expires time.Time `json:"expires"`
+		}{Expires: exp}
+	}
+	raw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return err
+	}
+	return config.AtomicWrite(filepath.Join(stateDir, "holds.json"), raw, 0o644)
+}
+
 func heldUnder(holds map[string]bool, path string) bool {
 	if len(holds) == 0 {
 		return false
 	}
 	pc := config.Canonical(path)
-	// walk up component by component
 	parts := strings.Split(pc, string(os.PathSeparator))
 	for i := len(parts); i >= 1; i-- {
 		if holds[strings.Join(parts[:i], string(os.PathSeparator))] {

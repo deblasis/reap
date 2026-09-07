@@ -502,6 +502,23 @@ func (in Input) activeHours() time.Duration {
 	return time.Duration(in.Thresholds.ActiveHours) * time.Hour
 }
 
+// reasonCodes is the closed enum: the normative list --include/--exclude
+// validate against (unknown codes are usage errors, not silent no-ops).
+var reasonCodes = map[string]bool{
+	"active": true, "incoda-live": true, "jj-active": true, "scratch-fresh": true,
+	"scratch-recent": true, "scratch-idle": true, "dirty-files": true,
+	"unpushed-commits": true, "unpushed-reflog": true, "no-remote": true,
+	"open-pr": true, "jj-unpushed": true, "ignored-content": true,
+	"remote-stale": true, "jj-remote-stale": true, "orphaned-worktree": true,
+	"orphaned-workspace": true, "nested-repositories": true,
+	"parent-of-live-children": true, "unknown-kind": true,
+	"state-unreadable": true, "facts-unavailable": true, "gh-unavailable": true,
+	"held-by-user": true, "protected": true, "clean-pushed": true,
+}
+
+// IsReasonCode reports membership in the closed enum.
+func IsReasonCode(code string) bool { return reasonCodes[code] }
+
 // LineageGroup detects the shared-lineage shape: dirs of one origin repo
 // reporting an identical huge unpushed count (the 2286-commit family).
 // Detection is per-run; members keep their own reasonCode and gain a detail.
