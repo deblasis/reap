@@ -109,12 +109,16 @@ type Deleter struct {
 }
 
 // ReverifyResult carries everything the audit intent line needs: the fresh
-// verdict plus the facts it came from.
+// verdict, the facts it came from, and the capped manifest captured while
+// the dir still existed (round 2: capturing it after Delete stamped the
+// unreadable-error stub on every line).
 type ReverifyResult struct {
-	SkipWhy string
-	Verdict verdict.Verdict
-	Git     *gitx.Facts
-	Class   classify.Info
+	SkipWhy  string
+	Verdict  verdict.Verdict
+	Git      *gitx.Facts
+	Class    classify.Info
+	Manifest []byte
+	Residue  string
 }
 
 // IsTerminal reports whether BOTH stdin and stdout are interactive: a
@@ -245,13 +249,32 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 // blocker fold — the fresh verdict must MATCH the plan: a SAFE row must
 // re-verdict SAFE (clean-pushed), a widened row must carry the same
 // reasonCode, and any drift (including parent-of-live-children) skips.
-func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool) ReverifyResult {
+// deletedInRun carries the paths this run has already deleted: a widened
+// parent-of-live-children row whose children all went in this run is the
+// SPEC'S EXPECTED UNLOCK when it re-verdicts SAFE — not drift (round 2:
+// the match gate alone made the both-clean family structurally undeletable).
+func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool) ReverifyResult {
 	now := time.Now()
 	remoteStale := time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 
 	// Heal strays first (never overwrite: a stranded probe name with a live
 	// original parks as .reap-orphaned-<ts> and is surfaced, not merged).
 	HealProbingStrays(filepath.Dir(path))
+
+	// FETCH_HEAD mtime capture: the apply-time fetch freshens it, and the
+	// walk reads .git internals as activity — without the restore, every
+	// repo that SURVIVES an apply (skip/abort) verdicts ACTIVE for 48h and
+	// vanishes from subsequent plans (round 2's feedback-loop find).
+	fhPath := filepath.Join(path, ".git", "FETCH_HEAD")
+	var fhMtime time.Time
+	if fi, err := os.Stat(fhPath); err == nil {
+		fhMtime = fi.ModTime()
+	}
+	restoreFetchHead := func() {
+		if !fhMtime.IsZero() {
+			_ = os.Chtimes(fhPath, fhMtime, fhMtime)
+		}
+	}
 
 	// Fresh walk: lastActivity NEVER from cache (the spec's structural rule).
 	info := walk.Entry(filepath.Dir(path), path, now)
@@ -275,13 +298,13 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 		// Apply-time strengthening: prune stale remote-tracking refs before
 		// computing unpushed (offline/timeout -> remote-stale MANUAL, never
 		// trust of stale refs). Budget check first: budget<=0 means fetch
-		// disabled, which is NOT an error.
+		// disabled, which is NOT an error. FETCH_HEAD's mtime is restored
+		// around the fetch (round 2's feedback loop).
 		if err := d.Git.FetchPrune(path); err != nil && d.Git.FetchBudget > 0 {
+			restoreFetchHead()
 			f := gitx.Facts{StateUnreadable: true, Why: fmt.Sprintf("fetch --prune: %v", err)}
 			in.Git = &f
-			res := ReverifyResult{Verdict: verdict.Decide(in), Class: classInfo}
-			res.SkipWhy = SkipIgnorance
-			return res
+			return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: verdict.Decide(in), Class: classInfo}
 		}
 		f := d.Git.Facts(path, now, remoteStale)
 		in.Git = &f
@@ -291,12 +314,18 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 			}
 		}
 	}
+	restoreFetchHead()
 	if classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace {
 		f := d.JJ.Facts(path, now, remoteStale)
 		in.JJ = &f
 	}
 	v := verdict.Decide(in)
 
+	// Ignorance-class fresh verdicts (gh died mid-run etc.) report as
+	// ignorance, not verdict-changed (round 2: the histogram misled).
+	if isIgnoranceCodeLocal(v.Code) {
+		return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: v, Git: in.Git, Class: classInfo}
+	}
 	// MATCH gate: the fresh verdict must equal the planned one.
 	if v.BlockedClassFact != "" && !v.OrphanedCarveOut {
 		return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
@@ -307,6 +336,12 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	switch {
 	case widened:
 		if v.Verdict != verdict.Manual || v.Code != plannedCode {
+			// The in-run unlock: a widened parent-of-live-children row whose
+			// children all went in this run re-verdicts SAFE — proceed.
+			if plannedCode == "parent-of-live-children" && v.Verdict == verdict.Safe &&
+				allChildrenDeletedInRun(classInfo, in, deletedInRun) {
+				break
+			}
 			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
 		}
 	default: // SAFE-planned
@@ -315,16 +350,62 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 		}
 	}
 
+	// Capture the manifest NOW: the dir exists (post-walk, pre-probe), and
+	// Delete will remove it (round 2: post-Delete capture stamped the
+	// unreadable stub on every line).
+	manifest := []byte(nil)
+	residue := ""
+	if plannedCode != "clean-pushed" {
+		manifest = walk.CappedManifest(path)
+	}
+	if len(info.NestedVCS) > 0 {
+		residue = fmt.Sprintf("nested repos: %d", len(info.NestedVCS))
+	} else if in.Git != nil && in.Git.ReflogOnly > 0 {
+		residue = fmt.Sprintf("reflog-only: %d", in.Git.ReflogOnly)
+	}
+
 	// Rename in-use probe: deterministic sibling, \\?\ long-safe paths,
 	// restore retried; a restore failure is a hard error the caller turns
 	// into an abort naming the new path.
 	if err := renameProbe(path); err != nil {
 		if errors.Is(err, errProbeInUse) {
-			return ReverifyResult{SkipWhy: SkipInUseProbe, Verdict: v, Git: in.Git, Class: classInfo}
+			return ReverifyResult{SkipWhy: SkipInUseProbe, Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
 		}
-		return ReverifyResult{SkipWhy: "PROBE-STRANDED:" + err.Error(), Verdict: v, Git: in.Git, Class: classInfo}
+		return ReverifyResult{SkipWhy: "PROBE-STRANDED:" + err.Error(), Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
 	}
-	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo}
+	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
+}
+
+func isIgnoranceCodeLocal(code string) bool {
+	switch code {
+	case "facts-unavailable", "state-unreadable", "remote-stale", "jj-remote-stale", "gh-unavailable", "unknown-kind":
+		return true
+	}
+	return false
+}
+
+// allChildrenDeletedInRun reports whether every live registered child of
+// the path went in this run's deletion set (the in-set unlock).
+func allChildrenDeletedInRun(classInfo classify.Info, in verdict.Input, deletedInRun map[string]bool) bool {
+	children := 0
+	gone := 0
+	if in.Git != nil {
+		children += len(in.Git.Children)
+		for _, c := range in.Git.Children {
+			if deletedInRun[config.Canonical(c)] {
+				gone++
+			}
+		}
+	}
+	if in.JJ != nil {
+		children += len(in.JJ.Children)
+		for _, c := range in.JJ.Children {
+			if deletedInRun[config.Canonical(c)] {
+				gone++
+			}
+		}
+	}
+	return children > 0 && children == gone
 }
 
 var errProbeInUse = errors.New("dir is in use (rename refused)")
@@ -403,7 +484,7 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 		return "worktree-remove+rm", nil
 	}
 	if (classInfo.Kind == classify.KindJJWorkspace || classInfo.Kind == classify.KindJJRepo) && classInfo.ParentRepo != "" {
-		if err := d.JJ.WorkspaceForget(classInfo.ParentRepo, workspaceName(classInfo.ParentRepo, path)); err != nil {
+		if err := d.JJ.WorkspaceForget(classInfo.ParentRepo, workspaceName(classInfo.ParentRepo, path, d.JJ)); err != nil {
 			// Spec: forget must succeed before rm; failure routes MANUAL.
 			return mode, fmt.Errorf("%w: jj workspace forget: %v", errDeregister, err)
 		}
@@ -419,8 +500,8 @@ var errDeregister = errors.New("deregistration failed")
 
 // workspaceName resolves the jj workspace name from the parent's registry
 // (the dir base need not equal the registered name — the round-1 find).
-func workspaceName(parent, path string) string {
-	f := jjx.Runner{}.WorkspaceListNames(parent)
+func workspaceName(parent, path string, jr jjx.Runner) string {
+	f := jr.WorkspaceListNames(parent)
 	for name, p := range f {
 		if config.Canonical(p) == config.Canonical(path) {
 			return name
@@ -482,21 +563,35 @@ func readLockHolder(path string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// ReadHoldsSnapshot is the shared lenient read for display commands.
-func ReadHoldsSnapshot(stateDir string) map[string]time.Time {
+// ReadHoldsSnapshotStrict reads holds.json distinguishing missing (ok, empty)
+// from CORRUPT (error): a writer must refuse corrupt rather than overwrite
+// existing holds (round 2: cmdHold silently wiped a corrupt file).
+func ReadHoldsSnapshotStrict(stateDir string) (map[string]time.Time, error) {
 	raw, err := os.ReadFile(filepath.Join(stateDir, "holds.json"))
+	if os.IsNotExist(err) {
+		return map[string]time.Time{}, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var hf map[string]struct {
 		Expires time.Time `json:"expires"`
 	}
-	if json.Unmarshal(raw, &hf) != nil {
-		return nil
+	if uerr := json.Unmarshal(raw, &hf); uerr != nil {
+		return nil, fmt.Errorf("holds.json is corrupt (refusing to overwrite holds): %w", uerr)
 	}
 	out := map[string]time.Time{}
 	for p, h := range hf {
 		out[config.Canonical(p)] = h.Expires
+	}
+	return out, nil
+}
+
+// ReadHoldsSnapshot is the shared lenient read for display commands.
+func ReadHoldsSnapshot(stateDir string) map[string]time.Time {
+	out, err := ReadHoldsSnapshotStrict(stateDir)
+	if err != nil {
+		return nil
 	}
 	return out
 }

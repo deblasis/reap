@@ -165,7 +165,7 @@ func TestReverifyTripwireSkipsFreshDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil)
 	if rv.SkipWhy != SkipActiveTripwire || rv.Verdict.Verdict != "ACTIVE" {
 		t.Fatalf("fresh dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
@@ -184,7 +184,7 @@ func TestReverifyProtectedSkips(t *testing.T) {
 	}
 	cfg := config.Default()
 	protected := []string{"**/cand/**"}
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, protected, nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, protected, nil, nil)
 	if rv.SkipWhy != SkipVerdictChanged || rv.Verdict.Verdict != "KEEP" {
 		t.Fatalf("protected dir: skip=%q verdict=%s", rv.SkipWhy, rv.Verdict.Verdict)
 	}
@@ -207,7 +207,7 @@ func TestReverifyFreshCodeMustMatchPlan(t *testing.T) {
 	old := time.Now().Add(-40 * 24 * time.Hour)
 	_ = os.Chtimes(target, old, old)
 	cfg := config.Default()
-	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil)
+	rv := Reverify(target, "scratch-idle", false, cfg, Deleter{}, config.ExpandRoots(cfg.Protect), nil, nil)
 	if rv.SkipWhy != SkipVerdictChanged {
 		t.Fatalf("drifted code: skip=%q verdict=%s/%s (must skip verdict-changed)", rv.SkipWhy, rv.Verdict.Verdict, rv.Verdict.Code)
 	}

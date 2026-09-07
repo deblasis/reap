@@ -37,7 +37,7 @@ type scanCore struct {
 	gitBudget, jjBudget, ghBudget, fetchBudget time.Duration
 }
 
-func newScanCore(args []string, stderr io.Writer) (*scanCore, int) {
+func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ bool) (*scanCore, int) {
 	stateDir, err := config.StateDir()
 	if err != nil {
 		fmt.Fprintf(stderr, "reap: %v\n", err)
@@ -48,17 +48,11 @@ func newScanCore(args []string, stderr io.Writer) (*scanCore, int) {
 		fmt.Fprintf(stderr, "reap: %v\n", err)
 		return nil, ExitState
 	}
-	core := &scanCore{cfg: cfg, noGH: hasFlag(args, "--no-gh"), noJJ: hasFlag(args, "--no-jj")}
+	core := &scanCore{cfg: cfg, noGH: noGH, noJJ: noJJ}
 	core.gitBudget, core.jjBudget, core.ghBudget, core.fetchBudget, err = cfg.Thresholds.Budgets()
 	if err != nil {
 		fmt.Fprintf(stderr, "reap: %v\n", err)
 		return nil, ExitState
-	}
-	var rootsFlag []string
-	for i, a := range args {
-		if a == "--roots" && i+1 < len(args) {
-			rootsFlag = append(rootsFlag, args[i+1])
-		}
 	}
 	core.roots, err = narrowRoots(config.ExpandRoots(cfg.Roots), rootsFlag)
 	if err != nil {
@@ -334,8 +328,8 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	rootsFlag := multiFlag{}
 	fs.Var(&rootsFlag, "roots", "narrow to these configured roots")
 	minGB := fs.Float64("min-gb", 0, "planning floor (GB)")
-	fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
-	fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
+	noGH := fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
+	noJJ := fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
 	include := multiFlag{}
 	fs.Var(&include, "include", "widen into a judgment-class MANUAL code (repeatable)")
 	exclude := multiFlag{}
@@ -344,7 +338,7 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
-	core, code := newScanCore(args, stderr)
+	core, code := newScanCore(args, stderr, rootsFlag, *noGH, *noJJ)
 	if core == nil {
 		return code
 	}
@@ -369,8 +363,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	rootsFlag := multiFlag{}
 	fs.Var(&rootsFlag, "roots", "narrow to these configured roots")
 	minGB := fs.Float64("min-gb", 0, "planning floor (GB)")
-	fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
-	fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
+	noGH := fs.Bool("no-gh", false, "skip the open-PR fact (weakens verdicts)")
+	noJJ := fs.Bool("no-jj", false, "skip jj facts (weakens verdicts)")
 	include := multiFlag{}
 	fs.Var(&include, "include", "widen into a judgment-class MANUAL code (repeatable)")
 	exclude := multiFlag{}
@@ -389,7 +383,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		fmt.Fprintf(stderr, "reap apply: %v\n", err)
 		return ExitState
 	}
-	core, code := newScanCore(args, stderr)
+	core, code := newScanCore(args, stderr, rootsFlag, *noGH, *noJJ)
 	if core == nil {
 		return code
 	}
@@ -467,6 +461,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		JJ:      jjx.Runner{Budget: core.jjBudget},
 		PRHeads: core.prHeads,
 	}
+	deletedInRun := map[string]bool{}
 	for _, p := range ordered {
 		intent := auditlog.Line{
 			Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
@@ -475,7 +470,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if rc := appendOrAbort(intent); rc >= 0 {
 			return rc
 		}
-		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds)
+		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun)
 		if rv.SkipWhy != "" {
 			if strings.HasPrefix(rv.SkipWhy, "PROBE-STRANDED:") {
 				fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.SkipWhy)
@@ -519,9 +514,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				result.Origin = c.entry.Origin
 			}
 		}
-		if p.Code != "clean-pushed" {
-			result.Manifest = walk.CappedManifest(p.Path)
-		}
+		result.Manifest = rv.Manifest
+		result.Residue = rv.Residue
 		ok := true
 		result.OK = &ok
 		if rc := appendOrAbort(result); rc >= 0 {
@@ -616,9 +610,10 @@ func cmdHold(args []string, stdout, stderr io.Writer) int {
 		return ExitState
 	}
 	defer lock.Close()
-	hf := applycmd.ReadHoldsSnapshot(stateDir)
-	if hf == nil {
-		hf = map[string]time.Time{}
+	hf, err := applycmd.ReadHoldsSnapshotStrict(stateDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap hold: %v\n", err)
+		return ExitState
 	}
 	abs, _ := filepath.Abs(fs.Arg(0))
 	hf[config.Canonical(abs)] = time.Now().Add(dur)
