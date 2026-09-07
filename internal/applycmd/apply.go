@@ -310,18 +310,26 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	if classInfo.GitBackend || (classInfo.Kind == classify.KindGitWorktreeOrphaned && classInfo.ParentRepo != "") {
 		// Apply-time strengthening: prune stale remote-tracking refs before
 		// computing unpushed (offline/timeout -> remote-stale MANUAL, never
-		// trust of stale refs). Budget check first: budget<=0 means fetch
-		// disabled, which is NOT an error. FETCH_HEAD's mtime is restored
-		// around the fetch (round 2's feedback loop).
-		if err := d.Git.FetchPrune(path); err != nil && d.Git.FetchBudget > 0 {
-			restoreFetchHead()
-			f := gitx.Facts{StateUnreadable: true, Why: fmt.Sprintf("fetch --prune: %v", err)}
-			in.Git = &f
-			return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: verdict.Decide(in), Class: classInfo}
+		// trust of stale refs). A repo with NO remotes skips the fetch
+		// entirely: `git fetch --prune` exits nonzero there, and reading
+		// that as unreadable made every no-remote repo state-unreadable at
+		// deletion time — the discard resolver could never fire on exactly
+		// the repos it exists for. Nothing to prune, no tracking refs to
+		// stale; the facts below stand on their own. Budget check first:
+		// budget<=0 means fetch disabled, which is NOT an error.
+		// FETCH_HEAD's mtime is restored around the fetch (round 2's loop).
+		remotes := d.Git.Remotes(path)
+		if len(remotes) > 0 {
+			if err := d.Git.FetchPrune(path); err != nil && d.Git.FetchBudget > 0 {
+				restoreFetchHead()
+				f := gitx.Facts{StateUnreadable: true, Why: fmt.Sprintf("fetch --prune: %v", err)}
+				in.Git = &f
+				return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: verdict.Decide(in), Class: classInfo}
+			}
 		}
 		f := d.Git.Facts(path, now, remoteStale)
 		in.Git = &f
-		for _, url := range d.Git.Remotes(path) {
+		for _, url := range remotes {
 			if slug := ghx.SlugFromURL(url); slug != "" {
 				in.RemoteSlugs = append(in.RemoteSlugs, slug)
 			}
@@ -466,6 +474,21 @@ func allPlanChildrenDeleted(planChildren []string, deletedInRun map[string]bool)
 }
 
 var errProbeInUse = errors.New("dir is in use (rename refused)")
+
+// InUseProbe runs the rename in-use probe standalone: discard needs it even
+// though Reverify's BLOCKED early return (the match gate) never reaches its
+// own probe. A dir a live process holds open must not be
+// quarantined-then-deleted any more than silently deleted.
+func InUseProbe(path string) (inUse bool, stranded error) {
+	err := renameProbe(path)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, errProbeInUse) {
+		return true, nil
+	}
+	return false, err
+}
 
 func longPath(p string) string {
 	if len(p) > 240 || strings.HasPrefix(p, `\\?\`) {

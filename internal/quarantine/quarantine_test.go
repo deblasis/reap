@@ -89,6 +89,18 @@ func TestSnapshotCompleteness(t *testing.T) {
 	if !strings.Contains(refs, "refs/reap/capture-") || !strings.Contains(refs, "refs/reap/unpushed-") {
 		t.Fatalf("refs/reap pins missing:\n%s", refs)
 	}
+	// The session holds a REAL bundle that verifies and is priced in the
+	// manifest — the pins alone die with the source dir.
+	bundle := filepath.Join(session, "bundle.git")
+	if fi, err := os.Stat(bundle); err != nil || fi.Size() == 0 {
+		t.Fatalf("bundle.git missing/empty: %v", err)
+	}
+	if m.BundleBytes == 0 {
+		t.Fatal("manifest does not price the bundle")
+	}
+	if err := gr.BundleVerify(repo, bundle); err != nil {
+		t.Fatalf("bundle verify: %v", err)
+	}
 }
 
 // The capture ref's tree contains the ignored file (completeness, not

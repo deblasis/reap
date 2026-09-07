@@ -90,74 +90,157 @@ func SessionDir(stateDir, source string, now time.Time) string {
 	return filepath.Join(Dir(stateDir), now.Format("20060102-150405")+"-"+name)
 }
 
-// Snapshot captures source completely and returns the manifest. The dir is
-// never mutated; on any failure the dir is untouched (the caller checks
-// err). gitRunner drives git; jjChanges is the caller's fact count.
+// Snapshot captures source completely and returns the manifest. The source
+// dir is never mutated; on any failure it is untouched AND the session dir
+// is removed — a half-written session must never masquerade as recoverable
+// (the caller checks err). gitRunner drives git.
 func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*Manifest, error) {
 	now := time.Now()
 	m := &Manifest{Created: now, Source: source, Mode: opts.Mode}
 
+	// The session dir must exist up front: `git bundle create` writes
+	// <bundle>.lock BESIDE its destination, so a session dir that first
+	// appears at manifest-write time makes every bundle create fail.
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		return nil, err
+	}
+
 	// 1. The capture ref: everything staged into a tree, committed via
 	//    plumbing. Working-tree files stay on disk.
 	if err := captureRef(gitRunner, source, m); err != nil {
+		removeSession(sessionDir)
 		return nil, err
 	}
 
 	// 2. Tip pinning under refs/reap/* (bundles pack refs, not reflogs).
 	pins, err := pinTips(gitRunner, source, m)
 	if err != nil {
-		return nil, err
-	}
-	_ = pins
-
-	// 3. Size accounting for the cap: bundle delta + tracked content.
-	if err := m.account(gitRunner, source, opts); err != nil {
+		removeSession(sessionDir)
 		return nil, err
 	}
 
-	// 4. Write the manifest first (it describes the bundle that follows).
+	// 3. THE BUNDLE IS THE QUARANTINE. refs/reap/* pins live inside the
+	//    source repo and die with it; materialize every pinned ref into the
+	//    session dir, verify it against the repo that still exists, and
+	//    fsync before the caller may delete anything.
+	bundle := filepath.Join(sessionDir, "bundle.git")
+	refs := append([]string{m.CaptureRef}, pins...)
+	if err := gitRunner.BundleCreate(source, bundle, refs); err != nil {
+		removeSession(sessionDir)
+		return nil, fmt.Errorf("bundle create: %w", err)
+	}
+	if err := gitRunner.BundleVerify(source, bundle); err != nil {
+		removeSession(sessionDir)
+		return nil, &ErrVerify{Underlying: err}
+	}
+	if err := syncFile(bundle); err != nil {
+		removeSession(sessionDir)
+		return nil, fmt.Errorf("bundle fsync: %w", err)
+	}
+	size := fileSize(bundle)
+	if opts.CapBytes > 0 && size > opts.CapBytes {
+		removeSession(sessionDir)
+		return nil, &ErrTooLarge{Need: size, Cap: opts.CapBytes}
+	}
+	m.BundleBytes = size
+
+	// 4. Class accounting (the manifest proves WHAT is recoverable).
+	if err := m.account(gitRunner, source); err != nil {
+		removeSession(sessionDir)
+		return nil, err
+	}
+
+	// 5. Manifest last: it describes a bundle that already exists and
+	//    verifies, and it is fsynced too.
 	if err := writeManifest(sessionDir, m); err != nil {
+		removeSession(sessionDir)
 		return nil, err
+	}
+	if err := syncFile(filepath.Join(sessionDir, "manifest.json")); err != nil {
+		removeSession(sessionDir)
+		return nil, fmt.Errorf("manifest fsync: %w", err)
 	}
 	return m, nil
 }
 
+// removeSession wipes a failed session: a quarantine that did not complete
+// is not a quarantine.
+func removeSession(sessionDir string) { _ = os.RemoveAll(sessionDir) }
+
+func fileSize(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// syncFile flushes a written artifact to disk. Opened read/write: Windows
+// refuses FlushFileBuffers on a read-only handle.
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // captureRef creates refs/reap/capture-<ts> holding the full working tree.
+// The operator's staged state is saved and restored EXACTLY (SaveIndex),
+// not reset to HEAD: a discard attempt that later refuses must leave the
+// repo as it found it, staged hunks included.
 func captureRef(r gitx.Runner, dir string, m *Manifest) error {
+	backup, _ := r.SaveIndex(dir)
+	restore := func() error {
+		if backup != "" {
+			return r.RestoreBackup(dir, backup)
+		}
+		return r.ResetIndex(dir)
+	}
 	if err := r.AddAll(dir); err != nil {
+		_ = restore()
 		return fmt.Errorf("stage working tree: %w", err)
 	}
 	tree, err := r.WriteTree(dir)
 	if err != nil {
+		_ = restore()
 		return fmt.Errorf("write-tree: %w", err)
 	}
 	commit, err := r.CommitTree(dir, tree)
 	if err != nil {
+		_ = restore()
 		return fmt.Errorf("commit-tree: %w", err)
 	}
 	ref := fmt.Sprintf("refs/reap/capture-%s", m.Created.Format("20060102-150405"))
 	if err := r.UpdateRef(dir, ref, commit); err != nil {
+		_ = restore()
 		return fmt.Errorf("update-ref %s: %w", ref, err)
 	}
 	m.CaptureRef = ref
-	// Restore the index reap just mutated (non-mutating means the SOURCE
-	// tree is untouched; the index is saved and restored around the stage).
-	if err := r.ResetIndex(dir); err != nil {
+	if err := restore(); err != nil {
 		return fmt.Errorf("index restore: %w", err)
 	}
 	return nil
 }
 
-// pinTips pins every recoverable local-only tip under refs/reap/*.
+// pinTips pins every recoverable LOCAL-ONLY tip under refs/reap/*: tips
+// already on a remote are recoverable by re-cloning and would only miscount
+// the manifest. When remote reachability cannot be computed, everything is
+// pinned (the completeness direction).
 func pinTips(r gitx.Runner, dir string, m *Manifest) ([]string, error) {
 	var pins []string
 	tips, err := r.LocalOnlyTips(dir)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate local-only tips: %w", err)
 	}
+	remoteReach := r.RemoteReachable(dir)
 	ts := m.Created.Format("20060102-150405")
-	for i, tip := range tips {
-		ref := fmt.Sprintf("refs/reap/unpushed-%d-%s", i, ts)
+	for _, tip := range tips {
+		if remoteReach != nil && remoteReach[tip.SHA] {
+			continue
+		}
+		ref := fmt.Sprintf("refs/reap/unpushed-%d-%s", len(pins), ts)
 		if err := r.UpdateRef(dir, ref, tip.SHA); err != nil {
 			return nil, fmt.Errorf("pin %s at %s: %w", ref, tip.SHA, err)
 		}
@@ -179,7 +262,7 @@ func pinTips(r gitx.Runner, dir string, m *Manifest) ([]string, error) {
 	return pins, nil
 }
 
-func (m *Manifest) account(r gitx.Runner, dir string, opts Options) error {
+func (m *Manifest) account(r gitx.Runner, dir string) error {
 	if st, err := r.StatusPorcelain(dir); err == nil {
 		m.Classes.Dirty = st.Dirty
 		m.Classes.UntrackedFiles = st.Untracked

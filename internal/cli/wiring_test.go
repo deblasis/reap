@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/deblasis/reap/internal/applycmd"
+	"github.com/deblasis/reap/internal/quarantine"
 )
 
 // The wiring layer (cmdPlan/cmdApply/cmdHold/cmdUnhold/cmdHolds) is where
@@ -203,13 +204,7 @@ func TestWiringExitBand(t *testing.T) {
 	os.RemoveAll(ph)
 	// Age the whole worktree: fresh files would verdict ACTIVE, and the
 	// refusal path only triggers for MANUAL orphaned rows.
-	past2 := time.Now().AddDate(0, 0, -30)
-	filepath.WalkDir(wt, func(p string, d os.DirEntry, err error) error {
-		if err == nil {
-			os.Chtimes(p, past2, past2)
-		}
-		return nil
-	})
+	ageTree(t, wt, 30*24*time.Hour)
 	// Re-point the fixture root so the orphan is a candidate.
 	writeWireConfig(t, filepath.Join(filepath.Dir(root), "state"), base)
 	if code := cmdApply([]string{"--no-gh", "--yes", "--override-manual", wt}, os.Stdout, os.Stderr, os.Stdin); code != applycmd.ExitNotTTY {
@@ -217,5 +212,307 @@ func TestWiringExitBand(t *testing.T) {
 	}
 	if _, err := os.Stat(wt); err != nil {
 		t.Fatal("orphaned dir was deleted")
+	}
+}
+
+// --- M3: discard / quarantine / log / doctor wiring ---
+
+func wireGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ageTree backdates every file and dir (incl. .git internals) so the walk
+// tripwire and activity floors see an idle tree.
+func ageTree(t *testing.T, root string, ago time.Duration) {
+	t.Helper()
+	past := time.Now().Add(-ago)
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+}
+
+// The discard happy path END TO END: a dirty no-remote repo (the canonical
+// BLOCKED shape) is quarantined into a session holding a REAL bundle, the
+// dir is deleted, the ledger carries intent-before/result-after with the
+// quarantine pointer, and RECOVERY IS PROVEN by fetching the bundle into a
+// fresh repo and reading the dirty content out of the capture ref.
+func TestWiringDiscardE2E(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "blocked-dirty")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("modified"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("u"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("discard: %d (%s / %s)", code, out.String(), "see stderr")
+	}
+	if _, err := os.Stat(repo); !os.IsNotExist(err) {
+		t.Fatal("blocked dir survived discard")
+	}
+
+	// Exactly one session, holding manifest + bundle.
+	qdir := filepath.Join(stateDir, "quarantine")
+	entries, err := os.ReadDir(qdir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("quarantine sessions: %v (%v)", len(entries), err)
+	}
+	session := filepath.Join(qdir, entries[0].Name())
+	mraw, err := os.ReadFile(filepath.Join(session, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := quarantine.Manifest{}
+	if err := json.Unmarshal(mraw, &m); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	if m.Mode != "bundle" || m.BundleBytes == 0 || m.CaptureRef == "" {
+		t.Fatalf("manifest incomplete: %+v", m)
+	}
+	if m.Classes.Dirty < 1 || m.Classes.Refs < 1 {
+		t.Fatalf("manifest classes: %+v", m.Classes)
+	}
+	if fi, err := os.Stat(filepath.Join(session, "bundle.git")); err != nil || fi.Size() == 0 {
+		t.Fatalf("bundle.git missing/empty: %v", err)
+	}
+
+	// Ledger: intent before result; result carries ok + quarantinePath.
+	raw, err := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("ledger too short: %d", len(lines))
+	}
+	var intent, result map[string]any
+	json.Unmarshal([]byte(lines[0]), &intent)
+	json.Unmarshal([]byte(lines[1]), &result)
+	if intent["event"] != "intent" || result["event"] != "result" {
+		t.Fatalf("write-ahead order: %v then %v", intent["event"], result["event"])
+	}
+	if result["ok"] != true {
+		t.Fatalf("result ok: %v", result["ok"])
+	}
+	qp, _ := result["quarantinePath"].(string)
+	if qp == "" || !strings.HasPrefix(filepath.Clean(qp), filepath.Clean(qdir)) {
+		t.Fatalf("result quarantinePath: %q", qp)
+	}
+	// The result manifest names the untracked file: recoverability must be
+	// legible from the ledger alone.
+	if mb, ok := result["manifest"].(string); ok {
+		dec, derr := base64.StdEncoding.DecodeString(mb)
+		if derr != nil || !strings.Contains(string(dec), "untracked.txt") {
+			t.Fatalf("ledger manifest missing the untracked file: %v %q", derr, dec)
+		}
+	} else {
+		t.Fatal("result line missing manifest")
+	}
+
+	// Recovery proof: fetch the bundle into a fresh repo; the capture ref's
+	// tree holds the dirty content. This is the whole contract.
+	rec := t.TempDir()
+	wireGit(t, rec, "init", "-q", "-b", "main")
+	wireGit(t, rec, "fetch", "-q", filepath.Join(session, "bundle.git"), "refs/reap/*:refs/reap/*")
+	shown := wireGit(t, rec, "show", m.CaptureRef+":f.txt")
+	if !strings.Contains(shown, "modified") {
+		t.Fatalf("capture ref does not hold the dirty content: %q", shown)
+	}
+}
+
+// discard refuses anything that is not BLOCKED: a clean, pushed repo is
+// SAFE and must survive with a skip line, exit 2.
+func TestWiringDiscardRefusesNotBlocked(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	bare := filepath.Join(t.TempDir(), "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	repo := filepath.Join(root, "clean-pushed")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	wireGit(t, repo, "remote", "add", "origin", bare)
+	wireGit(t, repo, "push", "-q", "origin", "main")
+	ageTree(t, repo, 30*24*time.Hour)
+
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("discard of SAFE dir must exit 2, got %d", code)
+	}
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatal("SAFE dir was deleted by discard")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	var sawSkip bool
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row struct {
+			Event   string `json:"event"`
+			SkipWhy string `json:"skipWhy"`
+			OK      *bool  `json:"ok"`
+		}
+		if json.Unmarshal([]byte(line), &row) == nil && row.Event == "skip" && row.SkipWhy == "not-blocked" {
+			sawSkip = true
+			if row.OK == nil || *row.OK {
+				t.Fatal("skip line must carry ok=false")
+			}
+		}
+	}
+	if !sawSkip {
+		t.Fatal("ledger missing the not-blocked skip line")
+	}
+}
+
+// Non-interactive discard without --yes is 121 and touches nothing (the
+// family confirm, applied at birth this time).
+func TestWiringDiscardNonTTYNeedsYes(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "d")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdDiscard([]string{repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != applycmd.ExitNotTTY {
+		t.Fatalf("non-TTY without --yes: %d (want 121)", code)
+	}
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatal("dir touched by a 121 refusal")
+	}
+	if code := cmdDiscard([]string{"--no-quarantine", "--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != applycmd.ExitNotTTY {
+		t.Fatalf("--no-quarantine non-TTY: %d (want 121)", code)
+	}
+}
+
+// A non-git scratch-idle dir (SAFE) also refuses: discard never widens.
+func TestWiringDiscardRefusesScratch(t *testing.T) {
+	root, _ := wireFixture(t)
+	target := filepath.Join(root, "scratch-old")
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", target}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("scratch discard: %d (want 2)", code)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("SAFE scratch dir was deleted by discard")
+	}
+}
+
+// quarantine list/prune through the command layer, including the
+// recovery-ends-here copy and the young-session survival.
+func TestWiringQuarantineLifecycle(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	old := quarantine.SessionDir(stateDir, `C:\x\old`, time.Now().Add(-48*time.Hour))
+	young := quarantine.SessionDir(stateDir, `C:\x\young`, time.Now())
+	for _, s := range []string{old, young} {
+		if err := os.MkdirAll(s, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.WriteFile(filepath.Join(old, "manifest.json"), []byte(`{"mode":"bundle","source":"C:\\x\\old"}`), 0o644)
+	os.WriteFile(filepath.Join(young, "manifest.json"), []byte(`{"mode":"plain-copy","source":"C:\\x\\young"}`), 0o644)
+	back := time.Now().Add(-72 * time.Hour)
+	os.Chtimes(old, back, back)
+
+	var out bytes.Buffer
+	if code := cmdQuarantine([]string{"list"}, &out, os.Stderr); code != ExitOK {
+		t.Fatalf("list: %d", code)
+	}
+	if !strings.Contains(out.String(), "old") || !strings.Contains(out.String(), "mode=bundle") {
+		t.Fatalf("list output: %q", out.String())
+	}
+
+	out.Reset()
+	if code := cmdQuarantine([]string{"prune", "--older-than", "24h", "--yes"}, &out, os.Stderr); code != ExitOK {
+		t.Fatalf("prune: %d", code)
+	}
+	if !strings.Contains(out.String(), "recovery") || !strings.Contains(out.String(), "pruned 1 session(s)") {
+		t.Fatalf("prune output: %q", out.String())
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("old session survived prune")
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Fatal("young session was pruned")
+	}
+}
+
+// log --since filters both the human rows and the raw JSONL.
+func TestWiringLogSince(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	oldTS := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano)
+	freshTS := time.Now().UTC().Format(time.RFC3339Nano)
+	body := `{"ts":"` + oldTS + `","event":"intent","path":"C:\\old"}` + "\n" +
+		`{"ts":"` + freshTS + `","event":"result","path":"C:\\new","ok":true}` + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "reap.log"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var text, raw bytes.Buffer
+	if code := cmdLog([]string{"--since", "24h"}, &text, os.Stderr); code != ExitOK {
+		t.Fatalf("log text: %d", code)
+	}
+	if strings.Contains(text.String(), "old") || !strings.Contains(text.String(), "new") {
+		t.Fatalf("text --since filter: %q", text.String())
+	}
+	if code := cmdLog([]string{"--json", "--since", "24h"}, &raw, os.Stderr); code != ExitOK {
+		t.Fatalf("log json: %d", code)
+	}
+	jsonLines := strings.Split(strings.TrimSpace(raw.String()), "\n")
+	if len(jsonLines) != 1 || !strings.Contains(jsonLines[0], `"result"`) {
+		t.Fatalf("json --since filter: %q", raw.String())
+	}
+}
+
+// doctor smoke: exit 0, state readout, free lock, and stray healing through
+// the command layer.
+func TestWiringDoctorSmoke(t *testing.T) {
+	root, _ := wireFixture(t)
+	stray := filepath.Join(root, "strayed.reap-probing")
+	if err := os.MkdirAll(stray, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stray, "keep.txt"), []byte("k"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code := cmdDoctor(nil, &out, os.Stderr); code != ExitOK {
+		t.Fatalf("doctor: %d (%s)", code, out.String())
+	}
+	for _, want := range []string{"state dir:", "apply.lock: free", "quarantine:", "reap.log:", "gh:", "jj:", "stray"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("doctor missing %q", want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "strayed", "keep.txt")); err != nil {
+		t.Fatal("stray .reap-probing dir was not healed back")
 	}
 }

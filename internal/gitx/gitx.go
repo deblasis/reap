@@ -601,9 +601,12 @@ func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
 }
 
 // AddAll stages the entire working tree (quarantine capture step 1). The
-// caller restores the index afterwards via RestoreBackup/ResetIndex.
+// caller restores the index afterwards via RestoreBackup/ResetIndex. The
+// .jj marker is excluded: -f force-adds ignored paths too, and .jj holds
+// colocated-repo internals (a /* gitignore) that would bloat every capture
+// of a jj repo with bookkeeping the working tree never owned.
 func (r Runner) AddAll(dir string) error {
-	_, err := r.run(dir, r.GitBudget, "add", "-A", "-f", ".")
+	_, err := r.run(dir, r.GitBudget, "add", "-A", "-f", ".", ":(exclude).jj")
 	return err
 }
 
@@ -677,13 +680,31 @@ func (r Runner) StashRefs(dir string) ([]string, error) {
 	return nonEmpty(out), nil
 }
 
-// BundleCreate writes an incremental bundle over the pinned refs.
-func (r Runner) BundleCreate(dir, dst, baseRef string, refs []string) error {
-	args := []string{"bundle", "create", dst}
-	if baseRef != "" {
-		args = append(args, baseRef+"..")
+// RemoteReachable returns the set of commits reachable from remote-tracking
+// refs (one rev-list). pinTips uses it to skip tips that are fully pushed;
+// on error the caller pins EVERYTHING — the safe direction (a bigger bundle
+// never loses content, an under-filled one does).
+func (r Runner) RemoteReachable(dir string) map[string]bool {
+	out, err := r.run(dir, r.GitBudget, "rev-list", "--remotes")
+	if err != nil {
+		return nil
 	}
-	args = append(args, refs...)
+	m := map[string]bool{}
+	for _, sha := range nonEmpty(out) {
+		m[sha] = true
+	}
+	return m
+}
+
+// BundleCreate writes a delta bundle carrying every commit reachable from
+// refs but not from any remote-tracking ref, with refs as the bundle's ref
+// table (recoverable by name). Argument order matters exactly as in the
+// unpushed decomposition: positive refs FIRST, then "--not --remotes" —
+// --not negates everything after it, so the reverse order would exclude the
+// pins themselves and mint an empty bundle that still verifies.
+func (r Runner) BundleCreate(dir, dst string, refs []string) error {
+	args := append([]string{"bundle", "create", dst}, refs...)
+	args = append(args, "--not", "--remotes")
 	_, err := r.run(dir, r.GitBudget, args...)
 	return err
 }

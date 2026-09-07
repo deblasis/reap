@@ -31,7 +31,6 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	asJSON := fs.Bool("json", false, "emit the machine schema")
 	yes := fs.Bool("yes", false, "confirm non-interactively")
 	noQuarantine := fs.Bool("no-quarantine", false, "skip the snapshot (interactive TTY confirm required; loud logging)")
-	_ = yes
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
@@ -54,6 +53,34 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	if *noQuarantine && !applycmd.IsTerminal(stdin, stdout) {
 		fmt.Fprintln(stderr, "reap discard: --no-quarantine requires an interactive TTY confirm naming what will NOT be captured")
 		return applycmd.ExitNotTTY
+	}
+	// The family confirm: --yes or an interactive TTY, never inferred from
+	// EOF; 121 when neither. Quarantine is the ONLY recovery, so the prompt
+	// says so, and --no-quarantine sessions name what will NOT be captured.
+	if !*yes {
+		if !applycmd.IsTerminal(stdin, stdout) {
+			fmt.Fprintln(stderr, "reap discard deletes permanently (the quarantine bundle is the only recovery); pass --yes to confirm when not interactive")
+			return applycmd.ExitNotTTY
+		}
+		for _, p := range fs.Args() {
+			fmt.Fprintf(stdout, "  discard %s\n", p)
+		}
+		if *noQuarantine {
+			fmt.Fprintln(stdout, "NO quarantine: dirty files, untracked files, stashes and local-only commits will NOT be captured")
+		} else {
+			fmt.Fprintln(stdout, "each dir is snapshotted to a quarantine bundle first (reap quarantine list shows sessions)")
+		}
+		fmt.Fprint(stdout, "Proceed? [y/N] ")
+		var answer string
+		if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
+			fmt.Fprintln(stdout, "\ndeclined")
+			return ExitOK
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(stdout, "declined")
+			return ExitOK
+		}
 	}
 
 	lock, err := applycmd.Lock(stateDir)
@@ -96,7 +123,11 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 
 		if !dirExists(path) {
-			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipVerdictChanged})
+			ok := false
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: "missing", OK: &ok, Quarantine: nil}); rc >= 0 {
+				return rc
+			}
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: "missing"})
 			continue
 		}
 
@@ -114,15 +145,34 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			continue
 		}
 
-		// Quarantine (unless loudly declined).
+		// The rename in-use probe: Reverify's BLOCKED early return (the
+		// match gate) never reaches its own probe, so discard runs it here —
+		// a dir a live process holds open must not be quarantined-then-
+		// deleted either. A stranded probe is a hard abort naming the path.
+		inUse, perr := applycmd.InUseProbe(path)
+		if perr != nil {
+			fmt.Fprintf(stderr, "reap discard: HARD ABORT: probe stranded for %s: %v\n", path, perr)
+			return ExitState
+		}
+		if inUse {
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipInUseProbe})
+			ok := false
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipInUseProbe, OK: &ok, Quarantine: nil}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
+
+		// Quarantine (unless loudly declined), under the configured cap: an
+		// over-cap snapshot refuses the discard with the dir untouched.
 		qPath := ""
 		mode := "no-quarantine"
 		if !*noQuarantine {
 			session := quarantine.SessionDir(stateDir, path, time.Now())
-			var m *quarantine.Manifest
-			m, err = quarantine.Snapshot(session, path, gr, quarantine.Options{Mode: "bundle"})
-			if err != nil {
-				fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, err)
+			capBytes := int64(cfg.Thresholds.QuarantineCapGB * float64(1<<30))
+			m, serr := quarantine.Snapshot(session, path, gr, quarantine.Options{Mode: "bundle", CapBytes: capBytes})
+			if serr != nil {
+				fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, serr)
 				summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: "quarantine-failed"})
 				ok := false
 				if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: "quarantine-failed", OK: &ok, Quarantine: nil}); rc >= 0 {
@@ -235,21 +285,56 @@ func cmdLog(args []string, stdout, stderr io.Writer) int {
 			if line == "" {
 				continue
 			}
-			if !*asJSON {
-				if cutoff.After(time.Time{}) {
-					var probe struct {
-						TS string `json:"ts"`
-					}
-					if json.Unmarshal([]byte(line), &probe) == nil {
-						if ts, perr := time.Parse(time.RFC3339Nano, probe.TS); perr == nil && ts.Before(cutoff) {
-							continue
-						}
+			// --since filters BOTH shapes: raw JSONL is a machine view of
+			// the same ledger, not an excuse to ignore the window.
+			if cutoff.After(time.Time{}) {
+				var probe struct {
+					TS string `json:"ts"`
+				}
+				if json.Unmarshal([]byte(line), &probe) == nil {
+					if ts, perr := time.Parse(time.RFC3339Nano, probe.TS); perr == nil && ts.Before(cutoff) {
+						continue
 					}
 				}
-				fmt.Fprintln(stdout, line)
-			} else {
-				fmt.Fprintln(stdout, line)
 			}
+			if *asJSON {
+				fmt.Fprintln(stdout, line)
+				continue
+			}
+			// Text mode renders human rows; --json is the raw JSONL.
+			var row struct {
+				TS      string `json:"ts"`
+				Event   string `json:"event"`
+				Path    string `json:"path"`
+				OK      *bool  `json:"ok"`
+				SkipWhy string `json:"skipWhy"`
+				Deleted int    `json:"deleted"`
+				Skipped int    `json:"skipped"`
+			}
+			if json.Unmarshal([]byte(line), &row) != nil {
+				fmt.Fprintln(stdout, line)
+				continue
+			}
+			ts := row.TS
+			if len(ts) > 19 {
+				ts = ts[:19]
+			}
+			status := ""
+			switch row.Event {
+			case "result":
+				if row.OK != nil && *row.OK {
+					status = "deleted"
+				} else {
+					status = "FAILED"
+				}
+			case "skip":
+				status = "skip:" + row.SkipWhy
+			case "intent":
+				status = "begin"
+			case "envelope":
+				status = fmt.Sprintf("run end: deleted=%d skipped=%d", row.Deleted, row.Skipped)
+			}
+			fmt.Fprintf(stdout, "%s  %-8s  %-28s  %s\n", ts, row.Event, status, row.Path)
 		}
 	}
 	return ExitOK
