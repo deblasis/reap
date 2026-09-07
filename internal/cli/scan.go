@@ -359,25 +359,40 @@ type holdEntry struct {
 }
 
 func loadHolds(stateDir string) (map[string]bool, error) {
+	active, _, err := loadHoldsWithExpired(stateDir)
+	return active, err
+}
+
+// loadHoldsWithExpired also returns recently-EXPIRED holds (within 7 days)
+// keyed by canonical path with their expiry time: the spec's
+// expiry-at-consequence map. A pinned dir's verdict flips KEEP->other the
+// moment the pin lapses; without this map that flip is silent.
+func loadHoldsWithExpired(stateDir string) (map[string]bool, map[string]time.Time, error) {
 	raw, err := os.ReadFile(filepath.Join(stateDir, "holds.json"))
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read holds.json: %w", err)
+		return nil, nil, fmt.Errorf("read holds.json: %w", err)
 	}
 	var hf holdsFile
 	if err := json.Unmarshal(raw, &hf); err != nil {
-		return nil, fmt.Errorf("holds.json is corrupt (refusing to silently drop holds): %w", err)
+		return nil, nil, fmt.Errorf("holds.json is corrupt (refusing to silently drop holds): %w", err)
 	}
 	now := time.Now()
-	out := map[string]bool{}
+	active := map[string]bool{}
+	expired := map[string]time.Time{}
 	for p, h := range hf {
+		cp := config.Canonical(p)
 		if h.Expires.IsZero() || h.Expires.After(now) {
-			out[config.Canonical(p)] = true
+			active[cp] = true
+			continue
+		}
+		if now.Sub(h.Expires) < 7*24*time.Hour {
+			expired[cp] = h.Expires
 		}
 	}
-	return out, nil
+	return active, expired, nil
 }
 
 func anyHoldUnder(holds map[string]bool, path string) bool {

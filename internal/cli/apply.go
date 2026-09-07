@@ -27,13 +27,16 @@ import (
 // The spec's invariant — plan/apply always run full-strength over the set,
 // same flags as scan — falls out of sharing one implementation.
 type scanCore struct {
-	cfg                                        config.Config
-	roots                                      []string
-	noGH, noJJ                                 bool
-	prHeads                                    *ghx.PRHeads
-	useGit, useJJ                              bool
-	protectExpanded                            []string
-	holds                                      map[string]bool
+	cfg             config.Config
+	roots           []string
+	noGH, noJJ      bool
+	prHeads         *ghx.PRHeads
+	useGit, useJJ   bool
+	protectExpanded []string
+	holds           map[string]bool
+	// expiredHolds: canonical path -> expiry, for pins that lapsed within
+	// the last 7 days (the spec's expiry-at-consequence marking).
+	expiredHolds                               map[string]time.Time
 	remoteStale                                time.Duration
 	gitBudget, jjBudget, ghBudget, fetchBudget time.Duration
 }
@@ -71,14 +74,26 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 		fmt.Fprintf(stderr, "reap: %v\n", err)
 		return nil, ExitState
 	}
-	holds, err := loadHolds(stateDir)
+	holds, expired, err := loadHoldsWithExpired(stateDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap: %v\n", err)
 		return nil, ExitState
 	}
 	core.holds = holds
+	core.expiredHolds = expired
 	core.remoteStale = time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 	return core, ExitOK
+}
+
+// ExpiredHoldDetail renders the expiry-at-consequence line for a path
+// ("" when the path has no recently-lapsed pin): plan's distinct section.
+func (c *scanCore) ExpiredHoldDetail(path string) string {
+	cp := config.Canonical(path)
+	exp, ok := c.expiredHolds[cp]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("hold expired %s (%dd ago)", exp.Format("2006-01-02"), int(time.Since(exp).Hours()/24))
 }
 
 func hasFlag(args []string, name string) bool {
@@ -100,6 +115,9 @@ type candidate struct {
 	// the registration, the FRESH enumeration is empty, so the unlock must
 	// compare against what the plan saw (round 3's end-to-end proof).
 	planChildren []string
+	// expiredHold: the expiry-at-consequence detail when a pin on this dir
+	// lapsed within 7 days ("" otherwise).
+	expiredHold string
 }
 
 // run walks the roots and verdicts every candidate.
@@ -116,7 +134,7 @@ func (c *scanCore) run(now time.Time) ([]candidate, []string) {
 			continue // KEEP rails never enter plans
 		}
 		e, v, cls, pc := c.build(info, now)
-		out = append(out, candidate{entry: e, vd: v, cls: cls, planChildren: pc})
+		out = append(out, candidate{entry: e, vd: v, cls: cls, planChildren: pc, expiredHold: c.ExpiredHoldDetail(info.Path)})
 	}
 	return out, unreadableRoots
 }
@@ -298,7 +316,7 @@ func validateCodes(include, exclude []string) error {
 // renderPlanText is THE plan renderer: cmdPlan and cmdApply --dry-run both
 // call it, byte-identically (the spec's tie; round 1 proved two renderers
 // drift within one review cycle).
-func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, widened []string) {
+func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, widened []string, expired []expiredHoldRef) {
 	var total int64
 	for _, p := range plan {
 		total += p.SizeBytes
@@ -314,7 +332,24 @@ func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.Exc
 	if len(below) > 0 {
 		fmt.Fprintf(w, "%d below --min-gb floor (excluded, not listed)\n", len(below))
 	}
+	for _, ex := range expired {
+		fmt.Fprintf(w, "expired hold: %s  %s\n", ex.path, ex.detail)
+	}
 	fmt.Fprintln(w, "dry-run: nothing will be deleted")
+}
+
+// expiredHoldRef is one row of plan's distinct expired-hold section.
+type expiredHoldRef struct{ path, detail string }
+
+// collectExpired gathers the expiry-at-consequence rows for plan's section.
+func collectExpired(cands []candidate) []expiredHoldRef {
+	var out []expiredHoldRef
+	for _, c := range cands {
+		if c.expiredHold != "" {
+			out = append(out, expiredHoldRef{path: c.entry.Path, detail: c.expiredHold})
+		}
+	}
+	return out
 }
 
 func dedupeStrings(in []string) []string {
@@ -383,7 +418,7 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	if *asJSON {
 		return renderPlanJSON(stdout, now, plan, below)
 	}
-	renderPlanText(stdout, plan, below, planWidenedCodes(plan))
+	renderPlanText(stdout, plan, below, planWidenedCodes(plan), collectExpired(cands))
 	return ExitOK
 }
 
@@ -445,7 +480,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if *asJSON {
 			return renderPlanJSON(stdout, now, plan, below)
 		}
-		renderPlanText(stdout, plan, below, planWidenedCodes(plan))
+		renderPlanText(stdout, plan, below, planWidenedCodes(plan), collectExpired(cands))
 		return ExitOK
 	}
 
