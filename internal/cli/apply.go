@@ -523,7 +523,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
-			if strings.Contains(err.Error(), "deregistration failed") {
+			if applycmd.IsDeregister(err) {
 				// Spec: jj forget failure routes MANUAL — a skip, not a run
 				// abort (round-3: this replace silently no-oped last fold).
 				summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipDeregister})

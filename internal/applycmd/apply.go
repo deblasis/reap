@@ -270,15 +270,22 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	// FETCH_HEAD mtime capture: the apply-time fetch freshens it, and the
 	// walk reads .git internals as activity — without the restore, every
 	// repo that SURVIVES an apply (skip/abort) verdicts ACTIVE for 48h and
-	// vanishes from subsequent plans (round 2's feedback-loop find).
-	fhPath := filepath.Join(path, ".git", "FETCH_HEAD")
-	var fhMtime time.Time
-	if fi, err := os.Stat(fhPath); err == nil {
-		fhMtime = fi.ModTime()
+	// vanishes from subsequent plans (round 2's feedback-loop find). The
+	// marker is resolved through the OWN gitdir AND the common dir (a linked
+	// worktree's .git is a FILE; which of the two the fetch writes has
+	// varied across git versions, so both are captured and restored).
+	var fhPaths []string
+	var fhMtimes []time.Time
+	for _, g := range gitDirsForFetchHead(path) {
+		fp := filepath.Join(g, "FETCH_HEAD")
+		if fi, err := os.Stat(fp); err == nil {
+			fhPaths = append(fhPaths, fp)
+			fhMtimes = append(fhMtimes, fi.ModTime())
+		}
 	}
 	restoreFetchHead := func() {
-		if !fhMtime.IsZero() {
-			_ = os.Chtimes(fhPath, fhMtime, fhMtime)
+		for i, fp := range fhPaths {
+			_ = os.Chtimes(fp, fhMtimes[i], fhMtimes[i])
 		}
 	}
 
@@ -383,6 +390,57 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 		return ReverifyResult{SkipWhy: "PROBE-STRANDED:" + err.Error(), Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
 	}
 	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
+}
+
+// gitDirsForFetchHead lists the per-worktree gitdir and the common git dir
+// for path (root repos: the same dir twice, deduped by the caller's stat
+// loop; linked worktrees: both the private gitdir and the parent's .git).
+func gitDirsForFetchHead(path string) []string {
+	var out []string
+	if g, ok := gitDirForPath(path); ok {
+		out = append(out, g)
+	}
+	if c, ok := gitCommonDirFor(path); ok {
+		out = append(out, c)
+	}
+	return out
+}
+
+// gitDirForPath resolves the candidate's own git dir (.git dir or the
+// linked .git file's gitdir pointer).
+func gitDirForPath(path string) (string, bool) {
+	gitPath := filepath.Join(path, ".git")
+	if fi, err := os.Stat(gitPath); err == nil && fi.IsDir() {
+		return gitPath, true
+	}
+	raw, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", false
+	}
+	s := strings.TrimSpace(string(raw))
+	s = strings.TrimPrefix(s, "gitdir:")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	s = filepath.FromSlash(s)
+	if !filepath.IsAbs(s) {
+		s = filepath.Join(path, s)
+	}
+	return s, true
+}
+
+// gitCommonDirFor resolves the common git dir (the parent's .git for
+// linked worktrees; identity for root repos).
+func gitCommonDirFor(path string) (string, bool) {
+	s, ok := gitDirForPath(path)
+	if !ok {
+		return "", false
+	}
+	if i := strings.Index(filepath.ToSlash(s), "/worktrees/"); i >= 0 {
+		return filepath.FromSlash(filepath.ToSlash(s)[:i]), true
+	}
+	return s, true
 }
 
 func isIgnoranceCodeLocal(code string) bool {
@@ -496,6 +554,12 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 }
 
 var errDeregister = errors.New("deregistration failed")
+
+// IsDeregister reports whether err is (wraps) the deregistration sentinel:
+// the caller routes it to a skip, never a run abort. An exported helper
+// rather than error-string matching (round 4: rewording the string would
+// silently revert the routing).
+func IsDeregister(err error) bool { return errors.Is(err, errDeregister) }
 
 // workspaceName resolves the jj workspace name from the parent's registry
 // (the dir base need not equal the registered name — the round-1 find).
