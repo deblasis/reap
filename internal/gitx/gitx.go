@@ -561,3 +561,173 @@ func Available() bool {
 	_, err := exec.LookPath("git")
 	return err == nil
 }
+
+// StatusSummary is the porcelain digest the quarantine manifest consumes.
+type StatusSummary struct {
+	Dirty          int
+	Untracked      int
+	UntrackedBytes int64
+	Ignored        int
+	IgnoredBytes   int64
+}
+
+// StatusPorcelain returns the three-way split with untracked/ignored bytes.
+func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
+	var s StatusSummary
+	out, err := r.run(dir, r.GitBudget, "status", "--porcelain", "--ignored")
+	if err != nil {
+		return s, err
+	}
+	for _, line := range nonEmpty(out) {
+		if len(line) < 4 {
+			continue
+		}
+		xy, p := line[:2], trimQuotes(line[3:])
+		switch {
+		case xy == "!!":
+			if p == ".jj" || p == ".jj/" {
+				continue
+			}
+			s.Ignored++
+			s.IgnoredBytes += entrySize(dir, p, time.Now())
+		case strings.Contains(xy, "?"):
+			s.Untracked++
+			s.UntrackedBytes += entrySize(dir, p, time.Now())
+		default:
+			s.Dirty++
+		}
+	}
+	return s, nil
+}
+
+// AddAll stages the entire working tree (quarantine capture step 1). The
+// caller restores the index afterwards via RestoreBackup/ResetIndex.
+func (r Runner) AddAll(dir string) error {
+	_, err := r.run(dir, r.GitBudget, "add", "-A", "-f", ".")
+	return err
+}
+
+// ResetIndex restores the index to HEAD after capture plumbing.
+func (r Runner) ResetIndex(dir string) error {
+	_, err := r.run(dir, r.GitBudget, "reset", "--mixed", "--quiet")
+	return err
+}
+
+// WriteTree writes the staged index as a tree, returning its SHA.
+func (r Runner) WriteTree(dir string) (string, error) {
+	out, err := r.run(dir, r.GitBudget, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(firstLine(out)), nil
+}
+
+// CommitTree creates a commit object for tree (parent = HEAD when one
+// exists), returning its SHA. Plumbing: no working-tree contact.
+func (r Runner) CommitTree(dir, tree string) (string, error) {
+	args := []string{"commit-tree", tree, "-m", "reap quarantine snapshot"}
+	if head, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err == nil && strings.TrimSpace(head) != "" {
+		args = append(args, "-p", strings.TrimSpace(head))
+	}
+	out, err := r.run(dir, r.GitBudget, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(firstLine(out)), nil
+}
+
+// UpdateRef points ref at sha.
+func (r Runner) UpdateRef(dir, ref, sha string) error {
+	_, err := r.run(dir, r.GitBudget, "update-ref", ref, sha)
+	return err
+}
+
+// LocalOnlyTip is one branch/tag tip not on any remote.
+type LocalOnlyTip struct {
+	Ref string
+	SHA string
+}
+
+// LocalOnlyTips enumerates local branch and tag tips (the caller subtracts
+// remote-reachable ones before pinning).
+func (r Runner) LocalOnlyTips(dir string) ([]LocalOnlyTip, error) {
+	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname) %(objectname)",
+		"refs/heads", "refs/tags")
+	if err != nil {
+		return nil, err
+	}
+	var all []LocalOnlyTip
+	for _, line := range nonEmpty(out) {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		all = append(all, LocalOnlyTip{Ref: fields[0], SHA: fields[1]})
+	}
+	return all, nil
+}
+
+// StashRefs returns every stash generation's SHA (oldest first; reflog-only
+// objects a bare bundle would not carry).
+func (r Runner) StashRefs(dir string) ([]string, error) {
+	out, err := r.run(dir, r.GitBudget, "rev-list", "-g", "refs/stash")
+	if err != nil {
+		return nil, err
+	}
+	return nonEmpty(out), nil
+}
+
+// BundleCreate writes an incremental bundle over the pinned refs.
+func (r Runner) BundleCreate(dir, dst, baseRef string, refs []string) error {
+	args := []string{"bundle", "create", dst}
+	if baseRef != "" {
+		args = append(args, baseRef+"..")
+	}
+	args = append(args, refs...)
+	_, err := r.run(dir, r.GitBudget, args...)
+	return err
+}
+
+// BundleVerify checks a bundle's integrity.
+func (r Runner) BundleVerify(dir, bundle string) error {
+	_, err := r.run(dir, r.GitBudget, "bundle", "verify", bundle)
+	return err
+}
+
+// SaveIndex copies the index aside so capture can restore the operator's
+// staged state exactly; empty return = nothing to save.
+func (r Runner) SaveIndex(dir string) (string, error) {
+	g, ok := gitDirFor(dir)
+	if !ok {
+		return "", fmt.Errorf("no git dir for %s", dir)
+	}
+	idx := filepath.Join(g, "index")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		return "", nil
+	}
+	backup := idx + ".reap-backup"
+	if err := os.WriteFile(backup, data, 0o644); err != nil {
+		return "", err
+	}
+	return backup, nil
+}
+
+// RestoreBackup restores a SaveIndex backup and removes it.
+func (r Runner) RestoreBackup(dir, backup string) error {
+	if backup == "" {
+		return nil
+	}
+	g, ok := gitDirFor(dir)
+	if !ok {
+		return fmt.Errorf("no git dir for %s", dir)
+	}
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(g, "index"), data, 0o644); err != nil {
+		return err
+	}
+	return os.Remove(backup)
+}

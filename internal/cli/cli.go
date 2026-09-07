@@ -38,6 +38,14 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return cmdPlan(rest, stdout, stderr)
 	case "apply":
 		return cmdApply(rest, stdout, stderr, os.Stdin)
+	case "discard":
+		return cmdDiscard(rest, stdout, stderr, os.Stdin)
+	case "log":
+		return cmdLog(rest, stdout, stderr)
+	case "quarantine":
+		return cmdQuarantine(rest, stdout, stderr)
+	case "doctor":
+		return cmdDoctor(rest, stdout, stderr)
 	case "hold":
 		return cmdHold(rest, stdout, stderr)
 	case "unhold":
@@ -69,6 +77,9 @@ commands:
   scan       walk configured roots and verdict every directory
   plan       resolve the deletion set (SAFE default; --include widens)
   apply      re-verify and delete the plan (write-ahead audit; --yes or TTY)
+  discard    quarantine-then-delete BLOCKED dirs (reap discard PATH...)
+  log        read the deletion ledger (reap log [--since DUR])
+  quarantine list / prune snapshot sessions
   hold       pin a path against deletion (reap hold PATH [--for DUR])
   unhold     release a pin
   holds      list pins with days remaining
@@ -80,9 +91,12 @@ reap plan  [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
 reap apply [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
            [--include CODE]... [--exclude CODE]... [--override-manual PATH]...
            [--yes] [--dry-run] [--json]
+reap discard PATH... [--yes] [--no-quarantine] [--json]
+reap quarantine [list | prune [--older-than DUR] [--yes]]
+reap log [--since DUR] [--json]
 
-discard, activity, log, quarantine, doctor land with their milestones (see
-the design spec's normative grammar).
+activity and doctor land with their milestones (see the design spec's
+normative grammar).
 `)
 }
 
