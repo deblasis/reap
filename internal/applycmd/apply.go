@@ -68,6 +68,8 @@ type PlanEntry struct {
 	Kind         string   `json:"kind"`
 	ParentRepo   string   `json:"parentRepoPath,omitempty"`
 	Orphaned     bool     `json:"orphanedCarveOut,omitempty"`
+	OrphanCounts string   `json:"-"` // knowable counts for the hardened confirm
+	Residue      string   `json:"residue,omitempty"` // nested/reflog overlap note
 	PlanChildren []string `json:"-"` // scan-time live children; unlock-only
 }
 
@@ -585,12 +587,6 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 }
 
 var errDeregister = errors.New("deregistration failed")
-
-// IsDeregister reports whether err is (wraps) the deregistration sentinel:
-// the caller routes it to a skip, never a run abort. An exported helper
-// rather than error-string matching (round 4: rewording the string would
-// silently revert the routing).
-func IsDeregister(err error) bool { return errors.Is(err, errDeregister) }
 
 // workspaceName resolves the jj workspace name from the parent's registry
 // (the dir base need not equal the registered name — the round-1 find).

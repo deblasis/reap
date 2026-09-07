@@ -747,8 +747,18 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // unpushed-HEAD shape, not unreadable state, and quarantine must capture it
 // fine (spec fixture list; the round-3 regression that broke exactly this).
 func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
-	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil || strings.TrimSpace(out) == "" {
+	// The unborn probe must NOT swallow a timeout or a corrupt repo (the
+	// round-4 completeness hole Facts guards at line ~117): quiet-exit-1 +
+	// empty output is the unborn shape; a timeout PROPAGATES (pinning
+	// nothing while claiming completeness is the forbidden lie), and a
+	// corrupt .git propagates too.
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil {
+		if strings.Contains(err.Error(), "timeout") {
+			return nil, err
+		}
 		return nil, nil // unborn HEAD: no reflog to pin
+	} else if strings.TrimSpace(out) == "" {
+		return nil, nil
 	}
 	out, err := r.run(dir, r.GitBudget, "reflog", "show", "--format=%H", "HEAD")
 	if err != nil {

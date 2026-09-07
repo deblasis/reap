@@ -15,6 +15,7 @@ import (
 	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
@@ -274,6 +275,14 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			SizeBytes: c.entry.SizeBytes, Widened: widened, Kind: string(c.cls.Kind),
 			ParentRepo: c.cls.ParentRepo, Orphaned: c.vd.OrphanedCarveOut,
 		}
+		if c.vd.OrphanedCarveOut && c.vd.BlockedClassFact != "" {
+			pe.OrphanCounts = c.vd.BlockedClassFact
+		}
+		if widened && c.vd.BlockedClassFact != "" {
+			// Shadowed BLOCKED facts ride the plan row (spec: residue noted
+			// in the plan row) — the deletion is accepted WITH this overlap.
+			pe.Residue = c.vd.BlockedClassFact
+		}
 		if c.vd.Code == "parent-of-live-children" {
 			for _, ch := range c.planChildren {
 				pe.PlanChildren = append(pe.PlanChildren, ch)
@@ -328,13 +337,46 @@ func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.Exc
 	for _, p := range plan {
 		total += p.SizeBytes
 	}
-	fmt.Fprintf(w, "reap will permanently delete %d directories, %.1f GB logical (not recycled)", len(plan), float64(total)/(1<<30))
+	// The plan-time hardlink pass (spec: plan/apply/discard): logical vs
+	// expected reclaim, with the skipped-pass caveat.
+	planReclaim := dedupe.NewCounter(50000)
+	for _, p := range plan {
+		planReclaim.Add(p.Path)
+	}
+	expected := planReclaim.Expected
+	caveat := ""
+	if planReclaim.Over() {
+		expected = total
+		caveat = "; hardlink pass skipped, logical only"
+	}
+	fmt.Fprintf(w, "reap will permanently delete %d directories, logical %.1f GB, expected reclaim ~%.1f GB (not recycled%s)", len(plan), float64(total)/(1<<30), float64(expected)/(1<<30), caveat)
 	if len(widened) > 0 {
 		fmt.Fprintf(w, "; %d widened via %s", len(widened), strings.Join(dedupeStrings(widened), ","))
 	}
 	fmt.Fprintln(w)
+	var orphaned []applycmd.PlanEntry
 	for _, p := range plan {
-		fmt.Fprintf(w, "%8.1f GB  %s  [%s]\n", float64(p.SizeBytes)/(1<<30), p.Path, p.Code)
+		if p.Orphaned {
+			orphaned = append(orphaned, p)
+			continue
+		}
+		row := fmt.Sprintf("%8.1f GB  %s  [%s]", float64(p.SizeBytes)/(1<<30), p.Path, p.Code)
+		if p.Residue != "" {
+			row += "  (residue: " + p.Residue + ")"
+		}
+		fmt.Fprintln(w, row)
+	}
+	// The carve-out rows render as their own OVERRIDDEN-ORPHANED section
+	// (spec: a distinct section, never mixed into the ordinary rows).
+	if len(orphaned) > 0 {
+		fmt.Fprintln(w, "OVERRIDDEN-ORPHANED (TTY-only hardened confirm; capped plain-copy quarantine first):")
+		for _, p := range orphaned {
+			counts := "counts unknowable, parent gone"
+			if p.OrphanCounts != "" {
+				counts = p.OrphanCounts
+			}
+			fmt.Fprintf(w, "%8.1f GB  %s  [%s]  (%s)\n", float64(p.SizeBytes)/(1<<30), p.Path, p.Code, counts)
+		}
 	}
 	if len(below) > 0 {
 		fmt.Fprintf(w, "%d below --min-gb floor (excluded, not listed)\n", len(below))
@@ -477,12 +519,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if errors.As(err, &co) {
 			if !applycmd.IsTerminal(stdin, stdout) {
 				// Agents are barred from the carve-out: the hardened
-				// confirm is TTY-only, --yes does not unlock it.
+				// confirm is TTY-only, --yes does not unlock it, and the
+				// non-TTY band is 121 regardless of --yes (spec: 'non-TTY
+				// (agents) exits 121').
 				fmt.Fprintf(stderr, "reap apply: %v\n", co)
-				if *yes {
-					return applycmd.ExitNotTTY
-				}
-				return ExitUsage
+				return applycmd.ExitNotTTY
 			}
 			// A live TTY: re-resolve WITH the carve-out; the hardened
 			// confirm (below, after the plan confirm) gates the deletion.
@@ -526,13 +567,25 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ccode
 	}
 	// The carve-out's own hardened confirm: a second, explicit gate that
-	// --yes never satisfies, naming each orphan and the capped plain-copy
-	// quarantine taken before its deletion.
+	// --yes never satisfies, naming each orphan with KNOWABLE counts
+	// (parent present but broken) vs unknowable ones (parent gone), the
+	// stale gitdir where it resolves, and the capped plain-copy quarantine
+	// taken before its deletion.
 	if carveOutActive {
 		for _, p := range plan {
-			if p.Orphaned {
-				fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB) — parent gone, counts unverifiable; a capped plain-copy quarantine is taken first\n", p.Path, float64(p.SizeBytes)/(1<<30))
+			if !p.Orphaned {
+				continue
 			}
+			counts := "counts unknowable, parent gone"
+			if p.OrphanCounts != "" {
+				counts = p.OrphanCounts + " (parent present but broken)"
+			}
+			gitdir := ""
+			if p.ParentRepo != "" {
+				gitdir = fmt.Sprintf("; stale gitdir: %s", p.ParentRepo)
+			}
+			fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB) — %s%s; a capped plain-copy quarantine is taken first\n",
+				p.Path, float64(p.SizeBytes)/(1<<30), counts, gitdir)
 		}
 		fmt.Fprint(stdout, "carve-out deletion (recovery = the plain copy only). Type y to confirm: ")
 		var answer string
@@ -600,14 +653,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	deletedInRun := map[string]bool{}
 	carveOutFailed := false // any 125-class carve-out quarantine failure
+	applyReclaim := dedupe.NewCounter(50000)
 	for _, p := range ordered {
-		intent := auditlog.Line{
-			Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
-			Verdict: p.Verdict, ReasonCode: p.Code, Quarantine: nil,
-		}
-		if rc := appendOrAbort(intent); rc >= 0 {
-			return rc
-		}
 		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun, p.PlanChildren)
 		if rv.HardAbort != "" {
 			fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.HardAbort)
@@ -622,6 +669,31 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				return rc
 			}
 			continue
+		}
+		// The intent line lands HERE: after re-verify (so it carries the
+		// fresh residue and, for carve-out rows, the hardened-confirm
+		// record the spec pins) but BEFORE any mutation — the write-ahead
+		// contract is intent-before-DELETION, and the skip lines above
+		// already cover the refusals.
+		intent := auditlog.Line{
+			Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
+			Verdict: p.Verdict, ReasonCode: p.Code, Quarantine: nil,
+		}
+		if rv.Residue != "" {
+			intent.Residue = rv.Residue
+		}
+		if len(rv.Nested) > 0 {
+			intent.Residue = strings.Join(nonEmptyNotes(intent.Residue, "nested: "+strings.Join(rv.Nested, ", ")), "; ")
+		}
+		if p.Orphaned {
+			counts := p.OrphanCounts
+			if counts == "" {
+				counts = "counts unknowable, parent gone"
+			}
+			intent.Residue = strings.Join(nonEmptyNotes(intent.Residue, "hardened confirm shown (counts: "+counts+")"), "; ")
+		}
+		if rc := appendOrAbort(intent); rc >= 0 {
+			return rc
 		}
 		// The carve-out rows: a capped plain-copy quarantine BEFORE the
 		// deletion (the orphan has no git backend to bundle; the plain
@@ -649,9 +721,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				carveMode = "plain-copy"
 			case errors.As(qerr, &tooLarge):
 				// The TTY-only over-cap consent (the carve-out is TTY-gated
-				// by construction; --yes never reached this path).
-				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs ~%d MB, cap %d MB): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
-					tooLarge.Need>>20, tooLarge.Cap>>20)
+				// by construction; --yes never reached this path). A decline
+				// is a SKIP: visible in the summary and the exit-2 band,
+				// never a silent machine-invisible non-deletion.
+				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs %.1f GB, cap %.1f GB): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
+					float64(tooLarge.Need)/(1<<30), float64(tooLarge.Cap)/(1<<30))
 				var answer string
 				if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil || strings.ToLower(strings.TrimSpace(answer)) != "y" {
 					fmt.Fprintln(stdout, "declined")
@@ -661,6 +735,9 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 						Residue: "carve-out declined at the over-cap confirm"}); rc >= 0 {
 						return rc
 					}
+					summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
+						Path: p.Path, Why: applycmd.SkipVerdictChanged, Note: "declined at the over-cap confirm"})
+					summary.SkippedBytes += p.SizeBytes
 					continue
 				}
 				carveMode = "plain-copy-skipped-overcap"
@@ -676,6 +753,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				continue
 			}
 		}
+		// The dedupe pass walks each path now, before the deletion.
+		applyReclaim.Add(p.Path)
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
 			// Deregistration failure is a deletion failure (spec's exit
@@ -737,9 +816,18 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	if freeAfter > freeBefore {
 		summary.FreeGain = freeAfter - freeBefore // saturating: underflow observed live in round 1
 	}
+	// The deletion-set hardlink pass (spec: at plan/apply/discard time),
+	// accumulated as each path is about to be deleted — one identity map
+	// across the run, logical vs expected-reclaim both surfaced.
 	if !*asJSON {
-		fmt.Fprintf(stdout, "deleted %d dirs (%.1f GB), excluded %d (%.1f GB below floor), skipped %d (%.1f GB): %s\n",
-			len(summary.Deleted), float64(summary.DeletedBytes)/(1<<30),
+		expected := applyReclaim.Expected
+		caveat := ""
+		if applyReclaim.Over() {
+			expected = summary.DeletedBytes
+			caveat = " (logical; hardlink pass skipped)"
+		}
+		fmt.Fprintf(stdout, "deleted %d dirs (logical %.1f GB, expected reclaim ~%.1f GB%s), excluded %d (%.1f GB below floor), skipped %d (%.1f GB): %s\n",
+			len(summary.Deleted), float64(summary.DeletedBytes)/(1<<30), float64(expected)/(1<<30), caveat,
 			len(below), float64(sumExcluded(below))/(1<<30),
 			len(summary.Skipped), float64(summary.SkippedBytes)/(1<<30), summarizeSkips(summary.Skipped))
 	} else {
@@ -757,6 +845,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return applycmd.ExitWithSkips
 	}
 	return applycmd.ExitOK
+}
+
+// nonEmptyNotes joins present notes, skipping empties.
+func nonEmptyNotes(notes ...string) []string {
+	var out []string
+	for _, n := range notes {
+		if n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func sumExcluded(below []applycmd.ExcludedRef) int64 {

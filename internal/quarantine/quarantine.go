@@ -53,6 +53,7 @@ type Manifest struct {
 	BaseBases     []BaseInfo `json:"baseBases,omitempty"` // per-branch-union bases (branch -> base)
 	SelfContained bool       `json:"selfContained"`
 	BundleBytes   int64      `json:"bundleBytes,omitempty"`
+	Note          string     `json:"note,omitempty"` // e.g. the plain-copy honesty label
 	Revset        string     `json:"revset,omitempty"` // jj push-state revset (jj captures)
 	CaptureRef    string     `json:"captureRef,omitempty"` // refs/reap/capture-*
 	Classes       Classes    `json:"classes"`
@@ -173,7 +174,12 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 	// MkdirAll): an existing dir of the same name is ANOTHER SESSION —
 	// proceeding would overwrite that dir's only recovery copy. A typed
 	// collision error (round 4): string-matching the prose burned the retry
-	// on unrelated mkdir failures.
+	// on unrelated mkdir failures. The PARENT is ours to create (round 5):
+	// cmdApply's carve-out was unreachable on a fresh install because only
+	// cmdDiscard ever created the quarantine dir.
+	if err := os.MkdirAll(filepath.Dir(sessionDir), 0o755); err != nil {
+		return nil, fmt.Errorf("quarantine dir: %w", err)
+	}
 	if err := os.Mkdir(sessionDir, 0o755); err != nil {
 		if os.IsExist(err) {
 			return nil, &ErrSessionExists{Dir: sessionDir}
@@ -369,6 +375,16 @@ var readIndexBytes = os.ReadFile
 
 func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	preMtime := indexMtime(dir)
+	// Whether an index existed AT ALL: on an unborn HEAD (fresh git init)
+	// there is none, and reap's own reset --mixed CREATES one — a refused
+	// capture must not leave it behind (a fresh .git/index flips the dir
+	// ACTIVE for 48h, the exact feedback loop FETCH_HEAD's restore kills).
+	indexExisted := false
+	if g0, ok := gitDirForPath(dir); ok {
+		if _, serr := os.Stat(filepath.Join(g0, "index")); serr == nil {
+			indexExisted = true
+		}
+	}
 	backup, serr := r.SaveIndex(dir)
 	if serr != nil {
 		return fmt.Errorf("save index: %w (refusing; a reset-based fallback would destroy the operator's staged state)", serr)
@@ -439,8 +455,16 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 			m.Interleaved = true
 		}
 	}
-	if g, ok := gitDirForPath(dir); ok && !preMtime.IsZero() {
-		_ = os.Chtimes(filepath.Join(g, "index"), preMtime, preMtime)
+	if g, ok := gitDirForPath(dir); ok {
+		if preMtime.IsZero() {
+			if !indexExisted {
+				// No index existed before reap ran: remove the one reap's
+				// staging created (unborn-HEAD refusal poisoning).
+				_ = os.Remove(filepath.Join(g, "index"))
+			}
+		} else {
+			_ = os.Chtimes(filepath.Join(g, "index"), preMtime, preMtime)
+		}
 	}
 	return nil
 }
@@ -629,17 +653,30 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 	// Capture-time revalidation: no remote to ask, or base not advertised
 	// (gone OR merely advanced — indistinguishable without a fetch, and
 	// self-contained is correct in both) -> self-contained form.
+	lsOut := (*string)(nil) // one ls-remote per capture, cached
 	baseAdvertised := func(ref, sha string) bool {
+		// Round 5: no remote to ask, or no SHA to check, means the base
+		// CANNOT be confirmed — self-contained, never a delta whose
+		// prerequisites nothing can fetch (the round-4 inversion shipped
+		// exactly that for no-remote repos with a resolvable base).
 		if m.Origin == "" || sha == "" {
-			return m.Origin == "" // no remote at all: self-contained by shape
-		}
-		out, err := r.LSRemote(m.Origin)
-		if err != nil {
-			// Offline at capture time: the base cannot be confirmed —
-			// self-contained, never an unverifiable delta.
 			return false
 		}
-		return strings.Contains(out, sha)
+		// ONE ls-remote per capture, cached: the per-branch tier probes N
+		// bases, and N identical network round-trips at capture time is
+		// waste the round-4 review flagged.
+		if lsOut == nil {
+			out, err := r.LSRemote(m.Origin)
+			if err != nil {
+				// Offline at capture time: the base cannot be confirmed —
+				// self-contained, never an unverifiable delta.
+				empty := ""
+				lsOut = &empty
+				return false
+			}
+			lsOut = &out
+		}
+		return strings.Contains(*lsOut, sha)
 	}
 
 	if up := r.UpstreamRef(dir); up != "" && r.ResolveRef(dir, up) != "" {
@@ -723,7 +760,8 @@ func writeManifest(sessionDir string, m *Manifest) error {
 // it was the one artifact class that was not fsynced); BundleBytes carries
 // the copy's size so callers can decrement their free-space budgets.
 func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
-	m := &Manifest{Created: time.Now(), Source: source, Mode: "plain-copy", SelfContained: true}
+	m := &Manifest{Created: time.Now(), Source: source, Mode: "plain-copy", SelfContained: true,
+		Note: "files only, no git objects"}
 	var total int64
 	var files []Entry
 	var emptyDirs []string
@@ -756,6 +794,12 @@ func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
 		return nil, &ErrTooLarge{Need: total, Cap: cap}
 	}
 	m.Entries, m.EmptyDirs, m.BundleBytes = files, emptyDirs, total
+	// The PARENT is ours to create (round 5: the carve-out's plain copy was
+	// unreachable on a fresh install — the exclusive session Mkdir needs
+	// the quarantine dir to exist and only discard ever created it).
+	if serr := os.MkdirAll(filepath.Dir(sessionDir), 0o755); serr != nil {
+		return nil, fmt.Errorf("quarantine dir: %w", serr)
+	}
 	if serr := os.Mkdir(sessionDir, 0o755); serr != nil {
 		if os.IsExist(serr) {
 			return nil, &ErrSessionExists{Dir: sessionDir}

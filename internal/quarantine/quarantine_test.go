@@ -1,6 +1,7 @@
 package quarantine
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"os"
 	"os/exec"
@@ -671,6 +672,99 @@ func TestSnapshotBaseGoneSelfContained(t *testing.T) {
 	shown := gitRun(t, rec, "show", m.CaptureRef+":f.txt")
 	if !strings.Contains(shown, "DIRTY") {
 		t.Fatalf("self-contained fallback not restorable standalone: %q", shown)
+	}
+}
+
+// The round-4 fresh-install major as a red-first fixture: WritePlainCopy
+// (and Snapshot) create their PARENT quarantine dir — before round 5 the
+// exclusive session Mkdir failed against a missing parent on any state
+// dir that had never seen a discard, making apply's carve-out a de-facto
+// no-op on fresh installs.
+func TestPlainCopyFreshStateDir(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.bin"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := t.TempDir() // NO quarantine subdir exists
+	session := SessionDir(fresh, src, time.Now())
+	m, err := WritePlainCopy(session, src, 1<<20)
+	if err != nil {
+		t.Fatalf("fresh-state plain copy: %v", err)
+	}
+	if m.BundleBytes == 0 {
+		t.Fatal("not priced")
+	}
+	// The bundle path too.
+	repo := filepath.Join(t.TempDir(), "r")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "one")
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	if _, err := Snapshot(SessionDir(fresh, repo, time.Now().Add(time.Second)), repo, gr, Options{Mode: "bundle"}); err != nil {
+		t.Fatalf("fresh-state snapshot: %v", err)
+	}
+}
+
+// The baseAdvertised no-remote inversion (round 4): a repo with a
+// resolvable upstream-tracking ref but NO configured remote must take the
+// SELF-CONTAINED form — the delta's prerequisites would be unfetchable
+// (restore skips the base fetch when Origin is empty).
+func TestSnapshotNoRemoteWithBaseSelfContained(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "one")
+	// Local-tracking upstream: branch.main.remote = "." (no real remote).
+	gitRun(t, repo, "config", "branch.main.remote", ".")
+	gitRun(t, repo, "config", "branch.main.merge", "refs/heads/main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	session := SessionDir(t.TempDir(), repo, time.Now())
+	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !m.SelfContained {
+		t.Fatalf("no-remote repo with a resolvable base must be self-contained: %+v", m)
+	}
+}
+
+// A REFUSED capture on an unborn repo leaves no .git/index behind (the
+// round-4 poison: reset --mixed CREATES one, flipping the dir ACTIVE for
+// 48h — the refusal must leave the dir untouched, literally).
+func TestSnapshotUnbornRefusedNoIndexPoison(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	big := make([]byte, 1<<20)
+	if _, err := crand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	_, err := Snapshot(SessionDir(t.TempDir(), repo, time.Now()), repo, gr, Options{Mode: "bundle", CapBytes: 64 << 10})
+	var tooLarge *ErrTooLarge
+	if err == nil || !errors.As(err, &tooLarge) {
+		t.Fatalf("want over-cap refusal, got %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(repo, ".git", "index")); serr == nil {
+		t.Fatal("refused capture left a .git/index behind (ACTIVE poisoning)")
 	}
 }
 

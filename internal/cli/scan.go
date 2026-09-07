@@ -13,6 +13,7 @@ import (
 
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
@@ -177,6 +178,25 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	rep.UnreadableRoots = unreadableRoots
 	for range unreadableRoots {
 		rep.Totals.Errors++
+	}
+	// reclaimableGB: the hardlink pass over the SAFE set (spec L511-514) —
+	// hardlinked content shared within the deletable set reclaims once.
+	// Null + caveat stands when the pass skips (file bound or unsupported
+	// filesystem).
+	var safePaths []string
+	for _, e := range entries {
+		if e.ReasonCode == "clean-pushed" || e.ReasonCode == "scratch-idle" {
+			safePaths = append(safePaths, e.Path)
+		}
+	}
+	if c := dedupe.NewCounter(50000); len(safePaths) > 0 {
+		for _, p := range safePaths {
+			c.Add(p)
+		}
+		if !c.Over() && c.Expected > 0 {
+			gb := float64(c.Expected) / (1 << 30)
+			rep.Totals.ReclaimableGB = &gb
+		}
 	}
 	if *asJSON {
 		if err := rep.JSON(stdout); err != nil {

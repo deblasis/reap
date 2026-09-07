@@ -369,7 +369,27 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// Free-space preflight: free >= max(cap, measured) * margin. The
 		// capture transiently writes roughly the delta twice (staged blobs,
 		// then the bundle) on the volume this tool exists to keep alive.
-		if !*noQuarantine {
+		// Non-git paths (the only !GitBackend eligible shape is a split jj
+		// workspace) price against the cap alone — StatusPorcelain is a git
+		// probe and would misread them as capture failures.
+		if *noQuarantine {
+			// No quarantine write is coming, but the AUDIT APPEND still
+			// needs its floor (spec: every destructive run preflights).
+			if floor := uint64(cfg.Thresholds.MinFreeMB) << 20; qFree < floor {
+				fmt.Fprintf(stderr, "reap discard: %s: free space %d MB below the min-free-mb floor (%d MB)\n", path, qFree>>20, floor>>20)
+				skip(applycmd.SkipSnapshotOvercap)
+				continue
+			}
+		} else if !cls.GitBackend {
+			need := int64(float64(capBytes) * margin)
+			if uint64(need) > qFree {
+				fmt.Fprintf(stderr, "reap discard: %s: quarantine needs ~%.1f GB, %.1f GB free (the quarantine-cap-gb cap of %.0f GB binds)\n",
+					path, float64(need)/(1<<30), float64(qFree)/(1<<30), cfg.Thresholds.QuarantineCapGB)
+				exitQuarantine = true
+				skip(applycmd.SkipSnapshotOvercap)
+				continue
+			}
+		} else {
 			st, serr := gr.StatusPorcelain(path)
 			if serr != nil {
 				fmt.Fprintf(stderr, "reap discard: %s: %v (dir untouched)\n", path, serr)
@@ -463,10 +483,17 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 			qPath = session
 			qManifest = m
-			if m != nil {
+			if m != nil && m.BundleBytes > 0 {
 				// The preflight window narrows as the run consumes the
 				// volume: later paths check against what is actually left.
-				qFree -= uint64(m.BundleBytes)
+				// Underflow-guarded: external consumers can drop free below
+				// the bundle size mid-run, and a wrapped uint64 passes every
+				// later preflight vacuously.
+				if m.BundleBytes >= int64(qFree) {
+					qFree = 0
+				} else {
+					qFree -= uint64(m.BundleBytes)
+				}
 			}
 		}
 
