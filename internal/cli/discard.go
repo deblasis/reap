@@ -274,10 +274,6 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	reclaim := dedupe.NewCounter(50000)
 	for _, w := range ordered {
 		path, cls := w.path, w.cls
-		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil}
-		if rc := appendOrAbort(intent); rc >= 0 {
-			return rc
-		}
 
 		// Re-verify seconds before deletion, at full strength, WITH the
 		// hold/protect rails joined (round-2 fold: a held dirty dir must
@@ -352,6 +348,19 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if rv.SkipWhy == applycmd.SkipInUseProbe {
 			skip(applycmd.SkipInUseProbe)
 			continue
+		}
+
+		// The intent line lands HERE (round-6 parity with apply): after
+		// re-verify, so it carries the fresh residue and nested names, and
+		// before ANY mutation — the write-ahead contract is
+		// intent-before-DELETION, and the skip/refusal lines above cover
+		// everything that did not get this far.
+		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil}
+		if len(rv.Nested) > 0 {
+			intent.Residue = "nested: " + strings.Join(rv.Nested, ", ")
+		}
+		if rc := appendOrAbort(intent); rc >= 0 {
+			return rc
 		}
 
 		// The rename in-use probe (Reverify's BLOCKED early return never
@@ -529,10 +538,10 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if qManifest.Interleaved {
 				notes = append(notes, "index interleaving detected during capture")
 			}
+			if qManifest.Mode == "plain-copy" {
+				notes = append(notes, "plain copy: files only, no git objects")
+			}
 			notes = append(notes, "rescued: "+rv.Verdict.BlockedClassFact)
-		}
-		if len(rv.Nested) > 0 {
-			notes = append(notes, "nested: "+strings.Join(rv.Nested, ", "))
 		}
 		result.Residue = strings.Join(notes, "; ")
 		if rv.Git != nil {

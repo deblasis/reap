@@ -55,6 +55,12 @@ var judgmentClass = map[string]bool{
 	"scratch-recent":          true,
 }
 
+// IsJudgmentCode reports whether a reasonCode is JUDGMENT-class (operator
+// said no) rather than IGNORANCE-class (the tool could not know) — the
+// widening gate: --include/--override-manual may widen into judgment rows
+// ONLY; overriding unread state is a side door around the cardinal rule.
+func IsJudgmentCode(code string) bool { return judgmentClass[code] }
+
 // Input carries every fact the matrix consumes. Nil optionals mean "not
 // applicable", never "checked and clean": applicable-but-nil facts are
 // routed to facts-unavailable by Decide, and the classifier's kinds make

@@ -748,15 +748,17 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // fine (spec fixture list; the round-3 regression that broke exactly this).
 func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
 	// The unborn probe must NOT swallow a timeout or a corrupt repo (the
-	// round-4 completeness hole Facts guards at line ~117): quiet-exit-1 +
-	// empty output is the unborn shape; a timeout PROPAGATES (pinning
-	// nothing while claiming completeness is the forbidden lie), and a
-	// corrupt .git propagates too.
+	// round-4 completeness hole Facts guards at line ~117). The unborn
+	// shape is EXACTLY quiet-exit-1 with empty stderr (`rev-parse
+	// --verify -q` on a missing HEAD prints nothing); our run() wrapper
+	// formats errors "%v: %s" so a quiet failure ends with ": " — anything
+	// else (a fatal from a corrupt .git, a timeout) PROPAGATES: pinning
+	// nothing while claiming completeness is the forbidden lie.
 	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil {
-		if strings.Contains(err.Error(), "timeout") {
-			return nil, err
+		if strings.HasSuffix(err.Error(), ": ") {
+			return nil, nil // quiet missing-ref: unborn HEAD, no reflog to pin
 		}
-		return nil, nil // unborn HEAD: no reflog to pin
+		return nil, err
 	} else if strings.TrimSpace(out) == "" {
 		return nil, nil
 	}

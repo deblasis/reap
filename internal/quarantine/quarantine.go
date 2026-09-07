@@ -408,15 +408,31 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 		}
 	}
 	restore := func() error {
+		var rerr error
 		if backup != "" {
-			if rerr := r.RestoreBackup(dir, backup); rerr != nil {
+			if rerr = r.RestoreBackup(dir, backup); rerr != nil {
 				// The all-staged index is live on disk; do not hide it.
 				_ = r.ResetIndex(dir)
 				return fmt.Errorf("index restore failed (%v); index reset to HEAD — staged state may be lost, .git/index.reap-backup may remain", rerr)
 			}
-			return nil
+		} else {
+			rerr = r.ResetIndex(dir)
+			if rerr != nil {
+				return rerr
+			}
 		}
-		return r.ResetIndex(dir)
+		// The un-poisoning lives HERE (round 6): every exit path from
+		// captureRef funnels through restore(), and on an unborn repo the
+		// reset itself CREATES .git/index — leaving it flips the dir
+		// ACTIVE for 48h even when the capture is refused on an earlier
+		// error branch (the round-5 falsified closure: the removal only
+		// ran on the success tail).
+		if preMtime.IsZero() && !indexExisted {
+			if g, ok := gitDirForPath(dir); ok {
+				_ = os.Remove(filepath.Join(g, "index"))
+			}
+		}
+		return nil
 	}
 	if err := r.AddAll(dir); err != nil {
 		_ = restore()
@@ -455,16 +471,8 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 			m.Interleaved = true
 		}
 	}
-	if g, ok := gitDirForPath(dir); ok {
-		if preMtime.IsZero() {
-			if !indexExisted {
-				// No index existed before reap ran: remove the one reap's
-				// staging created (unborn-HEAD refusal poisoning).
-				_ = os.Remove(filepath.Join(g, "index"))
-			}
-		} else {
-			_ = os.Chtimes(filepath.Join(g, "index"), preMtime, preMtime)
-		}
+	if g, ok := gitDirForPath(dir); ok && !preMtime.IsZero() {
+		_ = os.Chtimes(filepath.Join(g, "index"), preMtime, preMtime)
 	}
 	return nil
 }

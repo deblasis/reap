@@ -255,8 +255,22 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			// confirm + capped plain-copy snapshot happen in cmdApply).
 			take, widened = true, true
 		case inc[c.vd.Code] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
+			// The widening gate the spec pins at RESOLUTION time: only
+			// judgment-class MANUALs may widen. Ignorance rows (unread
+			// state, stale remote, tool failure) must refuse HERE with the
+			// side-door copy — advertising them as deletable and skipping
+			// them at re-verify is exactly the "output advertises a gate
+			// the tool will refuse" shape the spec forbids.
+			if !verdict.IsJudgmentCode(c.vd.Code) {
+				return nil, nil, nil, fmt.Errorf("%s is %s: an unread-state row (the fact is unavailable, not judged); overriding unread state is a side door around the cardinal rule; fix the tool or rerun scan, then widen on the row it shows",
+					c.entry.Path, c.vd.Code)
+			}
 			take, widened = true, true
 		case ovr[config.Canonical(c.entry.Path)] && c.vd.Verdict == verdict.Manual && c.vd.BlockedClassFact == "":
+			if !verdict.IsJudgmentCode(c.vd.Code) {
+				return nil, nil, nil, fmt.Errorf("%s is %s: an unread-state row (the fact is unavailable, not judged); overriding unread state is a side door around the cardinal rule; fix the tool or rerun scan, then widen on the row it shows",
+					c.entry.Path, c.vd.Code)
+			}
 			take = true
 		}
 		if !take {
@@ -724,8 +738,13 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				// by construction; --yes never reached this path). A decline
 				// is a SKIP: visible in the summary and the exit-2 band,
 				// never a silent machine-invisible non-deletion.
-				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs %.1f GB, cap %.1f GB): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
-					float64(tooLarge.Need)/(1<<30), float64(tooLarge.Cap)/(1<<30))
+				need, cap, unit := float64(tooLarge.Need)/(1<<30), float64(tooLarge.Cap)/(1<<30), "GB"
+				if tooLarge.Need < 1<<30 || tooLarge.Cap < 1<<30 {
+					// GB would round the decision inputs away at small scales.
+					need, cap, unit = float64(tooLarge.Need>>20), float64(tooLarge.Cap>>20), "MB"
+				}
+				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs %.1f %s, cap %.1f %s): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
+					need, unit, cap, unit)
 				var answer string
 				if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil || strings.ToLower(strings.TrimSpace(answer)) != "y" {
 					fmt.Fprintln(stdout, "declined")
@@ -735,8 +754,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 						Residue: "carve-out declined at the over-cap confirm"}); rc >= 0 {
 						return rc
 					}
+					// snapshot-overcap is the true cause (the cap ended this
+					// deletion); verdict-changed would tell machines the
+					// verdict drifted when it did not.
 					summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
-						Path: p.Path, Why: applycmd.SkipVerdictChanged, Note: "declined at the over-cap confirm"})
+						Path: p.Path, Why: applycmd.SkipSnapshotOvercap, Note: "declined at the over-cap confirm"})
 					summary.SkippedBytes += p.SizeBytes
 					continue
 				}
@@ -749,6 +771,9 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					Residue: "carve-out plain-copy failed: " + qerr.Error()}); rc >= 0 {
 					return rc
 				}
+				summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
+					Path: p.Path, Why: applycmd.SkipSnapshotOvercap, Note: "carve-out plain-copy failed"})
+				summary.SkippedBytes += p.SizeBytes
 				carveOutFailed = true
 				continue
 			}

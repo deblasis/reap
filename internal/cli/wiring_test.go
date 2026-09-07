@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/deblasis/reap/internal/applycmd"
+	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/quarantine"
 )
 
@@ -747,6 +748,182 @@ func TestWiringPlanExcludeStashes(t *testing.T) {
 	_, _ = wireFixture(t)
 	if code := cmdPlan([]string{"--no-gh", "--exclude", "stashes"}, os.Stdout, os.Stderr); code != ExitOK {
 		t.Fatalf("plan --exclude stashes: %d", code)
+	}
+}
+
+// THE WIDENING GATE (round-6 spec major, live-proven by the R5 panel):
+// --include/--override-manual must refuse IGNORANCE rows at resolution
+// time — a remote-stale dir may not widen into the plan, and the refusal
+// carries the side-door copy. The re-verify backstop was never enough: no
+// output may advertise a gate the tool will refuse.
+func TestWiringWideningGateRefusesIgnorance(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "stale-remote")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	bare := filepath.Join(t.TempDir(), "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	wireGit(t, repo, "remote", "add", "origin", bare)
+	wireGit(t, repo, "push", "-q", "origin", "main")
+	// No FETCH_HEAD marker after aging => remote-stale (an ignorance row).
+	ageTree(t, repo, 30*24*time.Hour)
+
+	var out, errOut bytes.Buffer
+	if code := cmdPlan([]string{"--no-gh", "--include", "remote-stale"}, &out, &errOut); code != ExitUsage {
+		t.Fatalf("plan --include remote-stale must refuse at resolution (120), got %d: %s %s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String()+errOut.String(), "side door") {
+		t.Fatalf("refusal copy must carry the side-door sentence: %s %s", out.String(), errOut.String())
+	}
+	errOut.Reset()
+	if code := cmdApply([]string{"--no-gh", "--yes", "--override-manual", repo}, &bytes.Buffer{}, &errOut, os.Stdin); code != ExitUsage {
+		t.Fatalf("apply --override-manual on a remote-stale dir must refuse at resolution (120), got %d", code)
+	}
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatal("remote-stale dir was deleted")
+	}
+}
+
+// The TTY carve-out choreography end to end through the ForceTerminal
+// seam (round-6: ~80 lines of the tool's most dangerous surface had zero
+// automated coverage because the terminal probe was untestable under
+// `go test`). Answers flow through a real stdin file: confirm, hardened
+// confirm, and (in the over-cap shape) the over-cap Proceed.
+func TestWiringCarveOutTTYFlows(t *testing.T) {
+	makeOrphan := func(t *testing.T) string {
+		t.Helper()
+		base := t.TempDir()
+		ph := filepath.Join(base, "porph")
+		if out, err := exec.Command("git", "init", "-q", "-b", "main", ph).CombinedOutput(); err != nil {
+			t.Skipf("git init: %v %s", err, out)
+		}
+		wt := filepath.Join(base, "orphan-wt")
+		if out, err := exec.Command("git", "-C", ph, "worktree", "add", "-q", wt).CombinedOutput(); err != nil {
+			t.Skipf("worktree add: %v %s", err, out)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "only-copy.txt"), []byte("PRECIOUS"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		os.RemoveAll(ph)
+		ageTree(t, wt, 30*24*time.Hour)
+		return wt
+	}
+	answerFile := func(t *testing.T, answers string) *os.File {
+		t.Helper()
+		f, err := os.CreateTemp(t.TempDir(), "answers")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() }) // an open handle blocks Windows temp cleanup
+		if _, err := f.WriteString(answers); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	restore := applycmd.ForceTerminal(true)
+	defer restore()
+
+	// Accept-accept: the dir deletes with a plain-copy quarantine.
+	wt := makeOrphan(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeWireConfig(t, stateDir, filepath.Dir(wt))
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt}, os.Stdout, os.Stderr, answerFile(t, "y\ny\n")); code != ExitOK {
+		t.Fatalf("TTY carve-out accept: %d", code)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatal("carve-out dir survived both confirms")
+	}
+	sessions, _ := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if len(sessions) != 1 {
+		t.Fatalf("carve-out plain-copy session: %d", len(sessions))
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "quarantine", sessions[0].Name(), "manifest.json"))
+	if !strings.Contains(string(raw), "files only, no git objects") {
+		t.Fatalf("plain-copy manifest label missing:\n%s", raw)
+	}
+
+	// Accept then decline at the hardened confirm: nothing happens.
+	wt2 := makeOrphan(t)
+	writeWireConfig(t, stateDir, filepath.Dir(wt2))
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt2}, os.Stdout, os.Stderr, answerFile(t, "y\nn\n")); code != ExitOK {
+		t.Fatalf("TTY carve-out decline: %d", code)
+	}
+	if _, err := os.Stat(wt2); err != nil {
+		t.Fatal("dir deleted after a decline")
+	}
+}
+
+// A LIVE split jj workspace classifies as jj-workspace with its parent
+// resolved (round-6 engineering major: the .jj/repo pointer is relative to
+// the .jj DIRECTORY; resolved against the workspace root every live parent
+// read as gone).
+func TestWiringSplitWorkspaceParentResolved(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v %s", err, out)
+	}
+	ws := filepath.Join(base, "ws")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v %s", err, out)
+	}
+	info := classify.Dir(ws)
+	if info.Kind != classify.KindJJWorkspace {
+		t.Fatalf("live workspace verdicts %s (want jj-workspace; the pointer mis-resolution is back)", info.Kind)
+	}
+	if info.ParentRepo == "" || !strings.Contains(strings.ToLower(info.ParentRepo), "parent") {
+		t.Fatalf("parent not resolved: %+v", info)
+	}
+}
+
+// The plain-copy restore round trip through the command layer (the
+// carve-out's only recovery path had no test).
+func TestWiringRestorePlainCopyRoundTrip(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	src := filepath.Join(t.TempDir(), "originals")
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "sub", "keep.bin"), []byte("PLAIN-COPY-ONLY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := quarantine.SessionDir(stateDir, src, time.Now())
+	if _, err := quarantine.WritePlainCopy(session, src, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "restored")
+	var out bytes.Buffer
+	if code := cmdQuarantine([]string{"restore", filepath.Base(session), "--to", dest}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("restore plain copy: %d (%s)", code, out.String())
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "sub", "keep.bin")); string(b) != "PLAIN-COPY-ONLY" {
+		t.Fatal("plain-copy restore not byte-for-byte")
+	}
+	// Non-empty refusal in plain-copy mode too.
+	if err := os.WriteFile(filepath.Join(dest, "x"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdQuarantine([]string{"restore", filepath.Base(session), "--to", dest}, &out, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("plain-copy restore to non-empty: %d (want 120)", code)
 	}
 }
 
