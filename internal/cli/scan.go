@@ -179,7 +179,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	for range unreadableRoots {
 		rep.Totals.Errors++
 	}
-	// reclaimableGB: the hardlink pass over the SAFE set (spec L511-514) —
+	// reclaimableGB: the hardlink pass over the SAFE set (spec L511-514)  - 
 	// hardlinked content shared within the deletable set reclaims once.
 	// Null + caveat stands when the pass skips (file bound or unsupported
 	// filesystem). JSON-only: text never renders the field, and the walk
@@ -260,7 +260,7 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	}
 
 	// Reparse candidates are NEVER read through: no classify, no facts, no
-	// activity — the KEEP row decides, on the link's own nature. The
+	// activity  -  the KEEP row decides, on the link's own nature. The
 	// never-walked fields stay zero (no 0001-01-01 sentinels, no 106751-day
 	// ages): "kind":"reparse" is the documented marker.
 	if info.IsReparse {
@@ -296,7 +296,7 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	}
 
 	// git facts only where classify found a git BACKEND (a root .git or a
-	// linked .git file) — or an orphaned worktree whose parent metadata is
+	// linked .git file)  -  or an orphaned worktree whose parent metadata is
 	// intact (the broken-branch flavor), so the carve-out can name real
 	// counts. Split-layout jj repos decide on jj facts alone.
 	gitReachable := classInfo.GitBackend ||
@@ -331,19 +331,33 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	jjReachable := classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace
 	if useJJ && jjReachable {
 		f := jr.Facts(info.Path, now, remoteStale)
-		if f.Deregistered {
+		// The re-route is WORKSPACE-shaped only (round 10): a root jj repo
+		// emitting the phrase would misroute; the parent must have resolved
+		// alive (classify said workspace, not orphaned).
+		if f.Deregistered && classInfo.Kind == classify.KindJJWorkspace {
 			// The forget-then-rm crash shape (parent alive, this dir out of
 			// its registry): route to the carve-out, NOT the no-deletion-path
-			// ignorance class. Rebuild the verdict input for the orphaned
-			// kind; the facts are honestly "unknown" for a deregistered copy.
+			// ignorance class. KEEP rails first (round 10: the early return
+			// previously skipped Held/Protected, displaying an override hint
+			// on a HELD dir); the kind is stamped for the row it now is.
+			in.Held = anyHoldUnder(holds, info.Path)
+			in.Protected, _ = config.MatchProtect(info.Path, protectExpanded)
+			in.PRHeads = prHeads
 			classInfo = classify.Info{Kind: classify.KindJJWorkspaceOrphaned}
 			in.Kind = classInfo.Kind
 			in.GitBackend = false
+			e.Kind = string(classInfo.Kind)
 			v := verdict.Decide(in)
 			e.Verdict = v.Verdict
 			e.ReasonCode = v.Code
-			e.Reason = v.Reason
+			// The reason must not say "parent gone" when the parent is
+			// alive: this shape is DEREGISTERED (the forget-then-rm crash
+			// window), not parent-less.
+			e.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
 			e.Hint = v.Hint
+			e.Held = in.Held
+			e.OrphanedCarveOut = v.OrphanedCarveOut
+			e.BlockedClassFact = v.BlockedClassFact
 			return e
 		}
 		in.JJ = &f

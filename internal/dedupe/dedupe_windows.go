@@ -4,7 +4,7 @@
 // expected-reclaim bytes, where files sharing a Windows file index
 // (hardlinks) WITHIN the set are counted once. The two-number truth the
 // spec pins ("freed ~D GB now") is derived from THIS pass, not from
-// logical sizes — zig lane caches share bytes across build dirs, and
+// logical sizes  -  zig lane caches share bytes across build dirs, and
 // deleting both dirs reclaims the content once.
 package dedupe
 
@@ -73,7 +73,7 @@ func (c *Counter) Over() bool { return c.over }
 // IndexesAvailable reports whether the filesystem exposes classic file
 // indexes for path's volume (ReFS/Dev Drive volumes do not; the pass
 // degrades to the logical upper bound there). Round-4 fix: presence in the
-// map, never the stored value — the bool-value version was constant-false
+// map, never the stored value  -  the bool-value version was constant-false
 // and made every volume "unsupported".
 func IndexesAvailable(path string) bool {
 	c := Counter{seen: map[key]struct{}{}}
@@ -83,7 +83,7 @@ func IndexesAvailable(path string) bool {
 
 // sharedUnder records the file's identity and reports whether the same
 // physical file was already seen in this set. A zero file index (some
-// filesystems) degrades to always-distinct — the logical upper bound.
+// filesystems) degrades to always-distinct  -  the logical upper bound.
 func (c *Counter) sharedUnder(p string) bool {
 	f, err := os.Open(p)
 	if err != nil {

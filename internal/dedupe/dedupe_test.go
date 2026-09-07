@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The deletion-set pass: two dirs hardlinking one file — logical counts
+// The deletion-set pass: two dirs hardlinking one file  -  logical counts
 // the file twice, expected counts the physical content once (the zig-lane
 // shape the two-number truth exists for). Skipped on filesystems that do
 // not expose classic file indexes (ReFS/Dev Drive: the pass degrades to
@@ -26,7 +26,7 @@ func TestCounterHardlinkCountedOnce(t *testing.T) {
 	}
 	// Capability probe: ReFS/Dev Drive volumes genuinely lack classic file
 	// indexes (the pass degrades to logical there, by design). On NTFS the
-	// presence-fixed IndexesAvailable MUST hold — the round-3 value-test
+	// presence-fixed IndexesAvailable MUST hold  -  the round-3 value-test
 	// bug made it constant-false and this fixture self-skipped everywhere,
 	// so the broken pass never failed a test.
 	if !IndexesAvailable(src) {

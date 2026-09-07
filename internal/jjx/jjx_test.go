@@ -38,7 +38,7 @@ func sh(t *testing.T, dir string, args ...string) string {
 // `jj git init --colocate <dir>` (positional destination); the helper probes
 // the older `--colocated` spelling only if that fails. A transient init
 // failure (observed under heavy parallel suite load, round 3) retries once
-// and then SKIPS with the stderr — a load-sensitive fixture must not make
+// and then SKIPS with the stderr  -  a load-sensitive fixture must not make
 // the required gate run non-deterministic.
 func colocate(t *testing.T, dir string) {
 	t.Helper()
@@ -96,7 +96,7 @@ func TestWSideNoChildren(t *testing.T) {
 	}
 	r := Runner{Budget: 60 * time.Second}
 	// From a workspace: no children at all (neither the parent nor the
-	// sibling — both belong to the PARENT's row).
+	// sibling  -  both belong to the PARENT's row).
 	f := r.Facts(ws1, time.Now(), 48*time.Hour)
 	if len(f.Children) != 0 {
 		t.Fatalf("workspace rows its own children: %v", f.Children)
@@ -109,7 +109,7 @@ func TestWSideNoChildren(t *testing.T) {
 }
 
 // The parent ROOT (not the .jj/repo dir) is what classify carries: `jj -R
-// <root> workspace forget` is the shape jj accepts — pointing at the repo
+// <root> workspace forget` is the shape jj accepts  -  pointing at the repo
 // dir failed live ("no jj repo in ...").
 func TestWorkspaceParentIsRootShape(t *testing.T) {
 	needJJ(t)
@@ -300,7 +300,7 @@ func TestColocatedFactsWork(t *testing.T) {
 
 // The dirty-tree stability case (the one that WRITES on snapshot): two
 // Facts calls on an aged, dirty colocated repo must leave nothing under
-// .jj or .git reading fresh — the round-3 panel proved clamping to the
+// .jj or .git reading fresh  -  the round-3 panel proved clamping to the
 // capture instant still flipped BLOCKED to ACTIVE on the next scan.
 func TestDirtyTreeStableAcrossReads(t *testing.T) {
 	needJJ(t)
@@ -392,7 +392,7 @@ func TestRepeatReadsStable(t *testing.T) {
 
 	// After two full fact reads, the freshest thing under .jj must still
 	// read as aged (the capture-instant clamp may add at most the first
-	// call's timestamp — assert it is NOT "now fresh").
+	// call's timestamp  -  assert it is NOT "now fresh").
 	freshest := time.Time{}
 	filepath.WalkDir(filepath.Join(repo, ".jj"), func(p string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {

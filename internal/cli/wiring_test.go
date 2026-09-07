@@ -100,7 +100,7 @@ func TestWiringHoldsLifecycle(t *testing.T) {
 		t.Fatalf("corrupt file was rewritten: %q", b)
 	}
 	// Restore a valid two-hold file (the refusal left GARBAGE in place),
-	// via the real writer — hand-built JSON with raw Windows backslashes is
+	// via the real writer  -  hand-built JSON with raw Windows backslashes is
 	// invalid JSON, which is itself the corrupt case under test.
 	far := time.Now().Add(100 * 365 * 24 * time.Hour)
 	if err := applycmd.WriteHolds(stateDir, map[string]time.Time{target: far, second: far}); err != nil {
@@ -566,7 +566,7 @@ func TestWiringLogAcrossRotation(t *testing.T) {
 	}
 }
 
-// restore: the first-class recovery command, end to end — bundle sessions
+// restore: the first-class recovery command, end to end  -  bundle sessions
 // materialize the capture tree; a non-empty --to destination is refused.
 func TestWiringQuarantineRestore(t *testing.T) {
 	root, stateDir := wireFixture(t)
@@ -614,7 +614,7 @@ func TestWiringQuarantineRestore(t *testing.T) {
 }
 
 // Delta restore survives ROUTINE REMOTE ADVANCEMENT: the remote's tips
-// moving past the recorded base is not a gone base — restore fetches the
+// moving past the recorded base is not a gone base  -  restore fetches the
 // remote and verifies the prerequisite object exists (round-3 fix of the
 // ls-remote-tips false refusal).
 func TestWiringRestoreRemoteAdvanced(t *testing.T) {
@@ -753,7 +753,7 @@ func TestWiringPlanExcludeStashes(t *testing.T) {
 
 // THE WIDENING GATE (round-6 spec major, live-proven by the R5 panel):
 // --include/--override-manual must refuse IGNORANCE rows at resolution
-// time — a remote-stale dir may not widen into the plan, and the refusal
+// time  -  a remote-stale dir may not widen into the plan, and the refusal
 // carries the side-door copy. The re-verify backstop was never enough: no
 // output may advertise a gate the tool will refuse.
 func TestWiringWideningGateRefusesIgnorance(t *testing.T) {
@@ -853,6 +853,85 @@ func TestWiringOverrideRefusalTrio(t *testing.T) {
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatal("dirty dir deleted by an override refusal")
 	}
+}
+
+// The forget-then-rm crash window, pinned end to end through ALL surfaces
+// (round 10: round 9's re-route was scan-display-only  -  the shared plan
+// pipeline refused the row its own hint advertised). A forgotten workspace
+// must verdict orphaned-workspace in scan AND plan, and delete through the
+// TTY carve-out.
+func TestWiringDeregisteredWorkspaceCarveOut(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, d := range []string{root, stateDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	parent := filepath.Join(root, "parent")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "commit", "-m", "one").CombinedOutput(); err != nil {
+		t.Skipf("jj commit: %v\n%s", err, out)
+	}
+
+	ws := filepath.Join(root, "forgotten-ws")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	// Deregister: the crash shape.
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "forget", "forgotten-ws").CombinedOutput(); err != nil {
+		t.Skipf("jj workspace forget: %v\n%s", err, out)
+	}
+	ageTree(t, ws, 30*24*time.Hour)
+
+	// Scan: the row must be orphaned-workspace (not facts-unavailable).
+	var scanOut bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &scanOut, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(scanOut.String(), "orphaned-workspace") {
+		t.Fatalf("deregistered ws not routed to orphaned-workspace in scan:\n%s", scanOut.String())
+	}
+
+	// TTY apply through the carve-out: the hint must be executable.
+	restore := applycmd.ForceTerminal(true)
+	defer restore()
+	if code := cmdApply([]string{"--no-gh", "--override-manual", ws}, os.Stdout, os.Stderr, answerStdin(t, "y\ny\n")); code != ExitOK {
+		t.Fatalf("TTY carve-out on the deregistered ws: %d", code)
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatal("deregistered ws survived the carve-out")
+	}
+}
+
+func answerStdin(t *testing.T, answers string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "ans")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if _, err := f.WriteString(answers); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	return f
 }
 
 // The TTY carve-out choreography end to end through the ForceTerminal
@@ -989,7 +1068,7 @@ func TestWiringCarveOutTTYFlows(t *testing.T) {
 		t.Fatalf("decline skip line must carry snapshot-overcap:\n%s", ledger)
 	}
 
-	// --include can NEVER reach the carve-out (spec) — even on a TTY.
+	// --include can NEVER reach the carve-out (spec)  -  even on a TTY.
 	wt5 := makeOrphan(t)
 	writeWireConfig(t, stateDir, filepath.Dir(wt5))
 	if code := cmdApply([]string{"--no-gh", "--include", "orphaned-worktree"}, os.Stdout, os.Stderr, answerFile(t, "y\ny\n")); code != ExitUsage {

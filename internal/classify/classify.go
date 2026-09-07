@@ -6,7 +6,7 @@
 // filesystem, not an error from git.
 //
 // The classifier defines no-VCS-markers = scratch, so kind unknown is
-// structurally rare and semantically "could not classify" — which the
+// structurally rare and semantically "could not classify"  -  which the
 // reachability rules treat as ignorance, not judgment.
 package classify
 
@@ -43,7 +43,7 @@ type Info struct {
 	GitDirFile string // the .git file content target when linked
 	// GitBackend reports whether a git backend exists HERE: a root .git dir
 	// or a linked .git file. Colocated jj repos have it, split-layout jj
-	// repos do not — and running git facts where no backend exists yields a
+	// repos do not  -  and running git facts where no backend exists yields a
 	// bogus state-unreadable that shadows the jj rows for that whole
 	// population (the round-2 finding both seats disproved live).
 	GitBackend bool
@@ -113,7 +113,7 @@ func classifyJJWorkspace(path, gitFile string) Info {
 		return Info{Kind: KindJJWorkspace, ParentRepo: parent, GitDirFile: gitFile}
 	}
 	// Fall back to the jj pointer: .jj/repo names the main repo in split
-	// layouts (the PARENT ROOT via jjpaths — the shape jj -R accepts). If
+	// layouts (the PARENT ROOT via jjpaths  -  the shape jj -R accepts). If
 	// neither resolves, orphaned.
 	if l, ok := jjpaths.Resolve(path); ok && l.ParentRoot != "" && dirExists(l.ParentRoot) {
 		return Info{Kind: KindJJWorkspace, ParentRepo: l.ParentRoot, GitDirFile: gitFile}
@@ -126,7 +126,7 @@ func classifyJJWorkspace(path, gitFile string) Info {
 // via .jj/repo; a root repo's pointer is absent or self-referential.
 // ParentRepo carries the parent WORKSPACE ROOT (not the repo dir the
 // pointer names verbatim): `jj -R <root>` is the shape every command
-// accepts — pointing at the repo dir made every workspace forget FAIL live
+// accepts  -  pointing at the repo dir made every workspace forget FAIL live
 // (the round-7 engineering major).
 func classifyJJStandalone(path string) Info {
 	l, ok := jjpaths.Resolve(path)
@@ -180,7 +180,7 @@ func worktreeParent(gitDir string) (parent, wtName string, ok bool) {
 // worktreeHeadResolvable checks the parent's registration for the worktree:
 // the metadata dir must exist and its HEAD must be either a sha or a ref the
 // parent still has (loose or packed). A deleted branch leaves "ref:
-// refs/heads/x" with no backing ref — broken, orphaned.
+// refs/heads/x" with no backing ref  -  broken, orphaned.
 func worktreeHeadResolvable(parent, wtName string) bool {
 	wtDir := filepath.Join(parent, ".git", "worktrees", wtName)
 	if !dirExists(wtDir) {

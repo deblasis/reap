@@ -74,7 +74,7 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// Status: repo-level failure if it cannot run. A live index.lock is
 	// detected STRUCTURALLY, before any exec: with optional locks disabled
 	// (below) git never takes or waits on that lock, so the only honest way
-	// to see "a concurrent git holds the index" is to look for the file —
+	// to see "a concurrent git holds the index" is to look for the file  - 
 	// in the worktree's OWN gitdir (linked worktrees keep their index there)
 	// and in the common dir.
 	if gi, ok := gitDirFor(dir); ok {
@@ -104,7 +104,7 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 
 	// rev-list decomposition: also repo-level when unreadable, EXCEPT the
 	// unborn-HEAD repo (fresh `git init`, no commits yet): rev-list over
-	// HEAD fails there, but that is not unreadable state — there is simply
+	// HEAD fails there, but that is not unreadable state  -  there is simply
 	// nothing to push. `rev-parse --verify -q HEAD` exits NONZERO on an
 	// unborn HEAD (the quiet missing-ref signal; pinned after the round-2
 	// seat proved the exit-0-and-empty reading was dead code), and the
@@ -113,7 +113,7 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	if err := r.unpushed(dir, &f); err != nil {
 		// `rev-parse --verify -q HEAD` exits NONZERO on an unborn HEAD. The
 		// ONE typed predicate (quiet exit 1, empty stderr) decides unborn;
-		// fatals (corrupt repo) and timeouts are NOT unborn — reading them
+		// fatals (corrupt repo) and timeouts are NOT unborn  -  reading them
 		// as such would zero unpushed counts on unreadable evidence, the
 		// cardinal rule's edge (round-7: Facts kept a second, looser
 		// heuristic long after the typed one landed).
@@ -205,7 +205,7 @@ func (r Runner) FetchPrune(dir string) error {
 // Run FROM THE PARENT: `git -C <worktree> worktree remove <worktree>` makes
 // the doomed worktree git's own cwd, so git deregisters it and then
 // reliably fails to delete the tree (Windows refuses to remove a process's
-// cwd) — the round-1 probe caught the apply path always falling through to
+// cwd)  -  the round-1 probe caught the apply path always falling through to
 // rm believing deregistration failed.
 func (r Runner) WorktreeRemove(dir string) error {
 	return r.WorktreeRemoveFrom(dir, dir)
@@ -234,7 +234,7 @@ func (r Runner) RemoteURL(dir string) string {
 
 // Remotes returns every configured remote name -> URL. The gh join matches
 // PR head repositories against ALL of them: origin, upstream, a secondary
-// fork — head repos vary by clone layout, and matching origin only is exactly
+// fork  -  head repos vary by clone layout, and matching origin only is exactly
 // the fork blind spot the spec closed.
 func (r Runner) Remotes(dir string) map[string]string {
 	out, err := r.run(dir, r.GitBudget, "remote", "-v")
@@ -267,7 +267,7 @@ type gitError struct {
 func (e *gitError) Error() string { return e.msg }
 
 // isQuietUnborn is the ONE unborn-HEAD predicate, shared: git exited 1
-// with nothing on stderr — `rev-parse --verify -q` on a missing HEAD.
+// with nothing on stderr  -  `rev-parse --verify -q` on a missing HEAD.
 // Fatals (corrupt repo, missing dir) and timeouts are NOT unborn.
 func isQuietUnborn(err error) bool {
 	ge, ok := err.(*gitError)
@@ -286,7 +286,7 @@ func (r Runner) run(dir string, budget time.Duration, args ...string) (string, e
 	cmd.Stderr = &stderr
 	// GIT_OPTIONAL_LOCKS=0: reap must never WRITE the index while reading.
 	// git status opportunistically refreshes it, and reap's own write then
-	// freshens the NEXT scan's walk-derived activity floor — a repo scanned
+	// freshens the NEXT scan's walk-derived activity floor  -  a repo scanned
 	// twice 20 seconds apart flipped SAFE to ACTIVE from exactly this. The
 	// locked-index taxonomy is preserved structurally: Facts stats
 	// index.lock before any exec, so a concurrent git mid-write still reads
@@ -424,7 +424,7 @@ func (r Runner) revlistDates(dir string, refs ...string) (map[string]time.Time, 
 	// refs/jj/** are jj's internal bookkeeping refs (move-tracking keeps
 	// commits alive under refs/jj/keep indefinitely). Sweeping them with
 	// --all mints phantom BLOCKED unpushed-reflog rows on every colocated
-	// repo with zero user work — and because they are refs, not reflog
+	// repo with zero user work  -  and because they are refs, not reflog
 	// entries, the "expire in 90d" story is false forever (the conformance
 	// seat's round-3 major). Excluded here in BOTH rev-lists of the
 	// decomposition; --exclude must precede --all to apply.
@@ -462,7 +462,7 @@ func fileChildren(dir string) []string {
 	}
 	// Children only for the repo ROOT: a linked worktree's own enumeration
 	// (through the shared common dir) lists every SIBLING worktree of the
-	// repo, and a sibling is not this dir's child — the mirrored wart of
+	// repo, and a sibling is not this dir's child  -  the mirrored wart of
 	// jj's workspace list (the round-7 finding: two worktrees each counted
 	// the other as a live child, wrong-reason MANUAL forever). The common
 	// dir IS the root's .git; a candidate whose own gitdir sits elsewhere
@@ -494,11 +494,11 @@ func fileChildren(dir string) []string {
 			continue
 		}
 		// LIVE registered children only: a registration whose worktree dir
-		// is gone (rm without prune) is stale metadata, not a child —
+		// is gone (rm without prune) is stale metadata, not a child  - 
 		// counting it would pin the parent MANUAL parent-of-live-children
 		// forever over a path nothing can act on. And the candidate itself
 		// is never its own child (an only-child worktree listed itself and
-		// displayed parent-of-live-children instead of its real row — the
+		// displayed parent-of-live-children instead of its real row  -  the
 		// round-2 finding).
 		if _, err := os.Stat(wtPath); err != nil {
 			continue
@@ -621,7 +621,7 @@ type StatusSummary struct {
 
 // StatusPorcelain returns the three-way split with per-class bytes. Dirty
 // bytes are the full on-disk size of each modified file (an over-estimate
-// of the staged delta — the safe direction for a free-space floor).
+// of the staged delta  -  the safe direction for a free-space floor).
 func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
 	var s StatusSummary
 	out, err := r.run(dir, r.GitBudget, "status", "--porcelain", "--ignored")
@@ -652,7 +652,7 @@ func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
 }
 
 // AddAll stages the entire working tree (quarantine capture step 1): the
-// spec's pinned `git add -A -f .`, no exclusions — .jj is force-staged too
+// spec's pinned `git add -A -f .`, no exclusions  -  .jj is force-staged too
 // (documented residue: op log / change-id mapping), because the capture
 // must hold everything the working tree holds. The caller restores the
 // index afterwards via RestoreBackup/ResetIndex.
@@ -716,7 +716,7 @@ func (r Runner) UpdateRef(dir, ref, sha string) error {
 // LocalOnlyTip is one branch/tag tip not on any remote. Peeled is the
 // commit SHA an annotated tag points AT (equal to SHA for lightweight tags
 // and branches): membership tests against the unpushed COMMIt set must use
-// Peeled — %(objectname) of an annotated tag is the tag OBJECT, which never
+// Peeled  -  %(objectname) of an annotated tag is the tag OBJECT, which never
 // appears in rev-list output, and comparing it silently skips every
 // annotated-tag pin (the round-2 live data-loss probe).
 type LocalOnlyTip struct {
@@ -763,7 +763,7 @@ func (r Runner) StashRefs(dir string) ([]string, error) {
 }
 
 // UnpushedCommits returns the branch/tag/HEAD-reachable local-only commit
-// set (one bounded rev-list — the same decomposition Facts runs, not a full
+// set (one bounded rev-list  -  the same decomposition Facts runs, not a full
 // --remotes enumeration, which materializes every remote-reachable SHA).
 // pinTips marks a tip for pinning iff its SHA is in this set: a tip outside
 // it is fully remote-reachable and recoverable by re-cloning.
@@ -784,18 +784,18 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // tag or remote (post-reset / pre-rebase generations): the unpushed-reflog
 // BLOCKED class. Entry tips, not the full rev-list enumeration: every commit
 // reachable from an entry rides into the bundle under that entry's pin
-// (<base>..<tip>), which bounds both the pin count and the command line —
+// (<base>..<tip>), which bounds both the pin count and the command line  - 
 // a rev-list of a stale reflog-heavy repo mints thousands of refs and blows
 // the Windows command-line bound (the round-2 reliability finding). Errors
 // PROPAGATE: pinning nothing on unreadable evidence is the completeness lie
-// the manifest must never tell — EXCEPT the unborn HEAD (fresh git init,
+// the manifest must never tell  -  EXCEPT the unborn HEAD (fresh git init,
 // no commits): `git reflog show HEAD` exits 128 there, but that is the
 // unpushed-HEAD shape, not unreadable state, and quarantine must capture it
 // fine (spec fixture list; the round-3 regression that broke exactly this).
 func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
 	// The unborn probe must NOT swallow a timeout or a corrupt repo (the
-	// round-4 completeness hole Facts guards). The ONE predicate — quiet
-	// exit 1, empty stderr — is typed (gitError), never a string suffix:
+	// round-4 completeness hole Facts guards). The ONE predicate  -  quiet
+	// exit 1, empty stderr  -  is typed (gitError), never a string suffix:
 	// a git killed by a signal with empty stderr must not read as unborn
 	// (the round-6 engineering nit).
 	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil {
@@ -911,13 +911,13 @@ func (r Runner) BundleCreateRanges(dir, dst string, ranges []string) error {
 }
 
 // LSRemote lists a remote's advertised refs ("sha ref" lines), read-only,
-// under the fetch budget — the quarantine revalidation probe (one
+// under the fetch budget  -  the quarantine revalidation probe (one
 // ls-remote per delta bundle).
 func (r Runner) LSRemote(url string) (string, error) {
 	return r.run(".", r.FetchBudget, "ls-remote", url)
 }
 
-// ForEachReapRef lists refs/reap/* pins in dir (nil on any failure — a
+// ForEachReapRef lists refs/reap/* pins in dir (nil on any failure  -  a
 // non-repo simply has none): doctor's stranded-ref detector.
 func (r Runner) ForEachReapRef(dir string) ([]string, error) {
 	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname)", "refs/reap")

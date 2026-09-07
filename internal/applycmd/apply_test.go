@@ -176,6 +176,43 @@ func TestWorkspaceDeleteE2E(t *testing.T) {
 	}
 }
 
+// A ROOT jj repo deletes with mode=rm: it has no workspace to forget, and
+// jj 0.44's forget of a nonexistent name is an exit-0 no-op, so the label
+// must not assert a deregistration that never happened (round 9's mode
+// honesty, pinned round 10).
+func TestRootJJRepoDeleteModeIsRM(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "r")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", root).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := classify.Dir(root)
+	if info.Kind != classify.KindJJRepo {
+		t.Fatalf("kind: %s", info.Kind)
+	}
+	d := Deleter{
+		Git: gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second},
+		JJ:  jjx.Runner{Budget: 60 * time.Second},
+	}
+	mode, derr := Delete(root, info, d)
+	if derr != nil {
+		t.Fatalf("delete: %v", derr)
+	}
+	if mode != "rm" {
+		t.Fatalf("root jj repo mode: %s (want rm, no vacuous forget label)", mode)
+	}
+}
+
 // apply.lock: exclusive (second Lock fails fast, naming the holder).
 func TestLockFailsFast(t *testing.T) {
 	dir := t.TempDir()

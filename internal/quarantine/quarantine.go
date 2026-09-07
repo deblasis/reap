@@ -9,7 +9,7 @@
 //     saved and restored, and the index mtime is verified unchanged across
 //     the window (interleaving surfaced, never silently restored over).
 //   - Tip pinning under refs/reap/*: bundles materialize refs, NEVER
-//     reflogs — so every recoverable tip gets a named ref first: branches
+//     reflogs  -  so every recoverable tip gets a named ref first: branches
 //     (unpushed-<branch>), tags (tag-<name>), reflog-only generations
 //     (reflog-N), stash generations (stash-N), jj push-state commits
 //     (jj-N), and the capture commit itself (capture-<ts>).
@@ -115,7 +115,7 @@ func (e *ErrGitBusy) Error() string {
 	return fmt.Sprintf("index.lock present at capture start (%s): a concurrent git is mid-write", e.Path)
 }
 
-// ErrSessionExists reports that the session directory already exists — a
+// ErrSessionExists reports that the session directory already exists  -  a
 // same-name race from another creator; proceeding would overwrite that
 // session's recovery. TYPED (fs.ErrExist) so retries key on collisions,
 // never on unrelated mkdir failures like access-denied.
@@ -149,7 +149,7 @@ func SessionDir(stateDir, source string, now time.Time) string {
 
 // FreshSessionDir returns SessionDir, suffixed -2, -3, ... when the name is
 // taken (two same-basename dirs discarded in one wall-clock second must not
-// share a session — the earlier bundle is that dir's only recovery).
+// share a session  -  the earlier bundle is that dir's only recovery).
 func FreshSessionDir(stateDir, source string, now time.Time) string {
 	base := SessionDir(stateDir, source, now)
 	session := base
@@ -163,7 +163,7 @@ func FreshSessionDir(stateDir, source string, now time.Time) string {
 
 // Snapshot captures source completely and returns the manifest. The source
 // dir is never mutated; on any failure it is untouched AND the session dir
-// is removed — a half-written session must never masquerade as recoverable
+// is removed  -  a half-written session must never masquerade as recoverable
 // (the caller checks err). gitRunner drives git.
 func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*Manifest, error) {
 	now := time.Now()
@@ -171,7 +171,7 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 
 	// The session dir must exist up front: `git bundle create` writes
 	// <bundle>.lock BESIDE its destination. Created EXCLUSIVELY (Mkdir, not
-	// MkdirAll): an existing dir of the same name is ANOTHER SESSION —
+	// MkdirAll): an existing dir of the same name is ANOTHER SESSION  - 
 	// proceeding would overwrite that dir's only recovery copy. A typed
 	// collision error (round 4): string-matching the prose burned the retry
 	// on unrelated mkdir failures. The PARENT is ours to create (round 5):
@@ -226,7 +226,7 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 		return nil, err
 	}
 	// Pricing REFUSES on failure too (round 4): a failed or unparseable
-	// pre-price must not degrade to write-then-refuse — that path puts the
+	// pre-price must not degrade to write-then-refuse  -  that path puts the
 	// transient bytes on the volume this tool protects before saying no.
 	if opts.CapBytes > 0 {
 		projected, derr := gitRunner.DiskUsage(source, ranges)
@@ -300,7 +300,7 @@ func syncFile(path string) error {
 
 // findEmptyDirs lists empty directories under root (capped), as paths
 // RELATIVE to root: git trees cannot represent them, so the manifest
-// records them and restore recreates them under the destination — absolute
+// records them and restore recreates them under the destination  -  absolute
 // paths there produced invalid joins (the round-2 live probe).
 func findEmptyDirs(root string, cap int) []string {
 	var out []string
@@ -366,7 +366,7 @@ func gitDirForPath(dir string) (string, bool) {
 // The operator's staged state is saved and restored EXACTLY (SaveIndex),
 // not reset to HEAD: a discard attempt that later refuses must leave the
 // repo as it found it, staged hunks included. SaveIndex failing is a
-// refusal — falling back to reset --mixed would destroy exactly the state
+// refusal  -  falling back to reset --mixed would destroy exactly the state
 // the backup exists to protect.
 // readIndexBytes is a seam: the deterministic interleave fixture swaps it
 // to simulate a concurrent git's mid-window write (a live race is
@@ -376,7 +376,7 @@ var readIndexBytes = os.ReadFile
 func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	preMtime := indexMtime(dir)
 	// Whether an index existed AT ALL: on an unborn HEAD (fresh git init)
-	// there is none, and reap's own reset --mixed CREATES one — a refused
+	// there is none, and reap's own reset --mixed CREATES one  -  a refused
 	// capture must not leave it behind (a fresh .git/index flips the dir
 	// ACTIVE for 48h, the exact feedback loop FETCH_HEAD's restore kills).
 	indexExisted := false
@@ -423,7 +423,7 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 		}
 		// The un-poisoning lives HERE (round 6): every exit path from
 		// captureRef funnels through restore(), and on an unborn repo the
-		// reset itself CREATES .git/index — leaving it flips the dir
+		// reset itself CREATES .git/index  -  leaving it flips the dir
 		// ACTIVE for 48h even when the capture is refused on an earlier
 		// error branch (the round-5 falsified closure: the removal only
 		// ran on the success tail).
@@ -457,10 +457,10 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	if rerr := restore(); rerr != nil {
 		return rerr
 	}
-	// w2: after the restore, the index on disk must equal the saved bytes —
+	// w2: after the restore, the index on disk must equal the saved bytes  - 
 	// anything else is a concurrent git that wrote past the restore.
-	// (The window DURING staging — while git add/plumbing hold the index
-	// lock between our steps — is honestly unobservable without holding
+	// (The window DURING staging  -  while git add/plumbing hold the index
+	// lock between our steps  -  is honestly unobservable without holding
 	// the lock ourselves, which would deadlock git add; w1+w2 are the two
 	// windows reap can see, and both are surfaced.) The restore's own
 	// mtime bump is UNDONE so a refused discard does not flip the dir
@@ -502,10 +502,10 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 
 	// Branch and tag tips: only those whose PEELD commit carries local-only
 	// work (a tip fully on a remote is recoverable by re-cloning). An
-	// annotated tag's %(objectname) is the tag OBJECT — membership against
+	// annotated tag's %(objectname) is the tag OBJECT  -  membership against
 	// the unpushed COMMIt set must use the peeled target, or every
 	// annotated-tag pin silently drops (the round-2 live data loss). When
-	// the unpushed set cannot be computed, EVERYTHING is pinned — the
+	// the unpushed set cannot be computed, EVERYTHING is pinned  -  the
 	// completeness direction.
 	tips, err := r.LocalOnlyTips(dir)
 	if err != nil {
@@ -542,7 +542,7 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 	}
 
 	// Reflog-only generations: post-reset / pre-rebase commits reachable
-	// from NO ref — the entire unpushed-reflog BLOCKED class. Reflogs are
+	// from NO ref  -  the entire unpushed-reflog BLOCKED class. Reflogs are
 	// never packed by bundles, so each ENTRY TIP gets a named pin (the
 	// chain under it rides along in the bundle range). Unreadable evidence
 	// FAILS the capture: pinning nothing while claiming completeness is
@@ -617,12 +617,12 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 	return pins, nil
 }
 
-// bundleRanges selects the delta base per the spec's pinned order — the
+// bundleRanges selects the delta base per the spec's pinned order  -  the
 // current branch's upstream-tracking ref, else origin/HEAD, else a
-// per-branch upstream union — and returns the literal <base>..<ref> list
+// per-branch upstream union  -  and returns the literal <base>..<ref> list
 // (a bare ref = a full, self-contained history). Two capture-time
 // decisions per the spec: (1) the base must still be ADVERTISED by the
-// recorded remote (one ls-remote) — a base that is not advertised may be
+// recorded remote (one ls-remote)  -  a base that is not advertised may be
 // gone (force-push/squash-merge), and shipping a delta whose recovery
 // depends on it would be a bundle that verifies yet never restores; the
 // safe fallback in both the gone and the merely-advanced case is the
@@ -659,12 +659,12 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		return rangesFor(""), nil
 	}
 	// Capture-time revalidation: no remote to ask, or base not advertised
-	// (gone OR merely advanced — indistinguishable without a fetch, and
+	// (gone OR merely advanced  -  indistinguishable without a fetch, and
 	// self-contained is correct in both) -> self-contained form.
 	lsOut := (*string)(nil) // one ls-remote per capture, cached
 	baseAdvertised := func(ref, sha string) bool {
 		// Round 5: no remote to ask, or no SHA to check, means the base
-		// CANNOT be confirmed — self-contained, never a delta whose
+		// CANNOT be confirmed  -  self-contained, never a delta whose
 		// prerequisites nothing can fetch (the round-4 inversion shipped
 		// exactly that for no-remote repos with a resolvable base).
 		if m.Origin == "" || sha == "" {
@@ -676,7 +676,7 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		if lsOut == nil {
 			out, err := r.LSRemote(m.Origin)
 			if err != nil {
-				// Offline at capture time: the base cannot be confirmed —
+				// Offline at capture time: the base cannot be confirmed  - 
 				// self-contained, never an unverifiable delta.
 				empty := ""
 				lsOut = &empty
@@ -703,7 +703,7 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		return rangesFor("refs/remotes/origin/HEAD"), nil
 	}
 	// Per-branch union: branches with their own upstream price against it
-	// (each base recorded AND revalidated — round 4 closed the gap where
+	// (each base recorded AND revalidated  -  round 4 closed the gap where
 	// this tier skipped the capture-time baseAdvertised check the first
 	// two tiers get; a gone per-branch base now carries that ref whole);
 	// everything else is carried whole.
@@ -763,7 +763,7 @@ func writeManifest(sessionDir string, m *Manifest) error {
 // WritePlainCopy snapshots a non-git BLOCKED dir as a capped byte-for-byte
 // copy with an entries list. The cap prices the WHOLE tree (directories
 // included) before anything is written; the session dir is created
-// EXCLUSIVELY (same collision contract as Snapshot — round 4); every
+// EXCLUSIVELY (same collision contract as Snapshot  -  round 4); every
 // copied file is FSYNCED (the plain copy is often the ONLY recovery, and
 // it was the one artifact class that was not fsynced); BundleBytes carries
 // the copy's size so callers can decrement their free-space budgets.
@@ -803,7 +803,7 @@ func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
 	}
 	m.Entries, m.EmptyDirs, m.BundleBytes = files, emptyDirs, total
 	// The PARENT is ours to create (round 5: the carve-out's plain copy was
-	// unreachable on a fresh install — the exclusive session Mkdir needs
+	// unreachable on a fresh install  -  the exclusive session Mkdir needs
 	// the quarantine dir to exist and only discard ever created it).
 	if serr := os.MkdirAll(filepath.Dir(sessionDir), 0o755); serr != nil {
 		return nil, fmt.Errorf("quarantine dir: %w", serr)
@@ -924,7 +924,7 @@ func List(stateDir string) []Session {
 }
 
 // PruneResult reports one prune outcome (spec: failures surface with the
-// bundle named, exit 124/125 — never a silent swallow).
+// bundle named, exit 124/125  -  never a silent swallow).
 type PruneResult struct {
 	Dir  string
 	Size int64
@@ -963,8 +963,8 @@ const (
 // Revalidate checks a delta bundle's base(s) against its recorded remote
 // with one ls-remote: every recorded base SHA still advertised =
 // verified-ok; the remote reachable but a base not among its advertised
-// tips = at-risk (likely force-push/squash-merge — recovery through the
-// remote is ending); unreachable remote = unverified (offline/auth — NOT
+// tips = at-risk (likely force-push/squash-merge  -  recovery through the
+// remote is ending); unreachable remote = unverified (offline/auth  -  NOT
 // at-risk). One ls-remote cannot prove ancestry, so "advertised" is the
 // approximation the spec's budget allows (restore itself fetch-then-
 // verifies and never refuses on advancement); self-contained bundles are

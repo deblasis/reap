@@ -1,6 +1,6 @@
 // Package auditlog is reap's write-ahead deletion ledger. The spec's rule:
 // an append failure is a hard abort of apply, because the log IS the
-// recovery story — a deletion that might not be logged is a deletion that
+// recovery story  -  a deletion that might not be logged is a deletion that
 // must not happen. Every apply/discard session opens and closes an envelope
 // with free-space snapshots so doctor can report measured deltas.
 package auditlog
@@ -47,7 +47,7 @@ type Line struct {
 }
 
 // rotationBound: past this the log rotates whole (reap.log.1), envelopes
-// intact — rotation never splits a session's story.
+// intact  -  rotation never splits a session's story.
 const rotationBound = 50 << 20
 
 // Log appends lines under a process-local mutex (cross-process serialization

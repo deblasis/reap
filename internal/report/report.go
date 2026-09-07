@@ -1,7 +1,7 @@
 // Package report renders a scan: the JSON schema that agents consume and
 // the terminal table that humans act on. The table's shape is the design
-// spec's mock — ACTIVE first (nothing to decide), BLOCKED second (the
-// resolution queue IS the product), SAFE last as the payoff — and every
+// spec's mock  -  ACTIVE first (nothing to decide), BLOCKED second (the
+// resolution queue IS the product), SAFE last as the payoff  -  and every
 // BLOCKED row carries a resolve hint, because a queue without verbs is a
 // list.
 package report

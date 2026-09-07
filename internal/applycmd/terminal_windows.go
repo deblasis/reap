@@ -8,8 +8,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// isTerminalFd is a VAR (not a func): the TTY-gated choreography — the
-// carve-out's hardened confirm, --no-quarantine — is otherwise untestable
+// isTerminalFd is a VAR (not a func): the TTY-gated choreography  -  the
+// carve-out's hardened confirm, --no-quarantine  -  is otherwise untestable
 // from `go test`, where stdin/stdout are never consoles and only the
 // non-TTY branch ever executes (the round-5 reliability finding: ~80 lines
 // of the tool's most dangerous surface with zero automated coverage).

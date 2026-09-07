@@ -3,6 +3,7 @@ package jjpaths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,11 +58,19 @@ func TestResolveTable(t *testing.T) {
 		})
 	}
 
-	// A pointer naming the workspace itself (case-variant): root repo, not
-	// a workspace of itself.
-	write(ws)
+	// A pointer naming the workspace itself, with a CASE-VARIANT segment
+	// (the fold compare is EqualFold): root repo, not a workspace of itself.
+	variant := ws
+	if i := strings.LastIndex(filepath.Base(ws), "s"); i >= 0 {
+		b := []byte(filepath.Base(ws))
+		b[i] = 'S'
+		variant = filepath.Join(filepath.Dir(ws), string(b))
+	} else {
+		variant = strings.ToUpper(ws)
+	}
+	write(variant)
 	if l, ok := Resolve(ws); !ok || l.ParentRoot != "" {
-		t.Fatalf("self-pointer must be root shape, got ok=%v %+v", ok, l)
+		t.Fatalf("case-variant self-pointer must be root shape, got ok=%v %+v", ok, l)
 	}
 
 	// Absent marker: ok=false.

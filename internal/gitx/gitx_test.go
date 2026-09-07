@@ -395,7 +395,7 @@ func TestWorktreeNotItsOwnChild(t *testing.T) {
 
 // Verdict-level pin for the unborn row (the engineering seat's third-pass
 // finding): the branch probe failing on an unborn HEAD must NOT shadow the
-// dirty/untracked rows — a fresh-init repo with parked files verdicts
+// dirty/untracked rows  -  a fresh-init repo with parked files verdicts
 // BLOCKED dirty-files end to end, not facts-unavailable.
 func TestUnbornHeadVerdictIsDirtyFiles(t *testing.T) {
 	base := t.TempDir()

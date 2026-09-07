@@ -5,7 +5,7 @@
 // FETCH_HEAD) rather than template exec: op-log templates churn across jj
 // versions, file mtimes do not.
 //
-// jj being missing or failing is Unavailable — never "clean" — and the
+// jj being missing or failing is Unavailable  -  never "clean"  -  and the
 // verdict matrix routes that to ignorance-class MANUAL.
 package jjx
 
@@ -35,8 +35,8 @@ type Facts struct {
 	// Deregistered: the workspace's parent is alive but this working copy
 	// is no longer in its registry (the forget-then-rm crash window): jj
 	// fails with "doesn't have a working-copy commit". Without this flag
-	// the row lands facts-unavailable — the one verdict class with no
-	// deletion path — instead of orphaned-workspace, which the carve-out
+	// the row lands facts-unavailable  -  the one verdict class with no
+	// deletion path  -  instead of orphaned-workspace, which the carve-out
 	// covers.
 	Deregistered bool
 	// UnpushedChanges counts commits in ::@ that no remote bookmark reaches.
@@ -63,7 +63,7 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// any remote bookmark reaches, with EMPTY commits filtered out. The filter
 	// is the whole game: jj keeps a standing (empty) working-copy change, so
 	// without it every jj repo on earth would verdict BLOCKED forever. A dirty
-	// working copy makes @ non-empty and counts — which REQUIRES the snapshot
+	// working copy makes @ non-empty and counts  -  which REQUIRES the snapshot
 	// (--ignore-working-copy would hide unsaved working-copy edits from ::@).
 	// The snapshot rewrites op_heads, i.e. reap's own read freshens the
 	// activity it measures, so the mtimes are captured before and restored
@@ -90,10 +90,10 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 
 	// Children: workspace list prints `<name>: <relative-path> <change-id>...`
 	// (verified 0.44). The path is the first token after ": ", relative to the
-	// parent; the default workspace ("." — the repo itself) is not a child.
+	// parent; the default workspace ("."  -  the repo itself) is not a child.
 	// Children are enumerated ONLY for the DEFAULT workspace (the repo root):
 	// run from a workspace, the list prints the PARENT ROOT for the default
-	// entry (never matching the .jj/repo pointer's REPO-DIR shape — the
+	// entry (never matching the .jj/repo pointer's REPO-DIR shape  -  the
 	// round-7 no-op) and every SIBLING workspace too, none of which are this
 	// dir's children. The shared jjpaths resolver supplies the parent root
 	// in the one shape `workspace list` actually prints.
@@ -136,11 +136,11 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 
 // captureOpHeads records mtimes across everything the push-state snapshot
 // touches and returns a restore func. The panel proved, across three rounds,
-// that the snapshot writes: op_heads, .jj/working_copy/tree_state, and — in
-// colocated repos — git objects and the index under .git. The restore:
+// that the snapshot writes: op_heads, .jj/working_copy/tree_state, and  -  in
+// colocated repos  -  git objects and the index under .git. The restore:
 // (a) resets every pre-existing file to its captured mtime, and (b) clamps
 // files CREATED by the snapshot (mtime newer than the capture instant) to
-// the tree's PRE-SCAN freshest mtime — clamping to the capture instant
+// the tree's PRE-SCAN freshest mtime  -  clamping to the capture instant
 // (round 2) still read as fresh activity to the next walk and flipped dirty
 // jj repos BLOCKED to ACTIVE on every subsequent scan. Residual, documented:
 // file CONTENT the snapshot wrote is real state; only its apparent age is
@@ -195,7 +195,7 @@ func captureOpHeads(dir string) func() {
 }
 
 // PushStateCommits returns the git SHAs of every non-empty commit reachable
-// from the working copy that no remote bookmark reaches — the SAME revset
+// from the working copy that no remote bookmark reaches  -  the SAME revset
 // the jj-unpushed fact counts, so quarantine pins exactly what the verdict
 // was holding. Snapshotting (a dirty @ must be visible) with op-heads mtime
 // restore, exactly like Facts.
@@ -213,7 +213,7 @@ func (r Runner) PushStateCommits(dir string) ([]string, error) {
 }
 
 // GitExport exports jj state to the colocated git backend's refs, making
-// jj-only commits and bookmarks visible to git rev-list/update-ref — the
+// jj-only commits and bookmarks visible to git rev-list/update-ref  -  the
 // precondition for pinning refs/reap/jj-N through the git backend (one
 // namespace rule for everything recoverable).
 func (r Runner) GitExport(dir string) error {

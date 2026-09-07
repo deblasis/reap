@@ -93,7 +93,7 @@ func TestSnapshotCompleteness(t *testing.T) {
 		t.Fatalf("refs/reap pins missing:\n%s", refs)
 	}
 	// The session holds a REAL bundle that verifies and is priced in the
-	// manifest — the pins alone die with the source dir.
+	// manifest  -  the pins alone die with the source dir.
 	bundle := filepath.Join(session, "bundle.git")
 	if fi, err := os.Stat(bundle); err != nil || fi.Size() == 0 {
 		t.Fatalf("bundle.git missing/empty: %v", err)
@@ -199,7 +199,7 @@ func TestListAndPrune(t *testing.T) {
 
 // The pin scheme per the spec: branch tips as unpushed-<branch>, tags as
 // tag-<name>, and REFLOG-ONLY generations as reflog-N (reflogs are never
-// packed by bundles — the reset-away commit must be recoverable by name).
+// packed by bundles  -  the reset-away commit must be recoverable by name).
 func TestSnapshotPinsReflogAndTags(t *testing.T) {
 	base := t.TempDir()
 	repo := filepath.Join(base, "repo")
@@ -432,7 +432,7 @@ func TestSnapshotColocatedJJ(t *testing.T) {
 
 // The round-2 live data-loss probe as a fixture: a repo whose ONLY ref to
 // unpushed work is an ANNOTATED tag. The tag-object SHA never appears in
-// the unpushed commit set, so membership must test the peeled target —
+// the unpushed commit set, so membership must test the peeled target  - 
 // the tagged commit must be recoverable from the bundle by name.
 func TestSnapshotAnnotatedTagOnly(t *testing.T) {
 	base := t.TempDir()
@@ -520,7 +520,7 @@ func TestSnapshotInterleaveFalseQuiet(t *testing.T) {
 }
 
 // RED-FIRST (round 4): a concurrent git's mid-window write IS detected.
-// Deterministic through the readIndexBytes seam — a live race cannot be
+// Deterministic through the readIndexBytes seam  -  a live race cannot be
 // timed reliably, and the round-3 fold's fixture could only assert the
 // quiet side (which is why the dead code survived a panel round).
 func TestSnapshotInterleavedDetected(t *testing.T) {
@@ -540,7 +540,7 @@ func TestSnapshotInterleavedDetected(t *testing.T) {
 	}
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
 
-	// The seam reports an index that DIFFERS from what reap saved — the
+	// The seam reports an index that DIFFERS from what reap saved  -  the
 	// exact shape of a concurrent write landing inside the capture window.
 	orig := readIndexBytes
 	readIndexBytes = func(p string) ([]byte, error) {
@@ -618,7 +618,7 @@ func TestSnapshotSessionExistsRefusal(t *testing.T) {
 }
 
 // Capture-time base revalidation: a base force-pushed away on the remote
-// produces the SELF-CONTAINED form — restorable from the bundle alone.
+// produces the SELF-CONTAINED form  -  restorable from the bundle alone.
 func TestSnapshotBaseGoneSelfContained(t *testing.T) {
 	base := t.TempDir()
 	bare := filepath.Join(base, "up.git")
@@ -676,7 +676,7 @@ func TestSnapshotBaseGoneSelfContained(t *testing.T) {
 }
 
 // The round-4 fresh-install major as a red-first fixture: WritePlainCopy
-// (and Snapshot) create their PARENT quarantine dir — before round 5 the
+// (and Snapshot) create their PARENT quarantine dir  -  before round 5 the
 // exclusive session Mkdir failed against a missing parent on any state
 // dir that had never seen a discard, making apply's carve-out a de-facto
 // no-op on fresh installs.
@@ -709,7 +709,7 @@ func TestPlainCopyFreshStateDir(t *testing.T) {
 
 // The baseAdvertised no-remote inversion (round 4): a repo with a
 // resolvable upstream-tracking ref but NO configured remote must take the
-// SELF-CONTAINED form — the delta's prerequisites would be unfetchable
+// SELF-CONTAINED form  -  the delta's prerequisites would be unfetchable
 // (restore skips the base fetch when Origin is empty).
 func TestSnapshotNoRemoteWithBaseSelfContained(t *testing.T) {
 	base := t.TempDir()
@@ -742,7 +742,7 @@ func TestSnapshotNoRemoteWithBaseSelfContained(t *testing.T) {
 
 // A REFUSED capture on an unborn repo leaves no .git/index behind (the
 // round-4 poison: reset --mixed CREATES one, flipping the dir ACTIVE for
-// 48h — the refusal must leave the dir untouched, literally).
+// 48h  -  the refusal must leave the dir untouched, literally).
 func TestSnapshotUnbornRefusedNoIndexPoison(t *testing.T) {
 	base := t.TempDir()
 	repo := filepath.Join(base, "repo")
@@ -769,7 +769,7 @@ func TestSnapshotUnbornRefusedNoIndexPoison(t *testing.T) {
 }
 
 // The unborn hoist RED-FIRST (round 7): fail AddAll on an unborn repo
-// (locked file) and assert no .git/index survives the ERROR branch — the
+// (locked file) and assert no .git/index survives the ERROR branch  -  the
 // round-5 fixture refused at post-capture pricing, which the old
 // success-tail cleanup already handled, so it could not fail on the bug.
 func TestSnapshotUnbornAddAllFailNoIndex(t *testing.T) {
@@ -842,7 +842,7 @@ func TestRevalidateStates(t *testing.T) {
 }
 
 // Empty dirs are recorded RELATIVE and restore recreates them under the
-// destination (bundle mode — the round-2 absolute-path fold was broken
+// destination (bundle mode  -  the round-2 absolute-path fold was broken
 // exactly here).
 func TestSnapshotEmptyDirsRelative(t *testing.T) {
 	base := t.TempDir()

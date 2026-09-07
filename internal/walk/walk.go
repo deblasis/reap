@@ -39,7 +39,7 @@ type DirInfo struct {
 	// target's facts and reach SAFE on evidence about a different path).
 	IsReparse bool
 	// NestedVCS lists ".git"/".jj" markers found BELOW the root (depth >= 1),
-	// relative to the root — including submodule .git FILES, which porcelain
+	// relative to the root  -  including submodule .git FILES, which porcelain
 	// hides behind ignore=dirty. Presence of any routes the dir MANUAL
 	// nested-repositories in the verdict matrix.
 	NestedVCS []string
@@ -136,7 +136,7 @@ func Entry(root, path string, now time.Time) DirInfo {
 			// to completion before children fire, so a counter cannot span a
 			// subtree. A VCS marker belongs to the candidate itself when it
 			// sits directly under the root (Dir(rel) == ".") and is "nested"
-			// anywhere deeper — that distinction is the whole
+			// anywhere deeper  -  that distinction is the whole
 			// nested-repositories verdict row.
 			if rel, rerr := filepath.Rel(path, p); rerr == nil {
 				name := d.Name()

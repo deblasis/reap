@@ -103,7 +103,7 @@ func TestByReasonTotals(t *testing.T) {
 // reclaimableGB null, sizes "logical", excluded counted not listed.
 func TestJSONShape(t *testing.T) {
 	// min-gb 1: the 1-byte SAFE entry drops from the LISTING (but still
-	// counts in totals) — the spec's report-only floor contract.
+	// counts in totals)  -  the spec's report-only floor contract.
 	r := Build(time.Now(),
 		[]RootSummary{{Path: "C:\\temp", Dirs: 2}},
 		[]Entry{

@@ -250,7 +250,7 @@ func TestCacheRoundTripAndInvalidation(t *testing.T) {
 	}
 
 	// Deep write to an EXISTING file: dir mtime and child count unchanged, so
-	// the cheap keys still hit — which is exactly why the TTL exists. Shrink
+	// the cheap keys still hit  -  which is exactly why the TTL exists. Shrink
 	// the TTL to prove the entry expires rather than trusting forever.
 	writeFile(t, filepath.Join(root, "x"), 4200, now)
 	c.ttl = -1 // force expiry

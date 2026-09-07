@@ -203,7 +203,7 @@ func TestScanJunctionCandidateKeeps(t *testing.T) {
 
 // Missing tool degrades to ignorance, never the "report as bug" fallback:
 // with git absent from PATH, a git repo past the active window must verdict
-// MANUAL facts-unavailable (a fresh repo verdicts ACTIVE first — row 3
+// MANUAL facts-unavailable (a fresh repo verdicts ACTIVE first  -  row 3
 // outranks degradation, which is safe, just not what this test isolates).
 func TestScanGitMissingDegradesToFactsUnavailable(t *testing.T) {
 	root, _ := scanFixture(t)

@@ -35,7 +35,7 @@ type discardWork struct {
 
 // cmdDiscard implements `reap discard PATH...`: BLOCKED resolution with
 // quarantine-then-delete. Eligibility keys on the FULL fact set (any
-// BLOCKED-class fact, regardless of the displayed row — this un-strands
+// BLOCKED-class fact, regardless of the displayed row  -  this un-strands
 // shadowed parents); every other class refuses with a NAMED message (KEEP
 // rails unconditionally; orphaned dirs point at the carve-out; nested-repo
 // dirs name them; MANUAL/ACTIVE point at plan --include/--override-manual;
@@ -92,7 +92,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		paths = append(paths, p)
 	}
 
-	// Wave 0: cheap, deterministic rails (no git) — missing paths, reparse
+	// Wave 0: cheap, deterministic rails (no git)  -  missing paths, reparse
 	// points, holds, protect globs, pure-jj dirs. These need no re-verify.
 	var work []discardWork
 	refused := false // any input-contract refusal (120-class when nothing was deleted)
@@ -208,7 +208,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// Holds and protect globs are RE-READ under the lock: a hold that
 	// landed while the operator sat at the confirm prompt (the lock was
 	// free then, and `reap hold` takes it only briefly) must not be
-	// invisible to re-verify — holds beat every rule and every flag.
+	// invisible to re-verify  -  holds beat every rule and every flag.
 	freshHolds := applycmd.ReadHoldsSnapshot(stateDir)
 	for h := range freshHolds {
 		holdsBool[h] = true
@@ -328,13 +328,18 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			continue
 		}
 		// Eligibility: the FULL fact set, not the displayed row (spec:
-		// shadowed parents — dirty-with-live-children etc. — are eligible;
+		// shadowed parents  -  dirty-with-live-children etc.  -  are eligible;
 		// the parent-live and nested checks below still gate them).
 		if rv.Verdict.BlockedClassFact == "" {
 			if rv.Verdict.Verdict == verdict.Safe {
 				refuse("SAFE; reap plan/apply is the deletion path for this dir", rv.Verdict.Code)
 			} else if rv.Verdict.Verdict == verdict.Active {
 				refuse(fmt.Sprintf("ACTIVE (%s); let it idle past the activity window; discard is the BLOCKED resolver, not the activity override", rv.Verdict.Code), rv.Verdict.Code)
+			} else if isIgnoranceCodeLocal(rv.Verdict.Code) {
+				// Ignorance rows get the fix-the-tool remedy, NOT the
+				// plan/override pointer: both advertised gates refuse them
+				// (the round-9 spec finding  -  dead-gate advertising).
+				refuse(fmt.Sprintf("facts unreadable (%s); fix the tool or rerun scan, then retry when the row is readable", rv.Verdict.Code), rv.Verdict.Code)
 			} else {
 				refuse(fmt.Sprintf("no BLOCKED-class fact (verdict %s: %s); run reap plan --include %s or reap apply --override-manual",
 					rv.Verdict.Verdict, rv.Verdict.Code, rv.Verdict.Code), rv.Verdict.Code)
@@ -352,12 +357,13 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 
 		// The intent line lands HERE (round-6 parity with apply): after
 		// re-verify, so it carries the fresh residue and nested names, and
-		// before ANY mutation — the write-ahead contract is
+		// before ANY mutation  -  the write-ahead contract is
 		// intent-before-DELETION, and the skip/refusal lines above cover
 		// everything that did not get this far.
-		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil}
+		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil,
+			Manifest: walk.CappedManifest(path)}
 		// (No nested residue here: discard structurally REFUSES any dir
-		// with nested repos before this line — the round-6 engineering
+		// with nested repos before this line  -  the round-6 engineering
 		// finding killed the dead branch that claimed parity.)
 		if rc := appendOrAbort(intent); rc >= 0 {
 			return rc
@@ -379,7 +385,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// capture transiently writes roughly the delta twice (staged blobs,
 		// then the bundle) on the volume this tool exists to keep alive.
 		// Non-git paths (the only !GitBackend eligible shape is a split jj
-		// workspace) price against the cap alone — StatusPorcelain is a git
+		// workspace) price against the cap alone  -  StatusPorcelain is a git
 		// probe and would misread them as capture failures.
 		if *noQuarantine {
 			// No quarantine write is coming, but the AUDIT APPEND still
@@ -629,6 +635,17 @@ func isSessionExistsErr(err error) bool {
 func dirExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && fi.IsDir()
+}
+
+// isIgnoranceCodeLocal mirrors applycmd's ignorance set for discard's
+// refusal-copy branching (the codes whose remedy is fix-the-tool, not
+// plan/override pointers that would refuse them too).
+func isIgnoranceCodeLocal(code string) bool {
+	switch code {
+	case "facts-unavailable", "state-unreadable", "remote-stale", "jj-remote-stale", "gh-unavailable", "unknown-kind":
+		return true
+	}
+	return false
 }
 
 func qPtr(s string) *string {
@@ -984,14 +1001,14 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 
 // quarantineRestore is the first-class recovery command, mode-dispatched
 // from the manifest: bundle sessions FETCH THE BASE FIRST (a delta whose
-// base is merely advanced, not gone, still restores — tips-contains was
+// base is merely advanced, not gone, still restores  -  tips-contains was
 // the wrong predicate and refused routine advancement), then the pinned
 // refs and the capture; plain-copy sessions copy the files back. Recovery
 // never deletes or overwrites anything at the destination. Runs under
 // apply.lock: a confirmed prune racing this fetch would delete the
 // session mid-restore.
 func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer) int {
-	// Manual scan (flags may appear before or after the session id —
+	// Manual scan (flags may appear before or after the session id  - 
 	// flag.Parse stops at the first positional).
 	var id, to string
 	asJSON := false
@@ -1072,7 +1089,7 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 	// Delta bundles: FETCH the remote first, then verify each recorded
 	// prerequisite EXISTS in the destination (cat-file -e). The remote's
 	// tips having moved past the base is routine advancement, not a gone
-	// base — refuse only when the object is truly absent, naming the
+	// base  -  refuse only when the object is truly absent, naming the
 	// exact SHAs.
 	var prereqs []string
 	if !m.SelfContained {
@@ -1139,7 +1156,7 @@ func wireInitRestore(_ io.Writer, dir string) {
 }
 
 // execGit runs git for restore under the FETCH BUDGET (round 4: the one
-// unbudgeted exec in the codebase ran while holding apply.lock — a wedged
+// unbudgeted exec in the codebase ran while holding apply.lock  -  a wedged
 // endpoint would hold the global state lock forever).
 func execGit(dir string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

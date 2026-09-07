@@ -2,12 +2,12 @@
 // branch) heads have open PRs authored by this user?
 //
 // Two-phase, pinned against gh 2.83 (where `search prs` exposes NO head-ref
-// fields at all — the field-name test caught this on its first run):
+// fields at all  -  the field-name test caught this on its first run):
 //
 //  1. one `gh search prs --author @me --state open --json repository` call
 //     finds the base repos with open authored PRs (usually a handful);
 //  2. one `gh pr list -R <base> --author @me --state open --json
-//     headRefName,headRepository` per HIT repo only — not per candidate —
+//     headRefName,headRepository` per HIT repo only  -  not per candidate  - 
 //     recovers the head branches.
 //
 // The head slug: pr list's headRepository.nameWithOwner comes back EMPTY in
@@ -16,7 +16,7 @@
 //
 // Failure discipline mirrors gitx/jjx: gh missing, auth-expired, timing out,
 // unparseable, or TRUNCATED at the result limit all mean the fact is
-// unavailable for every dir — never "no open PRs". A silently narrowed PR set
+// unavailable for every dir  -  never "no open PRs". A silently narrowed PR set
 // is exactly the false-SAFE the invariants forbid.
 package ghx
 
@@ -101,7 +101,7 @@ func (c Client) OpenPRHeads() PRHeads {
 	bases := map[string]bool{}
 	for _, r := range rows {
 		// search's repository object populates nameWithOwner (unlike pr
-		// list's headRepository, which leaves it empty — pinned by the live
+		// list's headRepository, which leaves it empty  -  pinned by the live
 		// parse test).
 		if s := SlugFromURL(r.Repository.NameWithOwner); s != "" {
 			bases[s] = true
@@ -114,7 +114,7 @@ func (c Client) OpenPRHeads() PRHeads {
 	// Bounded, parallel fan-out. The spec's budget is "gh is one call"; the
 	// two-phase shape (forced by gh 2.83's search lacking head fields) makes
 	// it 2 + N. Measured on this account, N was 51 and the serial version
-	// alone blew 150s — so the per-base calls run under a small pool with a
+	// alone blew 150s  -  so the per-base calls run under a small pool with a
 	// total wall budget and a base cap; exceeding either degrades the whole
 	// set to Unavailable (truncated semantics) rather than silently
 	// narrowing which PRs are known.
@@ -192,7 +192,7 @@ func (c Client) OpenPRHeads() PRHeads {
 
 // login resolves the authenticated login once (needed to reconstruct fork
 // head slugs); empty on any failure, which degrades those heads to the base
-// slug — a miss, never a false hold.
+// slug  -  a miss, never a false hold.
 func (c Client) login() string {
 	out, why := c.run("api", "user", "--jq", ".login")
 	if why != "" {
@@ -209,7 +209,7 @@ func NewHeads(heads map[string]map[string]bool) PRHeads {
 }
 
 // Holds reports whether (repo slug, branch) has an open authored PR. Always
-// false when the set is unavailable — callers route that case to MANUAL
+// false when the set is unavailable  -  callers route that case to MANUAL
 // gh-unavailable themselves; Holds is only the positive matcher.
 func (p PRHeads) Holds(slug, branch string) bool {
 	if p.heads == nil {

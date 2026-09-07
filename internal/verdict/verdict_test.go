@@ -260,7 +260,7 @@ func TestLineageGroups(t *testing.T) {
 }
 
 // Matrix completeness: every fixture yields exactly one verdict with a
-// non-empty machine code — an undefined fall-through is a spec violation.
+// non-empty machine code  -  an undefined fall-through is a spec violation.
 func TestMatrixCompleteness(t *testing.T) {
 	now := time.Now()
 	inputs := []Input{scratchInput(now), gitInput(now)}

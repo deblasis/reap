@@ -2,7 +2,7 @@
 // pipeline. The spec's choreography, in order: print the plan (naming
 // widened codes and counts), preflight free space (refusing below the
 // floor), require TTY-confirm or --yes (never infer from EOF; 121 when
-// non-interactive without --yes), take apply.lock, then per path —
+// non-interactive without --yes), take apply.lock, then per path  - 
 // re-verify the verdict seconds before deletion at FULL scan strength
 // (same facts, same gh join, fresh walk tripwire, fetch --prune, rename
 // in-use probe), require the fresh verdict to MATCH the planned one, skip
@@ -213,7 +213,7 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// OrderChildrenFirst emits every plan entry in lineage order — children
+// OrderChildrenFirst emits every plan entry in lineage order  -  children
 // before parents, at any depth (a grandchild chain was silently dropped by
 // the two-level version; planned-but-never-emitted is the worst shape a
 // plan can have).
@@ -261,13 +261,13 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 
 // Reverify re-runs the deletion-time checks for one PLANNED path at full
 // strength: fresh facts including the gh join and remote slugs, fresh walk
-// tripwire, fetch --prune, the rename in-use probe, and — the round-1
-// blocker fold — the fresh verdict must MATCH the plan: a SAFE row must
+// tripwire, fetch --prune, the rename in-use probe, and  -  the round-1
+// blocker fold  -  the fresh verdict must MATCH the plan: a SAFE row must
 // re-verdict SAFE (clean-pushed), a widened row must carry the same
 // reasonCode, and any drift (including parent-of-live-children) skips.
 // deletedInRun carries the paths this run has already deleted: a widened
 // parent-of-live-children row whose children all went in this run is the
-// SPEC'S EXPECTED UNLOCK when it re-verdicts SAFE — not drift (round 2:
+// SPEC'S EXPECTED UNLOCK when it re-verdicts SAFE  -  not drift (round 2:
 // the match gate alone made the both-clean family structurally undeletable).
 func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool, planChildren []string) ReverifyResult {
 	now := time.Now()
@@ -278,7 +278,7 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	HealProbingStrays(filepath.Dir(path))
 
 	// FETCH_HEAD mtime capture: the apply-time fetch freshens it, and the
-	// walk reads .git internals as activity — without the restore, every
+	// walk reads .git internals as activity  -  without the restore, every
 	// repo that SURVIVES an apply (skip/abort) verdicts ACTIVE for 48h and
 	// vanishes from subsequent plans (round 2's feedback-loop find). The
 	// marker is resolved through the OWN gitdir AND the common dir (a linked
@@ -323,7 +323,7 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 		// trust of stale refs). A repo with NO remotes skips the fetch
 		// entirely: `git fetch --prune` exits nonzero there, and reading
 		// that as unreadable made every no-remote repo state-unreadable at
-		// deletion time — the discard resolver could never fire on exactly
+		// deletion time  -  the discard resolver could never fire on exactly
 		// the repos it exists for. Nothing to prune, no tracking refs to
 		// stale; the facts below stand on their own. Budget check first:
 		// budget<=0 means fetch disabled, which is NOT an error.
@@ -348,7 +348,20 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	restoreFetchHead()
 	if classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace {
 		f := d.JJ.Facts(path, now, remoteStale)
-		in.JJ = &f
+		// WORKSPACE-shaped only (the parent resolved alive at classify).
+		if f.Deregistered && classInfo.Kind == classify.KindJJWorkspace {
+			// The forget-then-rm shape at RE-VERIFY (round 10): the fresh
+			// classification says jj-workspace (parent alive), but the dir
+			// is out of the parent's registry. Re-verdict as the orphaned
+			// row so a planned orphaned-workspace widening MATCHES and the
+			// carve-out is genuinely executable.
+			classInfo = classify.Info{Kind: classify.KindJJWorkspaceOrphaned}
+			in.Kind = classInfo.Kind
+			in.GitBackend = false
+			in.JJ = nil
+		} else {
+			in.JJ = &f
+		}
 	}
 	v := verdict.Decide(in)
 
@@ -554,9 +567,9 @@ func HealProbingStrays(dir string) {
 }
 
 // Delete removes one path: deregister first (worktree remove FROM THE
-// PARENT — git -C on the doomed worktree makes it git's own cwd, so the
+// PARENT  -  git -C on the doomed worktree makes it git's own cwd, so the
 // remove reliably fails after deregistering, which is how the round-1
-// probe caught it — jj workspace forget must succeed), then rm with
+// probe caught it  -  jj workspace forget must succeed), then rm with
 // contents-before-VCS ordering. The audit lines are written by the CALLER
 // (intent before, result after): the round-1 Delete wrote its own
 // mislabeled line on one branch and ignored its error.
@@ -574,7 +587,7 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 		return "worktree-remove+rm", nil
 	}
 	// WORKSPACES only (round 9): a jj ROOT repo has no workspace to forget
-	// — jj 0.44's forget of a nonexistent name is an exit-0 "Nothing
+	//  -  jj 0.44's forget of a nonexistent name is an exit-0 "Nothing
 	// changed" warning, so running it anyway labeled root deletions
 	// mode=jj-forget+rm, asserting a deregistration that never happened.
 	if classInfo.Kind == classify.KindJJWorkspace && classInfo.ParentRepo != "" {
@@ -593,7 +606,7 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 var errDeregister = errors.New("deregistration failed")
 
 // workspaceName resolves the jj workspace name from the parent's registry
-// (the dir base need not equal the registered name — the round-1 find).
+// (the dir base need not equal the registered name  -  the round-1 find).
 func workspaceName(parent, path string, jr jjx.Runner) string {
 	f := jr.WorkspaceListNames(parent)
 	for name, p := range f {
@@ -605,7 +618,7 @@ func workspaceName(parent, path string, jr jjx.Runner) string {
 }
 
 // removeContentsBeforeVCS deletes everything except the VCS metadata first,
-// then the metadata: a partial failure preserves history and reflog — the
+// then the metadata: a partial failure preserves history and reflog  -  the
 // difference between "lost work" and "an undeletable husk".
 func removeContentsBeforeVCS(path string) error {
 	lp := longPath(path)
@@ -625,7 +638,7 @@ func removeContentsBeforeVCS(path string) error {
 }
 
 // Lock takes apply.lock exclusively; a held lock fails fast naming the
-// holder (PID + runId written into the lock body — the spec asks for
+// holder (PID + runId written into the lock body  -  the spec asks for
 // both). The runId is MINTED BY THE CALLER before locking so the body
 // carries the real run, not "unknown" (the round-2 finding).
 func Lock(stateDir, runID string) (*lockfile.File, error) {
@@ -692,7 +705,7 @@ func ReadHoldsSnapshot(stateDir string) map[string]time.Time {
 }
 
 // WriteHolds is the single writer of holds.json, in the exact shape every
-// reader expects ({canonicalPath: {"expires": RFC3339}}) — the round-1
+// reader expects ({canonicalPath: {"expires": RFC3339}})  -  the round-1
 // blocker was a writer/reader shape mismatch that bricked the tool.
 func WriteHolds(stateDir string, hf map[string]time.Time) error {
 	out := map[string]struct {

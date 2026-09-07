@@ -1,5 +1,5 @@
 // Package jjpaths is the ONE resolver of jj's .jj/repo pointer semantics.
-// classify and jjx both need it and had drifted apart re-implementing it —
+// classify and jjx both need it and had drifted apart re-implementing it  - 
 // the drift is exactly how a round-7 fold shipped as a live no-op (the
 // pointer names the parent's REPO DIR; `jj workspace list` prints the
 // parent ROOT; an exclusion comparing the two never matches).
@@ -50,7 +50,7 @@ func Resolve(dir string) (Layout, bool) {
 	}
 	l := Layout{RepoDir: s}
 	// The parent ROOT: colocated layouts end .jj\repo; split layouts name
-	// a store under .jj\repo\store\... — the owning root is the first
+	// a store under .jj\repo\store\...  -  the owning root is the first
 	// .jj-repo ancestor's parent either way.
 	l.ParentRoot = parentRootOf(s)
 	if strings.EqualFold(filepath.Clean(l.ParentRoot), filepath.Clean(dir)) {
@@ -66,7 +66,7 @@ func parentRootOf(repoDir string) string {
 	if strings.HasSuffix(filepath.ToSlash(clean), "/.jj/repo") {
 		return filepath.FromSlash(strings.TrimSuffix(filepath.ToSlash(clean), "/.jj/repo"))
 	}
-	// Split layout: <root>/.jj/repo/store/git... — walk up to the .jj/repo
+	// Split layout: <root>/.jj/repo/store/git...  -  walk up to the .jj/repo
 	// element.
 	if i := strings.Index(filepath.ToSlash(clean), "/.jj/repo/"); i >= 0 {
 		return filepath.FromSlash(filepath.ToSlash(clean)[:i])

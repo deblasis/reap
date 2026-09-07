@@ -24,7 +24,7 @@ func TestSlugFromURL(t *testing.T) {
 
 // The join: a fork checkout with an upstream remote must match the PR whose
 // head repository is the fork slug (the head branch always lives on origin,
-// fork or not — matching "upstream" only was the round-3 spec bug).
+// fork or not  -  matching "upstream" only was the round-3 spec bug).
 func TestHoldsAnyRemoteSlug(t *testing.T) {
 	p := PRHeads{heads: map[string]map[string]bool{
 		"deblasis/wintty": {"feat/dormant-surfaces": true},
@@ -69,8 +69,8 @@ func TestLiveSearchParses(t *testing.T) {
 	}
 	p := Client{Budget: 15 * time.Second}.OpenPRHeads()
 	// This test pins the SEARCH phase (field names against the installed
-	// gh). Phase-2 degradation on the real account — the fan-out cap, or one
-	// big repo's pr list timing out — is the honest-unavailable contract
+	// gh). Phase-2 degradation on the real account  -  the fan-out cap, or one
+	// big repo's pr list timing out  -  is the honest-unavailable contract
 	// working, not a parse failure. Only search-phase and unparseable
 	// outcomes fail the pin.
 	if p.Unavailable {

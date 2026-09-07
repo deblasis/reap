@@ -96,7 +96,7 @@ func TestWorktreeOrphanedByDeletedBranch(t *testing.T) {
 	// git itself refuses `branch -D` for a checked-out branch, but this
 	// on-disk state is exactly what a squash-merge cleanup or a prune on
 	// another machine leaves behind, so the fixture removes the loose ref
-	// directly — classification must notice, without exec.
+	// directly  -  classification must notice, without exec.
 	if err := os.Remove(filepath.Join(repo, ".git", "refs", "heads", "feature")); err != nil {
 		t.Fatal(err)
 	}
@@ -170,8 +170,8 @@ func TestGitLinkParsing(t *testing.T) {
 // The backendless half of the gating: a .jj pointer with NO .git anywhere
 // classifies as jj with GitBackend=false, so the scan layer never execs git
 // there. (jj 0.44 cannot create real split roots with default flags, so the
-// synthetic shape — the same one classify sees in the wild via split
-// workspace pointers — is the honest fixture.)
+// synthetic shape  -  the same one classify sees in the wild via split
+// workspace pointers  -  is the honest fixture.)
 func TestDirBackendlessGate(t *testing.T) {
 	base := t.TempDir()
 	main := filepath.Join(base, "main")

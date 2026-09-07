@@ -56,7 +56,7 @@ var judgmentClass = map[string]bool{
 }
 
 // IsJudgmentCode reports whether a reasonCode is JUDGMENT-class (operator
-// said no) rather than IGNORANCE-class (the tool could not know) — the
+// said no) rather than IGNORANCE-class (the tool could not know)  -  the
 // widening gate: --include/--override-manual may widen into judgment rows
 // ONLY; overriding unread state is a side door around the cardinal rule.
 func IsJudgmentCode(code string) bool { return judgmentClass[code] }
@@ -311,7 +311,7 @@ func decide(in Input) Verdict {
 	// The clean rows. SAFE requires EVERYTHING clean, per kind applicability:
 	// git facts for git kinds, jj facts for jj kinds, and nothing shadowed.
 	// A scratch dir has no VCS facts at all, so cleanAndPushed must not fire
-	// for it — vacuous cleanliness is not cleanliness (the scratch tiers own
+	// for it  -  vacuous cleanliness is not cleanliness (the scratch tiers own
 	// that decision, from walk-derived activity).
 	if (in.Git != nil || in.JJ != nil) && cleanAndPushed(in) {
 		return v.set(Safe, "clean-pushed", "clean + fully pushed", "reap plan, then reap apply")
@@ -349,7 +349,7 @@ func (v *Verdict) set(verdict, code, reason, hint string) Verdict {
 	v.Hint = hint
 	// Shadow-aware hints: a judgment row that shadows a BLOCKED-class fact
 	// must not advertise the override as if it were unblocked. The orphaned
-	// carve-out is the exception — its BLOCKED facts do NOT gate the
+	// carve-out is the exception  -  its BLOCKED facts do NOT gate the
 	// override (the hardened confirm does), so "resolve that first" would
 	// advertise an ordering the tool will not enforce.
 	if v.BlockedClassFact != "" && v.Verdict == Manual && judgmentClass[code] && hint != "" {

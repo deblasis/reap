@@ -26,8 +26,8 @@ import (
 )
 
 // scanCore is the shared scan/plan/apply pipeline: walk, facts, verdicts.
-// The spec's invariant — plan/apply always run full-strength over the set,
-// same flags as scan — falls out of sharing one implementation.
+// The spec's invariant  -  plan/apply always run full-strength over the set,
+// same flags as scan  -  falls out of sharing one implementation.
 type scanCore struct {
 	cfg             config.Config
 	roots           []string
@@ -185,6 +185,23 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 	jjReachable := cls.Kind == classify.KindJJRepo || cls.Kind == classify.KindJJWorkspace
 	if c.useJJ && jjReachable {
 		f := jr.Facts(info.Path, now, c.remoteStale)
+		if f.Deregistered && cls.Kind == classify.KindJJWorkspace {
+			// The forget-then-rm crash shape, in the SHARED pipeline (round
+			// 10: round 9 wired only the scan display, leaving the carve-out
+			// unreachable here while the hint advertised it). KEEP rails
+			// first, then the orphaned-workspace row.
+			in.Kind = classify.KindJJWorkspaceOrphaned
+			in.GitBackend = false
+			in.JJ = nil
+			in.Held = anyHoldUnder(c.holds, info.Path)
+			in.Protected, _ = config.MatchProtect(info.Path, c.protectExpanded)
+			in.PRHeads = c.prHeads
+			v := verdict.Decide(in)
+			e.Verdict, e.ReasonCode, e.Reason, e.Hint = v.Verdict, v.Code, v.Reason, v.Hint
+			e.Held = in.Held
+			e.OrphanedCarveOut = v.OrphanedCarveOut
+			return e, v, classify.Info{Kind: classify.KindJJWorkspaceOrphaned}, nil
+		}
 		in.JJ = &f
 		if f.Unavailable {
 			e.DowngradedBy = strPtr("jj")
@@ -262,7 +279,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			// The widening gate the spec pins at RESOLUTION time: only
 			// judgment-class MANUALs may widen. Ignorance rows (unread
 			// state, stale remote, tool failure) must refuse HERE with the
-			// side-door copy — advertising them as deletable and skipping
+			// side-door copy  -  advertising them as deletable and skipping
 			// them at re-verify is exactly the "output advertises a gate
 			// the tool will refuse" shape the spec forbids.
 			if !verdict.IsJudgmentCode(c.vd.Code) {
@@ -298,7 +315,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		}
 		if widened && c.vd.BlockedClassFact != "" {
 			// Shadowed BLOCKED facts ride the plan row (spec: residue noted
-			// in the plan row) — the deletion is accepted WITH this overlap.
+			// in the plan row)  -  the deletion is accepted WITH this overlap.
 			pe.Residue = c.vd.BlockedClassFact
 		}
 		if c.vd.Code == "parent-of-live-children" {
@@ -566,7 +583,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	// The refusal pass: a --override-manual path (or --include code) that
 	// matched a candidate but was not taken is a NAMED error carrying the
-	// shadowed fact — never a silent drop that prints "0 directories" and
+	// shadowed fact  -  never a silent drop that prints "0 directories" and
 	// exits 0 (the round-6 spec finding).
 	if dropped := droppedWidenings(cands, include, overrideManual, plan, below, byCode); len(dropped) > 0 {
 		for _, d := range dropped {
@@ -575,7 +592,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitUsage
 	}
 
-	// The dry-run tie: delegate to the exact plan renderer — byte-identical
+	// The dry-run tie: delegate to the exact plan renderer  -  byte-identical
 	// in text AND json (round-1 blocker).
 	if *dryRun {
 		if *asJSON {
@@ -587,7 +604,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 
 	// Preflight floor: a refusal, not a print. Carve-out runs raise the
 	// floor to cap x margin (the spec: a confirmed snapshot is never
-	// replaced by a silent no-snapshot deletion — the quarantine write
+	// replaced by a silent no-snapshot deletion  -  the quarantine write
 	// itself needs the headroom).
 	minFree := uint64(core.cfg.Thresholds.MinFreeMB) << 20
 	if carveOutActive {
@@ -636,7 +653,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 
 	// Exclusive lock for the whole run. The runId is minted FIRST so the
-	// lock body names the real run; holds are RE-READ under the lock — a
+	// lock body names the real run; holds are RE-READ under the lock  -  a
 	// hold that landed while the operator sat at the confirm prompt (the
 	// lock was free then) must reach re-verify: holds beat every flag.
 	runID := auditlog.NewRunID()
@@ -708,11 +725,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		// The intent line lands HERE: after re-verify (so it carries the
 		// fresh residue and, for carve-out rows, the hardened-confirm
-		// record the spec pins) but BEFORE any mutation — the write-ahead
+		// record the spec pins) but BEFORE any mutation  -  the write-ahead
 		// contract is intent-before-DELETION, and the skip lines above
 		// already cover the refusals. Carve-out rows write their intent
 		// AFTER the plain-copy switch so the consent OUTCOME (snapshot
-		// taken vs over-cap accepted) rides the same line — a crash between
+		// taken vs over-cap accepted) rides the same line  -  a crash between
 		// accept and Delete must be distinguishable from a plain-copy run.
 		writeIntent := func(extraResidue string, manifest []byte) int {
 			intent := auditlog.Line{
@@ -736,7 +753,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if !p.Orphaned {
 			// Manifest write-ahead for EVERY non-clean deletion (round 9:
 			// carve-out rows had it; widened scratch/ignored/nested rows
-			// are the same crash-window shape — 'gone is never contents
+			// are the same crash-window shape  -  'gone is never contents
 			// unknown' rides the fsynced ledger, not the post-Delete line).
 			intentManifest := []byte(nil)
 			if p.Code != "clean-pushed" {
@@ -771,7 +788,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				qPtrVal = &session
 				carveMode = "plain-copy"
 				// Multi-orphan accounting (the R5 carryover): each copy
-				// consumes the volume this run preflighted once — recheck
+				// consumes the volume this run preflighted once  -  recheck
 				// the audit floor before the next copy. A stop here is a
 				// proper SKIP line with the taken session's pointer (the
 				// copy exists on disk; the ledger must say where).
@@ -808,7 +825,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					fmt.Fprintln(stdout, "declined")
 					// A decline is a SKIP line (the enum cause: the cap
 					// ended this deletion), visible in the summary and the
-					// exit-2 band — never a silent machine-invisible
+					// exit-2 band  -  never a silent machine-invisible
 					// non-deletion.
 					ok := false
 					if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
@@ -861,7 +878,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
 			// Deregistration failure is a deletion failure (spec's exit
-			// band: 124, path named) — not a skip: skipWhy is the spec's
+			// band: 124, path named)  -  not a skip: skipWhy is the spec's
 			// closed enum and the dir is still standing either way.
 			ok := false
 			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: qPtrVal})
@@ -869,7 +886,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return applycmd.ExitDeleteFail
 		}
 		// The in-run deletion set feeds the both-clean unlock (round-3: the
-		// map existed but was never written — dead wiring).
+		// map existed but was never written  -  dead wiring).
 		deletedInRun[config.Canonical(p.Path)] = true
 		// Full audit enrichment from the fresh facts (round-1: the line
 		// shape's fields were all dead) + capped manifest for non-clean
@@ -928,7 +945,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		summary.FreeGain = freeAfter - freeBefore // saturating: underflow observed live in round 1
 	}
 	// The deletion-set hardlink pass (spec: at plan/apply/discard time),
-	// accumulated as each path is about to be deleted — one identity map
+	// accumulated as each path is about to be deleted  -  one identity map
 	// across the run, logical vs expected-reclaim both surfaced.
 	if !*asJSON {
 		expected := applyReclaim.Expected
@@ -960,7 +977,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 
 // droppedWidenings names every --include code and --override-manual path
 // that MATCHED a candidate but was NOT taken for ELIGIBILITY reasons (KEEP,
-// displayed-BLOCKED, shadowed MANUAL, ignorance) — the spec's refusal shape:
+// displayed-BLOCKED, shadowed MANUAL, ignorance)  -  the spec's refusal shape:
 // a named usage error carrying the shadowed fact, never a silent drop.
 // Rows the resolver DID take but excluded afterwards (below --min-gb,
 // --exclude) are NOT refusals (they are the excluded buckets), and neither
@@ -1002,7 +1019,7 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 			out = append(out, fmt.Sprintf("%s: not override-eligible: %s", c.entry.Path, fact))
 		}
 		// --include of a code that matched this candidate but produced no
-		// planned row: refuse naming the row — INCLUDING the shadowed case
+		// planned row: refuse naming the row  -  INCLUDING the shadowed case
 		// (the displayed code differs from the include code; the BLOCKED
 		// fact still rides this candidate).
 		if inc[c.vd.Code] && !planned[cp] {
