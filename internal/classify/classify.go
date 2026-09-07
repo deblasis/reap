@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/deblasis/reap/internal/jjpaths"
 )
 
 // Kind enumerates what a candidate is. The verdict matrix keys off these;
@@ -111,9 +113,10 @@ func classifyJJWorkspace(path, gitFile string) Info {
 		return Info{Kind: KindJJWorkspace, ParentRepo: parent, GitDirFile: gitFile}
 	}
 	// Fall back to the jj pointer: .jj/repo names the main repo in split
-	// layouts. If neither resolves, orphaned.
-	if p, ok := jjRepoPointer(path); ok && dirExists(p) {
-		return Info{Kind: KindJJWorkspace, ParentRepo: p, GitDirFile: gitFile}
+	// layouts (the PARENT ROOT via jjpaths — the shape jj -R accepts). If
+	// neither resolves, orphaned.
+	if l, ok := jjpaths.Resolve(path); ok && l.ParentRoot != "" && dirExists(l.ParentRoot) {
+		return Info{Kind: KindJJWorkspace, ParentRepo: l.ParentRoot, GitDirFile: gitFile}
 	}
 	return Info{Kind: KindJJWorkspaceOrphaned, GitDirFile: gitFile}
 }
@@ -121,45 +124,20 @@ func classifyJJWorkspace(path, gitFile string) Info {
 // classifyJJStandalone handles .jj without any .git: a pure jj repo (root
 // itself) or a split-layout workspace. Working copies point at the main repo
 // via .jj/repo; a root repo's pointer is absent or self-referential.
+// ParentRepo carries the parent WORKSPACE ROOT (not the repo dir the
+// pointer names verbatim): `jj -R <root>` is the shape every command
+// accepts — pointing at the repo dir made every workspace forget FAIL live
+// (the round-7 engineering major).
 func classifyJJStandalone(path string) Info {
-	p, ok := jjRepoPointer(path)
-	if ok && p != "" {
-		if !dirExists(p) {
+	l, ok := jjpaths.Resolve(path)
+	if ok && l.ParentRoot != "" {
+		if !dirExists(l.ParentRoot) {
 			return Info{Kind: KindJJWorkspaceOrphaned}
 		}
-		return Info{Kind: KindJJWorkspace, ParentRepo: p}
+		return Info{Kind: KindJJWorkspace, ParentRepo: l.ParentRoot}
 	}
 	// No pointer or a root pointer: the dir is the jj repo itself.
 	return Info{Kind: KindJJRepo, ParentRepo: path}
-}
-
-// jjRepoPointer reads .jj/repo (a file containing the main repo path in split
-// layouts, or "." at the root). ok=false when the marker is absent, in which
-// case the dir is the repo root itself. RELATIVE pointer content is resolved
-// against the .jj DIRECTORY, not the workspace root — jj 0.44 writes
-// ../../parent/.jj/repo, which rooted at the workspace lands one directory
-// too shallow and reports every LIVE parent as gone (the round-5 live probe:
-// a whole workspace population verdicted orphaned with a false hint). Both
-// spellings are probed for version tolerance.
-func jjRepoPointer(path string) (string, bool) {
-	raw, err := os.ReadFile(filepath.Join(path, ".jj", "repo"))
-	if err != nil {
-		return "", false
-	}
-	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "." || s == filepath.Clean(path) {
-		return "", true // root repo
-	}
-	if filepath.IsAbs(s) {
-		return s, true
-	}
-	// jj's semantics: relative to the .jj directory.
-	jjRelative := filepath.Join(path, ".jj", s)
-	if dirExists(jjRelative) {
-		return jjRelative, true
-	}
-	// Older/tolerant spelling: relative to the workspace root.
-	return filepath.Join(path, s), true
 }
 
 // readGitLink returns the gitdir target when path/.git is a file (linked

@@ -111,14 +111,23 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// already-parsed dirty/untracked rows carry on and decide below.
 	unborn := false
 	if err := r.unpushed(dir, &f); err != nil {
-		// `rev-parse --verify -q HEAD` exits NONZERO on an unborn HEAD. Only
-		// an exit-status failure means that: a timeout must NOT be read as
-		// "nothing to push" (that would zero unpushed counts on unreadable
-		// evidence — the cardinal rule's edge, flagged two rounds running).
-		if _, uerr := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); uerr != nil && !strings.Contains(uerr.Error(), "timeout") {
+		// `rev-parse --verify -q HEAD` exits NONZERO on an unborn HEAD. The
+		// ONE typed predicate (quiet exit 1, empty stderr) decides unborn;
+		// fatals (corrupt repo) and timeouts are NOT unborn — reading them
+		// as such would zero unpushed counts on unreadable evidence, the
+		// cardinal rule's edge (round-7: Facts kept a second, looser
+		// heuristic long after the typed one landed).
+		if uerr := func() error { _, e := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); return e }(); isQuietUnborn(uerr) {
 			unborn = true
 			f.Unpushed, f.ReflogOnly = 0, 0
+		} else if uerr != nil {
+			f.StateUnreadable = true
+			f.Why = fmt.Sprintf("git rev-list: %v", err)
+			f.Children = fileChildren(dir)
+			return f
 		} else {
+			// The rev-parse probe SUCCEEDED (born HEAD): the unpushed
+			// failure is real unreadable state.
 			f.StateUnreadable = true
 			f.Why = fmt.Sprintf("git rev-list: %v", err)
 			f.Children = fileChildren(dir)
@@ -449,6 +458,16 @@ func (r Runner) revlistDates(dir string, refs ...string) (map[string]time.Time, 
 func fileChildren(dir string) []string {
 	common, ok := gitCommonDir(dir)
 	if !ok {
+		return nil
+	}
+	// Children only for the repo ROOT: a linked worktree's own enumeration
+	// (through the shared common dir) lists every SIBLING worktree of the
+	// repo, and a sibling is not this dir's child — the mirrored wart of
+	// jj's workspace list (the round-7 finding: two worktrees each counted
+	// the other as a live child, wrong-reason MANUAL forever). The common
+	// dir IS the root's .git; a candidate whose own gitdir sits elsewhere
+	// is a worktree, not the root.
+	if g, ok := gitDirFor(dir); !ok || filepath.Clean(g) != filepath.Clean(common) {
 		return nil
 	}
 	wtsDir := filepath.Join(common, "worktrees")

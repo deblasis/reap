@@ -477,9 +477,9 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	}
 	now := time.Now()
 	cands, _ := core.run(now)
-	plan, below, _, err := resolvePlan(cands, include, exclude, nil, *minGB, false)
+	plan, below, byCodeExcl, err := resolvePlan(cands, include, exclude, nil, *minGB, false)
 	if err == nil {
-		if dropped := droppedWidenings(cands, include, nil, plan); len(dropped) > 0 {
+		if dropped := droppedWidenings(cands, include, nil, plan, below, byCodeExcl); len(dropped) > 0 {
 			for _, d := range dropped {
 				fmt.Fprintf(stderr, "reap plan: %s\n", d)
 			}
@@ -568,7 +568,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// matched a candidate but was not taken is a NAMED error carrying the
 	// shadowed fact — never a silent drop that prints "0 directories" and
 	// exits 0 (the round-6 spec finding).
-	if dropped := droppedWidenings(cands, include, overrideManual, plan); len(dropped) > 0 {
+	if dropped := droppedWidenings(cands, include, overrideManual, plan, below, byCode); len(dropped) > 0 {
 		for _, d := range dropped {
 			fmt.Fprintf(stderr, "reap apply: %s\n", d)
 		}
@@ -620,7 +620,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if p.ParentRepo != "" {
 				gitdir = fmt.Sprintf("; stale gitdir: %s", p.ParentRepo)
 			}
-			fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB) — %s%s; a capped plain-copy quarantine is taken first\n",
+			fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB): %s%s; a capped plain-copy quarantine is taken first\n",
 				p.Path, float64(p.SizeBytes)/(1<<30), counts, gitdir)
 		}
 		fmt.Fprint(stdout, "carve-out deletion (recovery = the plain copy only). Type y to confirm: ")
@@ -714,10 +714,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// AFTER the plain-copy switch so the consent OUTCOME (snapshot
 		// taken vs over-cap accepted) rides the same line — a crash between
 		// accept and Delete must be distinguishable from a plain-copy run.
-		writeIntent := func(extraResidue string) int {
+		writeIntent := func(extraResidue string, manifest []byte) int {
 			intent := auditlog.Line{
 				Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
 				Verdict: p.Verdict, ReasonCode: p.Code, Quarantine: nil,
+				Manifest: manifest,
 			}
 			notes := []string{}
 			if rv.Residue != "" {
@@ -733,7 +734,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return appendOrAbort(intent)
 		}
 		if !p.Orphaned {
-			if rc := writeIntent(""); rc >= 0 {
+			if rc := writeIntent("", nil); rc >= 0 {
 				return rc
 			}
 		}
@@ -763,14 +764,21 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				carveMode = "plain-copy"
 				// Multi-orphan accounting (the R5 carryover): each copy
 				// consumes the volume this run preflighted once — recheck
-				// the audit floor before the next copy.
+				// the audit floor before the next copy. A stop here is a
+				// proper SKIP line with the taken session's pointer (the
+				// copy exists on disk; the ledger must say where).
 				if freeNow := auditlog.FreeBytes(stateDir); freeNow < minFree {
 					fmt.Fprintf(stderr, "reap apply: free space fell below the floor mid-run (%d MB); stopping\n", freeNow>>20)
 					ok := false
-					if rc := appendOrAbort(auditlog.Line{Event: "result", Path: p.Path, OK: &ok, Quarantine: nil,
-						Residue: "carve-out stopped: free space below floor after the plain copy"}); rc >= 0 {
+					if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
+						SkipWhy: applycmd.SkipSnapshotOvercap, OK: &ok, Quarantine: &session,
+						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code,
+					}); rc >= 0 {
 						return rc
 					}
+					summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
+						Path: p.Path, Why: applycmd.SkipSnapshotOvercap, Note: "free space below floor after the plain copy (session kept)"})
+					summary.SkippedBytes += p.SizeBytes
 					carveOutFailed = true
 					continue
 				}
@@ -809,7 +817,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				// it authorizes (write-ahead: a crash after Delete must be
 				// distinguishable from a deleted-with-snapshot run).
 				if rc := appendOrAbort(auditlog.Line{Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
-					Verdict: p.Verdict, ReasonCode: p.Code,
+					Verdict: p.Verdict, ReasonCode: p.Code, Manifest: rv.Manifest,
 					Residue: "hardened confirm shown; over-cap consent accepted: recovery is the file manifest only"}); rc >= 0 {
 					return rc
 				}
@@ -835,7 +843,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if counts == "" {
 				counts = "counts unknowable, parent gone"
 			}
-			if rc := writeIntent("hardened confirm shown (counts: " + counts + "); plain copy taken"); rc >= 0 {
+			if rc := writeIntent("hardened confirm shown (counts: "+counts+"); plain copy taken", rv.Manifest); rc >= 0 {
 				return rc
 			}
 		}
@@ -941,27 +949,27 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	return applycmd.ExitOK
 }
 
-// nonEmptyNotes joins present notes, skipping empties.
-func nonEmptyNotes(notes ...string) []string {
-	var out []string
-	for _, n := range notes {
-		if n != "" {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
 // droppedWidenings names every --include code and --override-manual path
-// that MATCHED a candidate but was NOT taken (KEEP, displayed-BLOCKED,
-// shadowed MANUAL, ignorance) — the spec's refusal shape: a named usage
-// error carrying the shadowed fact, never a silent drop from the plan.
-func droppedWidenings(cands []candidate, include, overrideManual []string, plan []applycmd.PlanEntry) []string {
+// that MATCHED a candidate but was NOT taken for ELIGIBILITY reasons (KEEP,
+// displayed-BLOCKED, shadowed MANUAL, ignorance) — the spec's refusal shape:
+// a named usage error carrying the shadowed fact, never a silent drop.
+// Rows the resolver DID take but excluded afterwards (below --min-gb,
+// --exclude) are NOT refusals (they are the excluded buckets), and neither
+// are SAFE rows given as override paths (already deletable, nothing widened
+// was needed).
+func droppedWidenings(cands []candidate, include, overrideManual []string, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string) []string {
 	planned := map[string]bool{}
 	plannedCodes := map[string]bool{}
 	for _, p := range plan {
 		planned[config.Canonical(p.Path)] = true
 		plannedCodes[p.Code] = true
+	}
+	excluded := map[string]bool{}
+	for _, b := range below {
+		excluded[config.Canonical(b.Path)] = true
+	}
+	for _, p := range excludedByCode {
+		excluded[config.Canonical(p)] = true
 	}
 	inc := map[string]bool{}
 	for _, c := range include {
@@ -974,14 +982,21 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 	var out []string
 	for _, c := range cands {
 		cp := config.Canonical(c.entry.Path)
+		if excluded[cp] {
+			continue // the excluded buckets are not refusals
+		}
 		fact := string(c.vd.Verdict) + "/" + c.vd.Code
 		if c.vd.BlockedClassFact != "" {
 			fact += " (shadowed fact: " + c.vd.BlockedClassFact + ")"
 		}
-		if ovr[cp] && !planned[cp] {
+		if ovr[cp] && !planned[cp] && c.vd.Verdict != verdict.Safe {
 			out = append(out, fmt.Sprintf("%s: not override-eligible: %s", c.entry.Path, fact))
 		}
-		if inc[c.vd.Code] && !plannedCodes[c.vd.Code] && !planned[cp] {
+		// --include of a code that matched this candidate but produced no
+		// planned row: refuse naming the row — INCLUDING the shadowed case
+		// (the displayed code differs from the include code; the BLOCKED
+		// fact still rides this candidate).
+		if inc[c.vd.Code] && !planned[cp] {
 			out = append(out, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, c.vd.Code, fact))
 		}
 	}

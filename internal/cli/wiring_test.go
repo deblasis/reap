@@ -894,6 +894,20 @@ func TestWiringCarveOutTTYFlows(t *testing.T) {
 	if code := cmdApply([]string{"--no-gh", "--override-manual", wt3}, os.Stdout, os.Stderr, answerFile(t, "y\ny\ny\n")); code != ExitOK {
 		t.Fatalf("TTY over-cap accept: %d", code)
 	}
+	// Never a silent absence, BOTH directions pinned: the accept carries
+	// mode=plain-copy-skipped-overcap + the consent residue on the ledger,
+	// and no quarantine session exists for it.
+	accLedger, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(accLedger), `"mode":"plain-copy-skipped-overcap"`) {
+		t.Fatalf("over-cap accept ledger mode missing:\n%s", accLedger)
+	}
+	if !strings.Contains(string(accLedger), "over-cap consent accepted") {
+		t.Fatalf("over-cap consent intent line missing:\n%s", accLedger)
+	}
+	sessionsAfter, _ := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if len(sessionsAfter) > 1 { // the under-cap accept's one session only
+		t.Fatalf("over-cap accept must not create a session: %d", len(sessionsAfter))
+	}
 	if _, err := os.Stat(wt3); !os.IsNotExist(err) {
 		t.Fatal("over-cap-accepted dir survived three confirms")
 	}

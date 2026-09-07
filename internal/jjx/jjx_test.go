@@ -1,6 +1,7 @@
 package jjx
 
 import (
+	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
 	"os"
 	"os/exec"
@@ -57,6 +58,67 @@ func colocate(t *testing.T, dir string) {
 		t.Skipf("jj git init %s: %v\n%s", spelling[0], err, out)
 	}
 	t.Fatal("jj git init: no supported spelling")
+}
+
+// The round-7/8 children semantics, pinned from the WORKSPACE side: a
+// workspace enumerates NO children (its parent is the default workspace's
+// ROOT — never its child; siblings belong to the parent's row, not this
+// one). The round-7 fold shipped as a no-op because the exclusion compared
+// the pointer's REPO-DIR shape against list's ROOT shape.
+func TestWorkspaceFromWorkspaceSideHasNoChildren(t *testing.T) {
+	needJJ(t)
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	ws1 := filepath.Join(base, "ws1")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws1).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	ws2 := filepath.Join(base, "ws2")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws2).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add 2: %v\n%s", err, out)
+	}
+	r := Runner{Budget: 60 * time.Second}
+	// From a workspace: no children at all (neither the parent nor the
+	// sibling — both belong to the PARENT's row).
+	f := r.Facts(ws1, time.Now(), 48*time.Hour)
+	if len(f.Children) != 0 {
+		t.Fatalf("workspace rows its own children: %v", f.Children)
+	}
+	// From the parent: both workspaces are children.
+	fp := r.Facts(parent, time.Now(), 48*time.Hour)
+	if len(fp.Children) != 2 {
+		t.Fatalf("parent must keep both workspaces as children: %v", fp.Children)
+	}
+}
+
+// The parent ROOT (not the .jj/repo dir) is what classify carries: `jj -R
+// <root> workspace forget` is the shape jj accepts — pointing at the repo
+// dir failed live ("no jj repo in ...").
+func TestWorkspaceParentIsRootShape(t *testing.T) {
+	needJJ(t)
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	ws := filepath.Join(base, "ws")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	info := classify.Dir(ws)
+	if info.Kind != classify.KindJJWorkspace {
+		t.Fatalf("kind: %s", info.Kind)
+	}
+	if info.ParentRepo == "" || strings.HasSuffix(filepath.ToSlash(info.ParentRepo), ".jj/repo") {
+		t.Fatalf("ParentRepo must be the ROOT shape, got %q", info.ParentRepo)
+	}
+	// The shape jj accepts, live.
+	if out, err := exec.Command("jj", "-R", info.ParentRepo, "workspace", "list").CombinedOutput(); err != nil {
+		t.Fatalf("jj -R %s (root shape) must work: %v\n%s", info.ParentRepo, err, out)
+	}
 }
 
 func TestUnpushedAndPushedStates(t *testing.T) {

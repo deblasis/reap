@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/jjpaths"
 )
 
 // Runner executes jj with a budget.
@@ -75,42 +76,41 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// Children: workspace list prints `<name>: <relative-path> <change-id>...`
 	// (verified 0.44). The path is the first token after ": ", relative to the
 	// parent; the default workspace ("." — the repo itself) is not a child.
-	// CRITICAL when run FROM a workspace: the default workspace's path then
-	// resolves to the PARENT, which passes the plain self-filter and would
-	// make every live workspace's only "child" its own immortal parent —
-	// parent-of-live-children forever, advertising a gate re-verify can
-	// never execute (the round-6 engineering finding). The pointer target
-	// (the repo this workspace BELONGS to) is excluded alongside dir.
-	pointerTarget := jjRepoPointerPath(dir)
-	if out, err := r.run(dir, "workspace", "list"); err == nil {
-		for _, line := range nonEmpty(out) {
-			i := strings.Index(line, ": ")
-			if i < 0 {
-				continue
+	// Children are enumerated ONLY for the DEFAULT workspace (the repo root):
+	// run from a workspace, the list prints the PARENT ROOT for the default
+	// entry (never matching the .jj/repo pointer's REPO-DIR shape — the
+	// round-7 no-op) and every SIBLING workspace too, none of which are this
+	// dir's children. The shared jjpaths resolver supplies the parent root
+	// in the one shape `workspace list` actually prints.
+	layout, _ := jjpaths.Resolve(dir)
+	if layout.ParentRoot == "" {
+		if out, err := r.run(dir, "workspace", "list"); err == nil {
+			for _, line := range nonEmpty(out) {
+				i := strings.Index(line, ": ")
+				if i < 0 {
+					continue
+				}
+				fields := strings.Fields(line[i+2:])
+				if len(fields) == 0 {
+					continue
+				}
+				rel := fields[0]
+				if rel == "." || rel == "(deleted)" {
+					continue
+				}
+				p := rel
+				if !filepath.IsAbs(p) {
+					p = filepath.Join(dir, p)
+				}
+				p = filepath.Clean(p)
+				// The default workspace is the repo itself: "." when jj runs
+				// from inside, an absolute path when invoked via -R. Either
+				// way it is the parent, not a child.
+				if config.Canonical(p) == config.Canonical(dir) {
+					continue
+				}
+				f.Children = append(f.Children, p)
 			}
-			fields := strings.Fields(line[i+2:])
-			if len(fields) == 0 {
-				continue
-			}
-			rel := fields[0]
-			if rel == "." || rel == "(deleted)" {
-				continue
-			}
-			p := rel
-			if !filepath.IsAbs(p) {
-				p = filepath.Join(dir, p)
-			}
-			p = filepath.Clean(p)
-			// The default workspace is the repo itself: "." when jj runs from
-			// inside, an absolute path when invoked via -R. Either way it is
-			// the parent, not a child.
-			if config.Canonical(p) == config.Canonical(dir) {
-				continue
-			}
-			if pointerTarget != "" && config.Canonical(p) == config.Canonical(pointerTarget) {
-				continue // this workspace's own parent: not its child
-			}
-			f.Children = append(f.Children, p)
 		}
 	}
 
