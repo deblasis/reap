@@ -11,6 +11,7 @@ import (
 
 	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/ghx"
+	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
@@ -57,13 +58,39 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// Quarantine readout.
+	// Quarantine readout, with per-bundle revalidation states (one ls-remote
+	// per DELTA bundle: verified-ok / at-risk / unverified, never conflated).
+	gr := gitx.Runner{GitBudget: 15 * time.Second, FetchBudget: 15 * time.Second}
 	qTotal, qOldest := quarantineStats(stateDir)
 	fmt.Fprintf(stdout, "quarantine: %d MB across sessions, oldest %dd\n", qTotal>>20, qOldest)
+	states := map[string]int{"verified-ok": 0, "at-risk": 0, "unverified": 0}
+	for _, s := range quarantine.List(stateDir) {
+		if s.Manifest == nil {
+			states["unverified"]++
+			continue
+		}
+		states[string(quarantine.Revalidate(gr, s.Manifest))]++
+	}
+	fmt.Fprintf(stdout, "quarantine revalidation: %d verified-ok, %d at-risk, %d unverified\n",
+		states["verified-ok"], states["at-risk"], states["unverified"])
 
-	// Ledger.
+	// Ledger: size, rotation state, covered span, free-space deltas since
+	// the last apply (from audit envelopes), and downgraded-dirs counts.
 	ledger := ledgerStats(stateDir)
-	fmt.Fprintf(stdout, "reap.log: %d KB, %d line(s), spans %s\n", ledger.bytes>>10, ledger.lines, ledger.span)
+	rot := "active only"
+	if ledger.rotations > 0 {
+		rot = fmt.Sprintf("active + %d rotation(s)", ledger.rotations)
+	}
+	fmt.Fprintf(stdout, "reap.log: %d KB, %d line(s), %s, spans %s\n", ledger.bytes>>10, ledger.lines, rot, ledger.span)
+	if ledger.freeDelta != nil {
+		d := *ledger.freeDelta
+		sign := "+"
+		if d < 0 {
+			sign = ""
+		}
+		fmt.Fprintf(stdout, "free-space delta since last apply: %s%d MB (from envelopes)\n", sign, d>>20)
+	}
+	fmt.Fprintf(stdout, "dirs downgraded by gh/jj unavailability (last logged run): %d\n", ledger.downgraded)
 
 	// Tool health.
 	ghInstalled, ghAuthed := ghx.Client{Budget: 15 * time.Second}.AuthStatus()
@@ -82,43 +109,65 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "jj: not on PATH (jj facts degrade to facts-unavailable)\n")
 	}
 
-	// Stray healing.
-	healed := 0
-	for _, r := range config.ExpandRoots(cfg.Roots) {
-		entries, derr := os.ReadDir(r)
-		if derr != nil {
-			continue
-		}
-		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".reap-probing") {
-				stray := filepath.Join(r, e.Name())
-				orig := filepath.Join(r, strings.TrimSuffix(e.Name(), ".reap-probing"))
-				if _, oerr := os.Stat(orig); os.IsNotExist(oerr) {
-					if os.Rename(stray, orig) == nil {
-						healed++
+	// Stray healing UNDER apply.lock (spec: heal under the lock or skip
+	// while it is held — a lockless heal can race a live probe's
+	// millisecond rename window and strand a dir that was fine).
+	if healLock, hlerr := lockfile.Open(lockPath); hlerr == nil {
+		free, _ := healLock.TryLock()
+		healLock.Close()
+		if !free {
+			fmt.Fprintf(stdout, "stray healing: SKIPPED (apply.lock held by a running apply/discard/prune)\n")
+		} else {
+			healed := 0
+			parked := 0
+			for _, r := range config.ExpandRoots(cfg.Roots) {
+				entries, derr := os.ReadDir(r)
+				if derr != nil {
+					continue
+				}
+				for _, e := range entries {
+					if !strings.HasSuffix(e.Name(), ".reap-probing") {
+						continue
 					}
-				} else {
-					parked := stray + ".reap-orphaned-" + time.Now().Format("150405")
-					if os.Rename(stray, parked) == nil {
-						healed++
+					stray := filepath.Join(r, e.Name())
+					orig := filepath.Join(r, strings.TrimSuffix(e.Name(), ".reap-probing"))
+					if _, oerr := os.Stat(orig); os.IsNotExist(oerr) {
+						if os.Rename(stray, orig) == nil {
+							healed++
+						}
+					} else {
+						dest := stray + ".reap-orphaned-" + time.Now().Format("150405")
+						if os.Rename(stray, dest) == nil {
+							parked++
+						}
 					}
 				}
 			}
+			fmt.Fprintf(stdout, "stray .reap-probing dirs healed: %d, parked as .reap-orphaned: %d (restore by renaming back)\n", healed, parked)
 		}
 	}
-	fmt.Fprintf(stdout, "stray .reap-probing dirs healed: %d\n", healed)
-	fmt.Fprintf(stdout, "downgraded dirs last scan: (see reap log envelope lines)\n")
 
-	// Aged index.lock listing.
+	// Per-candidate residue: stranded refs/reap/* pins (a crashed discard
+	// leaves them; they hold objects alive and pollute unpushed counts),
+	// .reap-backup index pairs (an interrupted capture), and aged
+	// index.lock files (the git-busy skip's remedy).
 	for _, r := range config.ExpandRoots(cfg.Roots) {
 		entries, derr := os.ReadDir(r)
 		if derr != nil {
 			continue
 		}
 		for _, e := range entries {
+			cand := filepath.Join(r, e.Name())
+			if out, gerr := gr.ForEachReapRef(cand); gerr == nil && len(out) > 0 {
+				fmt.Fprintf(stdout, "stranded refs/reap/* in %s: %d ref(s); reclaim with: git -C %s update-ref -d <ref> && git -C %s gc --prune=now\n",
+					cand, len(out), cand, cand)
+			}
 			g := filepath.Join(r, e.Name(), ".git", "index.lock")
 			if fi, gerr := os.Stat(g); gerr == nil && time.Since(fi.ModTime()) > time.Hour {
 				fmt.Fprintf(stdout, "aged index.lock: %s (%.0fh old; delete if no git is running)\n", g, time.Since(fi.ModTime()).Hours())
+			}
+			if _, gerr := os.Stat(filepath.Join(r, e.Name(), ".git", "index.reap-backup")); gerr == nil {
+				fmt.Fprintf(stdout, "interrupted capture in %s: .git/index.reap-backup present; if everything is staged, unstage with: git -C %s reset\n", cand, cand)
 			}
 		}
 	}
@@ -139,21 +188,35 @@ func quarantineStats(stateDir string) (total int64, oldestDays int) {
 }
 
 type ledgerInfo struct {
-	bytes int64
-	lines int
-	span  string
+	bytes      int64
+	lines      int
+	rotations  int
+	span       string
+	freeDelta  *int64
+	downgraded int
 }
 
 func ledgerStats(stateDir string) ledgerInfo {
 	var li ledgerInfo
 	newest, oldest := time.Time{}, time.Time{}
-	files := []string{filepath.Join(stateDir, "reap.log")}
-	for i := 1; i <= 5; i++ {
+	// Oldest rotations first so envelopes parse in time order across the
+	// rotation boundary.
+	var files []string
+	for i := 5; i >= 1; i-- {
 		p := filepath.Join(stateDir, fmt.Sprintf("reap.log.%d", i))
 		if _, err := os.Stat(p); err == nil {
 			files = append(files, p)
+			li.rotations++
 		}
 	}
+	files = append(files, filepath.Join(stateDir, "reap.log"))
+
+	type envelope struct {
+		runID string
+		after uint64
+	}
+	var envelopes []envelope
+	var lastRunLines []map[string]any
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
@@ -165,21 +228,47 @@ func ledgerStats(stateDir string) ledgerInfo {
 				continue
 			}
 			li.lines++
-			var probe struct {
-				TS string `json:"ts"`
+			var row map[string]any
+			if json.Unmarshal([]byte(line), &row) != nil {
+				continue
 			}
-			if json.Unmarshal([]byte(line), &probe) == nil {
-				if ts, perr := time.Parse(time.RFC3339Nano, probe.TS); perr == nil {
-					if oldest.IsZero() || ts.Before(oldest) {
-						oldest = ts
+			if ts, ok := row["ts"].(string); ok {
+				if t, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
+					if oldest.IsZero() || t.Before(oldest) {
+						oldest = t
 					}
-					if newest.IsZero() || ts.After(newest) {
-						newest = ts
+					if newest.IsZero() || t.After(newest) {
+						newest = t
 					}
 				}
 			}
+			if row["event"] == "envelope" {
+				after, _ := row["freeBytesAfter"].(float64)
+				runID, _ := row["runId"].(string)
+				envelopes = append(envelopes, envelope{runID: runID, after: uint64(after)})
+				lastRunLines = nil // a new run closes the window
+				continue
+			}
+			lastRunLines = append(lastRunLines, row)
 		}
 	}
+	if len(envelopes) >= 2 {
+		delta := int64(envelopes[len(envelopes)-1].after) - int64(envelopes[len(envelopes)-2].after)
+		li.freeDelta = &delta
+	}
+	// Downgraded = distinct paths in the LAST logged run carrying an
+	// ignorance-class reasonCode (gh/jj/git unavailability).
+	downgraded := map[string]bool{}
+	for _, row := range lastRunLines {
+		code, _ := row["reasonCode"].(string)
+		switch code {
+		case "gh-unavailable", "jj-remote-stale", "facts-unavailable", "state-unreadable", "remote-stale":
+			if p, ok := row["path"].(string); ok {
+				downgraded[p] = true
+			}
+		}
+	}
+	li.downgraded = len(downgraded)
 	if !oldest.IsZero() && !newest.IsZero() {
 		li.span = fmt.Sprintf("%s to %s", oldest.Format("2006-01-02"), newest.Format("2006-01-02"))
 	} else {

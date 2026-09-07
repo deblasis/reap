@@ -16,6 +16,7 @@ import (
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/jjx"
+	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/report"
 	"github.com/deblasis/reap/internal/verdict"
 	"github.com/deblasis/reap/internal/walk"
@@ -188,7 +189,34 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "reap scan: unreadable root skipped: %s\n", u)
 	}
 	rep.Table(stdout)
+	// The quarantine footer (spec presentation): sessions hold recoverable
+	// bytes and expire by retention, so every scan that shows deletable
+	// bytes also shows what is being kept back and how to release it.
+	if sessions := quarantine.List(stateDirOfScan()); len(sessions) > 0 {
+		var total int64
+		oldest := 0
+		for _, s := range sessions {
+			total += quarantine.Bytes(s.Dir)
+			if fi, err := os.Stat(s.Dir); err == nil {
+				if d := int(time.Since(fi.ModTime()).Hours() / 24); d > oldest {
+					oldest = d
+				}
+			}
+		}
+		fmt.Fprintf(stdout, "quarantine holds %d MB, oldest %dd (reap quarantine prune)\n", total>>20, oldest)
+	}
 	return ExitOK
+}
+
+// stateDirOfScan resolves the state dir for the scan-side quarantine
+// footer (the command already resolved it once for holds; this stays a
+// cheap re-read).
+func stateDirOfScan() string {
+	d, err := config.StateDir()
+	if err != nil {
+		return ""
+	}
+	return d
 }
 
 func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool, expiredHolds map[string]time.Time,

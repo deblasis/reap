@@ -562,16 +562,20 @@ func Available() bool {
 	return err == nil
 }
 
-// StatusSummary is the porcelain digest the quarantine manifest consumes.
+// StatusSummary is the porcelain digest the quarantine manifest and the
+// free-space preflight consume.
 type StatusSummary struct {
 	Dirty          int
+	DirtyBytes     int64
 	Untracked      int
 	UntrackedBytes int64
 	Ignored        int
 	IgnoredBytes   int64
 }
 
-// StatusPorcelain returns the three-way split with untracked/ignored bytes.
+// StatusPorcelain returns the three-way split with per-class bytes. Dirty
+// bytes are the full on-disk size of each modified file (an over-estimate
+// of the staged delta — the safe direction for a free-space floor).
 func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
 	var s StatusSummary
 	out, err := r.run(dir, r.GitBudget, "status", "--porcelain", "--ignored")
@@ -595,19 +599,37 @@ func (r Runner) StatusPorcelain(dir string) (StatusSummary, error) {
 			s.UntrackedBytes += entrySize(dir, p, time.Now())
 		default:
 			s.Dirty++
+			s.DirtyBytes += entrySize(dir, p, time.Now())
 		}
 	}
 	return s, nil
 }
 
-// AddAll stages the entire working tree (quarantine capture step 1). The
-// caller restores the index afterwards via RestoreBackup/ResetIndex. The
-// .jj marker is excluded: -f force-adds ignored paths too, and .jj holds
-// colocated-repo internals (a /* gitignore) that would bloat every capture
-// of a jj repo with bookkeeping the working tree never owned.
+// AddAll stages the entire working tree (quarantine capture step 1): the
+// spec's pinned `git add -A -f .`, no exclusions — .jj is force-staged too
+// (documented residue: op log / change-id mapping), because the capture
+// must hold everything the working tree holds. The caller restores the
+// index afterwards via RestoreBackup/ResetIndex.
 func (r Runner) AddAll(dir string) error {
-	_, err := r.run(dir, r.GitBudget, "add", "-A", "-f", ".", ":(exclude).jj")
+	_, err := r.run(dir, r.GitBudget, "add", "-A", "-f", ".")
 	return err
+}
+
+// IndexLocked reports whether an index.lock exists in the worktree's own
+// gitdir or the common dir (capture-start git-busy check; Facts checks the
+// same files before any exec).
+func (r Runner) IndexLocked(dir string) bool {
+	if gi, ok := gitDirFor(dir); ok {
+		if _, err := os.Stat(filepath.Join(gi, "index.lock")); err == nil {
+			return true
+		}
+	}
+	if common, ok := gitCommonDir(dir); ok {
+		if _, err := os.Stat(filepath.Join(common, "index.lock")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // ResetIndex restores the index to HEAD after capture plumbing.
@@ -671,8 +693,12 @@ func (r Runner) LocalOnlyTips(dir string) ([]LocalOnlyTip, error) {
 }
 
 // StashRefs returns every stash generation's SHA (oldest first; reflog-only
-// objects a bare bundle would not carry).
+// objects a bare bundle would not carry). A stash-less repo is NOT an
+// error: rev-list -g fails on a missing ref, so existence is probed first.
 func (r Runner) StashRefs(dir string) ([]string, error) {
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "refs/stash"); err != nil || strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
 	out, err := r.run(dir, r.GitBudget, "rev-list", "-g", "refs/stash")
 	if err != nil {
 		return nil, err
@@ -680,12 +706,14 @@ func (r Runner) StashRefs(dir string) ([]string, error) {
 	return nonEmpty(out), nil
 }
 
-// RemoteReachable returns the set of commits reachable from remote-tracking
-// refs (one rev-list). pinTips uses it to skip tips that are fully pushed;
-// on error the caller pins EVERYTHING — the safe direction (a bigger bundle
-// never loses content, an under-filled one does).
-func (r Runner) RemoteReachable(dir string) map[string]bool {
-	out, err := r.run(dir, r.GitBudget, "rev-list", "--remotes")
+// UnpushedCommits returns the branch/tag/HEAD-reachable local-only commit
+// set (one bounded rev-list — the same decomposition Facts runs, not a full
+// --remotes enumeration, which materializes every remote-reachable SHA).
+// pinTips marks a tip for pinning iff its SHA is in this set: a tip outside
+// it is fully remote-reachable and recoverable by re-cloning.
+func (r Runner) UnpushedCommits(dir string) map[string]bool {
+	args := []string{"rev-list", "--exclude=refs/jj/*", "--branches", "--tags", "HEAD", "--not", "--remotes"}
+	out, err := r.run(dir, r.GitBudget, args...)
 	if err != nil {
 		return nil
 	}
@@ -696,17 +724,80 @@ func (r Runner) RemoteReachable(dir string) map[string]bool {
 	return m
 }
 
-// BundleCreate writes a delta bundle carrying every commit reachable from
-// refs but not from any remote-tracking ref, with refs as the bundle's ref
-// table (recoverable by name). Argument order matters exactly as in the
-// unpushed decomposition: positive refs FIRST, then "--not --remotes" —
-// --not negates everything after it, so the reverse order would exclude the
-// pins themselves and mint an empty bundle that still verifies.
-func (r Runner) BundleCreate(dir, dst string, refs []string) error {
-	args := append([]string{"bundle", "create", dst}, refs...)
-	args = append(args, "--not", "--remotes")
+// ReflogOnlyCommits returns commits reachable only via reflog entries
+// (post-reset / pre-rebase generations): the entire unpushed-reflog BLOCKED
+// class. These die with the repo unless pinned — reflogs are never packed
+// by bundles — so quarantine pins every one as refs/reap/reflog-N.
+func (r Runner) ReflogOnlyCommits(dir string) []string {
+	args := []string{"rev-list", "--exclude=refs/jj/*", "--reflog", "HEAD", "--not", "--branches", "--tags", "--remotes"}
+	out, err := r.run(dir, r.GitBudget, args...)
+	if err != nil {
+		return nil
+	}
+	return nonEmpty(out)
+}
+
+// UpstreamRef resolves the current branch's upstream-tracking ref (empty
+// when none). Base selection's first choice.
+func (r Runner) UpstreamRef(dir string) string {
+	out, err := r.run(dir, r.GitBudget, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(firstLine(out))
+}
+
+// ResolveRef returns the SHA a ref points at ("" when unresolvable): used
+// to prove a candidate base exists before pricing ranges against it.
+func (r Runner) ResolveRef(dir, ref string) string {
+	out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", ref)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(firstLine(out))
+}
+
+// BranchUpstreams maps each local branch to its upstream ref when one is
+// configured (the per-branch base union fallback).
+func (r Runner) BranchUpstreams(dir string) map[string]string {
+	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname:short) %(upstream)", "refs/heads")
+	if err != nil {
+		return nil
+	}
+	m := map[string]string{}
+	for _, line := range nonEmpty(out) {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] != "" {
+			m[fields[0]] = fields[1]
+		}
+	}
+	return m
+}
+
+// BundleCreateRanges writes a bundle from LITERAL range arguments (the
+// spec's pinned form: the refs/reap/* set enumerated into an explicit
+// <base>..<ref> list; a bare ref means a full, self-contained history).
+func (r Runner) BundleCreateRanges(dir, dst string, ranges []string) error {
+	args := append([]string{"bundle", "create", dst}, ranges...)
 	_, err := r.run(dir, r.GitBudget, args...)
 	return err
+}
+
+// LSRemote lists a remote's advertised refs ("sha ref" lines), read-only,
+// under the fetch budget — the quarantine revalidation probe (one
+// ls-remote per delta bundle).
+func (r Runner) LSRemote(url string) (string, error) {
+	return r.run(".", r.FetchBudget, "ls-remote", url)
+}
+
+// ForEachReapRef lists refs/reap/* pins in dir (nil on any failure — a
+// non-repo simply has none): doctor's stranded-ref detector.
+func (r Runner) ForEachReapRef(dir string) ([]string, error) {
+	out, err := r.run(dir, r.GitBudget, "for-each-ref", "--format=%(refname)", "refs/reap")
+	if err != nil {
+		return nil, err
+	}
+	return nonEmpty(out), nil
 }
 
 // BundleVerify checks a bundle's integrity.

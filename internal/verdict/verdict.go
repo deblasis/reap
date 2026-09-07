@@ -113,12 +113,23 @@ type Verdict struct {
 	OrphanedCarveOut bool
 }
 
-// Decide applies the matrix. Row order is the spec's and is load-bearing:
+// Decide applies the matrix and stamps every BLOCKED row with the in-tool
+// resolver (the spec's presentation: "commit+push origin main, or reap
+// discard C:\temp\muxc").
+func Decide(in Input) Verdict {
+	v := decide(in)
+	if v.Verdict == Blocked && v.Hint != "" && in.Path != "" {
+		v.Hint += ", or reap discard " + in.Path
+	}
+	return v
+}
+
+// decide applies the matrix. Row order is the spec's and is load-bearing:
 // KEEP rails first; orphan detection (file-based, structural) outranks
 // unreadable-state rows; every failure row outranks every clean row;
 // BLOCKED-class rows outrank SAFE so shadowing can only ever DISPLAY a
 // weaker row, never reach one.
-func Decide(in Input) Verdict {
+func decide(in Input) Verdict {
 	v := Verdict{Verdict: Manual}
 
 	// BLOCKED-class fact scan first: reachability comes from the full fact

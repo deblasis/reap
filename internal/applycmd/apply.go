@@ -46,15 +46,16 @@ const (
 	ExitQuarantine  = 125
 )
 
-// skipWhy values (spec's closed enum).
+// skipWhy values: the spec's CLOSED seven-value enum (Data model). No
+// other string may appear in a skip line's skipWhy field.
 const (
-	SkipGitBusy        = "git-busy"
+	SkipGitBusy        = "git-busy"        // index.lock at capture time
 	SkipActiveTripwire = "active-tripwire"
 	SkipInUseProbe     = "in-use-probe"
 	SkipVerdictChanged = "verdict-changed"
 	SkipParentLive     = "parent-of-live-children"
 	SkipIgnorance      = "ignorance-unreadable"
-	SkipDeregister     = "deregistration-failed"
+	SkipSnapshotOvercap = "snapshot-overcap"
 )
 
 // PlanEntry is one path the plan proposes to delete.
@@ -112,12 +113,16 @@ type Deleter struct {
 // ReverifyResult carries everything the audit intent line needs: the fresh
 // verdict, the facts it came from, and the capped manifest captured while
 // the dir still existed (round 2: capturing it after Delete stamped the
-// unreadable-error stub on every line).
+// unreadable-error stub on every line). HardAbort (not SkipWhy) carries
+// probe-strand failures: skipWhy is the spec's closed enum and a stranded
+// probe is a hard error, not a skip cause.
 type ReverifyResult struct {
 	SkipWhy  string
+	HardAbort string
 	Verdict  verdict.Verdict
 	Git      *gitx.Facts
 	Class    classify.Info
+	Nested   []string // nested repo paths (walk evidence; discard names them)
 	Manifest []byte
 	Residue  string
 }
@@ -345,14 +350,14 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	// Ignorance-class fresh verdicts (gh died mid-run etc.) report as
 	// ignorance, not verdict-changed (round 2: the histogram misled).
 	if isIgnoranceCodeLocal(v.Code) {
-		return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: v, Git: in.Git, Class: classInfo}
+		return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS}
 	}
 	// MATCH gate: the fresh verdict must equal the planned one.
 	if v.BlockedClassFact != "" && !v.OrphanedCarveOut {
-		return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
+		return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS}
 	}
 	if v.Code == "parent-of-live-children" {
-		return ReverifyResult{SkipWhy: SkipParentLive, Verdict: v, Git: in.Git, Class: classInfo}
+		return ReverifyResult{SkipWhy: SkipParentLive, Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS}
 	}
 	switch {
 	case widened:
@@ -393,11 +398,11 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	// into an abort naming the new path.
 	if err := renameProbe(path); err != nil {
 		if errors.Is(err, errProbeInUse) {
-			return ReverifyResult{SkipWhy: SkipInUseProbe, Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
+			return ReverifyResult{SkipWhy: SkipInUseProbe, Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS, Manifest: manifest, Residue: residue}
 		}
-		return ReverifyResult{SkipWhy: "PROBE-STRANDED:" + err.Error(), Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
+		return ReverifyResult{HardAbort: fmt.Sprintf("probe stranded for %s: %v", path, err), Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS, Manifest: manifest, Residue: residue}
 	}
-	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo, Manifest: manifest, Residue: residue}
+	return ReverifyResult{Verdict: v, Git: in.Git, Class: classInfo, Nested: info.NestedVCS, Manifest: manifest, Residue: residue}
 }
 
 // gitDirsForFetchHead lists the per-worktree gitdir and the common git dir
@@ -717,6 +722,10 @@ func heldUnder(holds map[string]bool, path string) bool {
 	}
 	return false
 }
+
+// PathHeld reports whether path (or any ancestor) is held; exported for
+// discard's wave-0 rails (holds beat every rule and every flag).
+func PathHeld(holds map[string]bool, path string) bool { return heldUnder(holds, path) }
 
 func protected(path string, globs []string) bool {
 	ok, _ := config.MatchProtect(path, globs)

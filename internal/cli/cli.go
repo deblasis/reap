@@ -43,7 +43,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	case "log":
 		return cmdLog(rest, stdout, stderr)
 	case "quarantine":
-		return cmdQuarantine(rest, stdout, stderr)
+		return cmdQuarantine(rest, stdout, stderr, os.Stdin)
 	case "doctor":
 		return cmdDoctor(rest, stdout, stderr)
 	case "hold":
@@ -79,7 +79,8 @@ commands:
   apply      re-verify and delete the plan (write-ahead audit; --yes or TTY)
   discard    quarantine-then-delete BLOCKED dirs (reap discard PATH...)
   log        read the deletion ledger (reap log [--since DUR])
-  quarantine list / prune snapshot sessions
+  quarantine list / prune / restore snapshot sessions
+  doctor     state-of-the-world readout (roots, lock, quarantine, ledger)
   hold       pin a path against deletion (reap hold PATH [--for DUR])
   unhold     release a pin
   holds      list pins with days remaining
@@ -92,11 +93,12 @@ reap apply [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
            [--include CODE]... [--exclude CODE]... [--override-manual PATH]...
            [--yes] [--dry-run] [--json]
 reap discard PATH... [--yes] [--no-quarantine] [--json]
-reap quarantine [list | prune [--older-than DUR] [--yes]]
+reap quarantine [list [--json] | prune [--older-than DUR] [--yes] [--json]
+                | restore <session> [--to PATH]]
 reap log [--since DUR] [--json]
+reap doctor
 
-activity and doctor land with their milestones (see the design spec's
-normative grammar).
+activity lands with its milestone (see the design spec's normative grammar).
 `)
 }
 

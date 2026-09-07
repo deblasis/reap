@@ -172,6 +172,33 @@ func captureOpHeads(dir string) func() {
 	}
 }
 
+// PushStateCommits returns the git SHAs of every non-empty commit reachable
+// from the working copy that no remote bookmark reaches — the SAME revset
+// the jj-unpushed fact counts, so quarantine pins exactly what the verdict
+// was holding. Snapshotting (a dirty @ must be visible) with op-heads mtime
+// restore, exactly like Facts.
+func (r Runner) PushStateCommits(dir string) ([]string, error) {
+	if r.Budget <= 0 {
+		return nil, fmt.Errorf("no jj exec budget configured")
+	}
+	restore := captureOpHeads(dir)
+	out, err := r.runSnapshotting(dir, "log", "-r", "::@ ~ ::remote_bookmarks()", "--no-graph", "-T", `if(empty, "", commit_id ++ "\n")`)
+	restore()
+	if err != nil {
+		return nil, fmt.Errorf("jj log: %w", err)
+	}
+	return nonEmpty(out), nil
+}
+
+// GitExport exports jj state to the colocated git backend's refs, making
+// jj-only commits and bookmarks visible to git rev-list/update-ref — the
+// precondition for pinning refs/reap/jj-N through the git backend (one
+// namespace rule for everything recoverable).
+func (r Runner) GitExport(dir string) error {
+	_, err := r.run(dir, "git", "export")
+	return err
+}
+
 // WorkspaceForget deregisters a workspace from its parent (apply path; must
 // succeed before rm per the spec).
 func (r Runner) WorkspaceForget(parent, name string) error {

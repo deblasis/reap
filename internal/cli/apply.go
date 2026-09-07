@@ -542,11 +542,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return rc
 		}
 		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun, p.PlanChildren)
+		if rv.HardAbort != "" {
+			fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.HardAbort)
+			return ExitState
+		}
 		if rv.SkipWhy != "" {
-			if strings.HasPrefix(rv.SkipWhy, "PROBE-STRANDED:") {
-				fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.SkipWhy)
-				return ExitState
-			}
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: rv.SkipWhy})
 			summary.SkippedBytes += p.SizeBytes
 			ok := false
@@ -558,18 +558,9 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
-			if applycmd.IsDeregister(err) {
-				// Spec: jj forget failure routes MANUAL — a skip, not a run
-				// abort (round-3: this replace silently no-oped last fold).
-				summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipDeregister})
-				summary.SkippedBytes += p.SizeBytes
-				ok := false
-				if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipDeregister,
-					Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, OK: &ok, Quarantine: nil}); rc >= 0 {
-					return rc
-				}
-				continue
-			}
+			// Deregistration failure is a deletion failure (spec's exit
+			// band: 124, path named) — not a skip: skipWhy is the spec's
+			// closed enum and the dir is still standing either way.
 			ok := false
 			_ = log.Append(auditlog.Line{Event: "result", Path: p.Path, Mode: mode, OK: &ok, Quarantine: nil})
 			fmt.Fprintf(stderr, "reap apply: deletion failed: %s: %v\n", p.Path, err)

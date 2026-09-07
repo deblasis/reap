@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -368,8 +369,8 @@ func TestWiringDiscardRefusesNotBlocked(t *testing.T) {
 	ageTree(t, repo, 30*24*time.Hour)
 
 	var out bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
-		t.Fatalf("discard of SAFE dir must exit 2, got %d", code)
+	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("discard of SAFE dir must exit 120 (refusal, nothing deleted), got %d", code)
 	}
 	if _, err := os.Stat(repo); err != nil {
 		t.Fatal("SAFE dir was deleted by discard")
@@ -382,7 +383,7 @@ func TestWiringDiscardRefusesNotBlocked(t *testing.T) {
 			SkipWhy string `json:"skipWhy"`
 			OK      *bool  `json:"ok"`
 		}
-		if json.Unmarshal([]byte(line), &row) == nil && row.Event == "skip" && row.SkipWhy == "not-blocked" {
+		if json.Unmarshal([]byte(line), &row) == nil && row.Event == "skip" && row.SkipWhy == applycmd.SkipVerdictChanged {
 			sawSkip = true
 			if row.OK == nil || *row.OK {
 				t.Fatal("skip line must carry ok=false")
@@ -390,12 +391,13 @@ func TestWiringDiscardRefusesNotBlocked(t *testing.T) {
 		}
 	}
 	if !sawSkip {
-		t.Fatal("ledger missing the not-blocked skip line")
+		t.Fatal("ledger missing the verdict-changed skip line")
 	}
 }
 
-// Non-interactive discard without --yes is 121 and touches nothing (the
-// family confirm, applied at birth this time).
+// Non-interactive discard without --yes is 121 and touches nothing; the
+// --no-quarantine non-TTY combination is a USAGE error (120): the flag
+// demands an interactive confirm that cannot even be asked.
 func TestWiringDiscardNonTTYNeedsYes(t *testing.T) {
 	root, _ := wireFixture(t)
 	repo := filepath.Join(root, "d")
@@ -408,8 +410,8 @@ func TestWiringDiscardNonTTYNeedsYes(t *testing.T) {
 	if _, err := os.Stat(repo); err != nil {
 		t.Fatal("dir touched by a 121 refusal")
 	}
-	if code := cmdDiscard([]string{"--no-quarantine", "--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != applycmd.ExitNotTTY {
-		t.Fatalf("--no-quarantine non-TTY: %d (want 121)", code)
+	if code := cmdDiscard([]string{"--no-quarantine", "--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("--no-quarantine non-TTY: %d (want 120)", code)
 	}
 }
 
@@ -418,11 +420,195 @@ func TestWiringDiscardRefusesScratch(t *testing.T) {
 	root, _ := wireFixture(t)
 	target := filepath.Join(root, "scratch-old")
 	var out bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", target}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
-		t.Fatalf("scratch discard: %d (want 2)", code)
+	if code := cmdDiscard([]string{"--yes", target}, &out, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("scratch discard: %d (want 120)", code)
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatal("SAFE scratch dir was deleted by discard")
+	}
+}
+
+// A held dirty dir is KEEP and survives discard: holds beat every rule and
+// every flag, even --yes (the round-1 panel's held-dir major).
+func TestWiringDiscardHeldSurvives(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "held-dirty")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	if code := cmdHold([]string{"--for", "720h", repo}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("held dirty discard: %d (want 120)", code)
+	}
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatal("held dir was deleted by discard")
+	}
+}
+
+// Over-cap quarantine refuses with the dir untouched and exit 125, with the
+// snapshot-overcap skipWhy (the closed enum's cap member).
+func TestWiringDiscardOverCap125(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "fat")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	// ~4 MB of INCOMPRESSIBLE untracked content (zeros or short-period
+	// patterns pack to nothing and slip under the cap): the bundle
+	// exceeds a 1 MB cap.
+	big := make([]byte, 4<<20)
+	if _, err := crand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	// Custom config: a 1 MB quarantine cap.
+	cfg := `{
+  "roots": ["` + filepath.ToSlash(root) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 0.001, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": false,
+  "jj": true
+}`
+	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REAP_DIR", stateDir)
+
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != applycmd.ExitQuarantine {
+		t.Fatalf("over-cap discard: %d (want 125)", code)
+	}
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatal("over-cap discard deleted the dir")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(raw), `"skipWhy":"snapshot-overcap"`) {
+		t.Fatalf("ledger missing snapshot-overcap skip:\n%s", raw)
+	}
+}
+
+// Duplicate PATH args dedupe to one deletion (no phantom 'missing' skip
+// forcing exit 2), and the summary prints the two-number truth.
+func TestWiringDiscardDedupeAndTwoNumber(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "dup")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo, repo}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("deduped discard: %d (%s)", code, out.String())
+	}
+	if _, err := os.Stat(repo); !os.IsNotExist(err) {
+		t.Fatal("dir survived")
+	}
+	if !strings.Contains(out.String(), "freed") || !strings.Contains(out.String(), "bundle") || !strings.Contains(out.String(), "kept") {
+		t.Fatalf("two-number truth missing: %q", out.String())
+	}
+}
+
+// reap log lists across the rotation boundary, oldest-first.
+func TestWiringLogAcrossRotation(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	oldTS := time.Now().Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := os.WriteFile(filepath.Join(stateDir, "reap.log.1"),
+		[]byte(`{"ts":"`+oldTS+`","event":"intent","path":"C:\\rot-old"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	freshTS := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := os.WriteFile(filepath.Join(stateDir, "reap.log"),
+		[]byte(`{"ts":"`+freshTS+`","event":"result","path":"C:\\rot-new","ok":true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code := cmdLog(nil, &out, os.Stderr); code != ExitOK {
+		t.Fatalf("log: %d", code)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("rotation listing: %q", out.String())
+	}
+	if !strings.Contains(lines[0], "rot-old") || !strings.Contains(lines[1], "rot-new") {
+		t.Fatalf("rotation order wrong: %q", out.String())
+	}
+}
+
+// restore: the first-class recovery command, end to end — bundle sessions
+// materialize the capture tree; a non-empty --to destination is refused.
+func TestWiringQuarantineRestore(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "gone")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("PRECIOUS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatal("discard failed")
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "quarantine"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("sessions: %v", err)
+	}
+	session := entries[0].Name()
+
+	dest := filepath.Join(t.TempDir(), "recovered")
+	var out bytes.Buffer
+	if code := cmdQuarantine([]string{"restore", session, "--to", dest}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("restore: %d (%s)", code, out.String())
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "f.txt")); string(b) != "PRECIOUS" {
+		t.Fatal("restore did not materialize the captured tree")
+	}
+	// Non-empty destination: refused, nothing overwritten.
+	if err := os.WriteFile(filepath.Join(dest, "existing.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdQuarantine([]string{"restore", session, "--to", dest}, &out, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("restore to non-empty: %d (want 120)", code)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "existing.txt")); string(b) != "x" {
+		t.Fatal("restore overwrote the destination")
 	}
 }
 
@@ -443,15 +629,15 @@ func TestWiringQuarantineLifecycle(t *testing.T) {
 	os.Chtimes(old, back, back)
 
 	var out bytes.Buffer
-	if code := cmdQuarantine([]string{"list"}, &out, os.Stderr); code != ExitOK {
+	if code := cmdQuarantine([]string{"list"}, &out, os.Stderr, os.Stdin); code != ExitOK {
 		t.Fatalf("list: %d", code)
 	}
-	if !strings.Contains(out.String(), "old") || !strings.Contains(out.String(), "mode=bundle") {
+	if !strings.Contains(out.String(), "old") || !strings.Contains(out.String(), "state=verified-ok") || !strings.Contains(out.String(), "restore: reap quarantine restore") {
 		t.Fatalf("list output: %q", out.String())
 	}
 
 	out.Reset()
-	if code := cmdQuarantine([]string{"prune", "--older-than", "24h", "--yes"}, &out, os.Stderr); code != ExitOK {
+	if code := cmdQuarantine([]string{"prune", "--older-than", "24h", "--yes"}, &out, os.Stderr, os.Stdin); code != ExitOK {
 		t.Fatalf("prune: %d", code)
 	}
 	if !strings.Contains(out.String(), "recovery") || !strings.Contains(out.String(), "pruned 1 session(s)") {
