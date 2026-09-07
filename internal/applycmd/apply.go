@@ -644,7 +644,7 @@ func Lock(stateDir, runID string) (*lockfile.File, error) {
 	if !ok {
 		l.Close()
 		holder := readLockHolder(path)
-		return nil, fmt.Errorf("another reap apply/discard holds apply.lock (holder: %s); fail-fast, retry when it exits", holder)
+		return nil, fmt.Errorf("another reap run holds apply.lock (holder: %s); fail-fast, retry when it exits", holder)
 	}
 	_ = os.WriteFile(path, []byte(fmt.Sprintf("pid=%d runId=%s", os.Getpid(), runID)), 0o644)
 	return l, nil

@@ -53,6 +53,7 @@ type Manifest struct {
 	BaseBases     []BaseInfo `json:"baseBases,omitempty"` // per-branch-union bases (branch -> base)
 	SelfContained bool       `json:"selfContained"`
 	BundleBytes   int64      `json:"bundleBytes,omitempty"`
+	Revset        string     `json:"revset,omitempty"` // jj push-state revset (jj captures)
 	CaptureRef    string     `json:"captureRef,omitempty"` // refs/reap/capture-*
 	Classes       Classes    `json:"classes"`
 	Entries       []Entry    `json:"entries,omitempty"` // plain-copy file list
@@ -113,6 +114,19 @@ func (e *ErrGitBusy) Error() string {
 	return fmt.Sprintf("index.lock present at capture start (%s): a concurrent git is mid-write", e.Path)
 }
 
+// ErrSessionExists reports that the session directory already exists — a
+// same-name race from another creator; proceeding would overwrite that
+// session's recovery. TYPED (fs.ErrExist) so retries key on collisions,
+// never on unrelated mkdir failures like access-denied.
+type ErrSessionExists struct{ Dir string }
+
+func (e *ErrSessionExists) Error() string {
+	return fmt.Sprintf("session dir %s already exists: a same-named session exists; refusing to overwrite", e.Dir)
+}
+
+// Is lets errors.Is(err, fs.ErrExist) match a session collision.
+func (e *ErrSessionExists) Is(target error) bool { return target == os.ErrExist }
+
 // Options carries the caller's budgets and context.
 type Options struct {
 	CapBytes int64 // 0 = no cap
@@ -157,9 +171,14 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 	// The session dir must exist up front: `git bundle create` writes
 	// <bundle>.lock BESIDE its destination. Created EXCLUSIVELY (Mkdir, not
 	// MkdirAll): an existing dir of the same name is ANOTHER SESSION —
-	// proceeding would overwrite that dir's only recovery copy.
+	// proceeding would overwrite that dir's only recovery copy. A typed
+	// collision error (round 4): string-matching the prose burned the retry
+	// on unrelated mkdir failures.
 	if err := os.Mkdir(sessionDir, 0o755); err != nil {
-		return nil, fmt.Errorf("session dir %s: %w (a same-named session exists; refusing to overwrite)", sessionDir, err)
+		if os.IsExist(err) {
+			return nil, &ErrSessionExists{Dir: sessionDir}
+		}
+		return nil, fmt.Errorf("session dir %s: %w", sessionDir, err)
 	}
 
 	// Capture-start git-busy check (the spec's step 3 interlock): a live
@@ -200,9 +219,16 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 		removeSession(sessionDir)
 		return nil, err
 	}
+	// Pricing REFUSES on failure too (round 4): a failed or unparseable
+	// pre-price must not degrade to write-then-refuse — that path puts the
+	// transient bytes on the volume this tool protects before saying no.
 	if opts.CapBytes > 0 {
 		projected, derr := gitRunner.DiskUsage(source, ranges)
-		if derr == nil && projected > opts.CapBytes {
+		if derr != nil || projected == 0 && len(ranges) > 0 {
+			removeSession(sessionDir)
+			return nil, fmt.Errorf("bundle pricing failed (refusing rather than writing unpriced): %w", derr)
+		}
+		if projected > opts.CapBytes {
 			removeSession(sessionDir)
 			return nil, &ErrTooLarge{Need: projected, Cap: opts.CapBytes}
 		}
@@ -336,11 +362,34 @@ func gitDirForPath(dir string) (string, bool) {
 // repo as it found it, staged hunks included. SaveIndex failing is a
 // refusal — falling back to reset --mixed would destroy exactly the state
 // the backup exists to protect.
+// readIndexBytes is a seam: the deterministic interleave fixture swaps it
+// to simulate a concurrent git's mid-window write (a live race is
+// untestable-reliable; the seam makes the detection provable).
+var readIndexBytes = os.ReadFile
+
 func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	preMtime := indexMtime(dir)
 	backup, serr := r.SaveIndex(dir)
 	if serr != nil {
 		return fmt.Errorf("save index: %w (refusing; a reset-based fallback would destroy the operator's staged state)", serr)
+	}
+	// The saved index BYTES stay in memory: RestoreBackup deletes the
+	// backup file, so a post-restore read of it was dead code (the round-3
+	// phantom fold the live concurrent-add race proved inert).
+	var savedBytes []byte
+	idxPath := ""
+	if backup != "" {
+		if g, ok := gitDirForPath(dir); ok {
+			idxPath = filepath.Join(g, "index")
+			savedBytes, _ = os.ReadFile(backup)
+		}
+		// w1: a concurrent git that wrote between SaveIndex and staging is
+		// detectable HERE, before reap's own add rewrites the index.
+		if len(savedBytes) > 0 && idxPath != "" {
+			if cur, cerr := readIndexBytes(idxPath); cerr == nil && !bytes.Equal(savedBytes, cur) {
+				m.Interleaved = true
+			}
+		}
 	}
 	restore := func() error {
 		if backup != "" {
@@ -376,21 +425,18 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	if rerr := restore(); rerr != nil {
 		return rerr
 	}
-	// Interlock, for real this time (round-3): mtimes cannot carry the
-	// signal — `git add` itself rewrites the index mid-window, so mtime
-	// comparisons fire on every capture, and a pre-restore content check
-	// sees only reap's own all-staged index. The one honest, observable
-	// window is AFTER the restore: if the index on disk differs from the
-	// backup bytes we just wrote there, a concurrent git wrote during the
-	// capture window — surface it instead of silently restoring over it.
-	// The restore's own mtime bump is UNDONE so a refused discard does not
-	// flip the dir ACTIVE for 48h (the exact feedback loop Reverify fixes
-	// for FETCH_HEAD).
-	if backup != "" {
-		if saved, serr := os.ReadFile(backup); serr == nil {
-			if cur, cerr := os.ReadFile(filepath.Join(gitDirOf(dir), "index")); cerr == nil && !bytes.Equal(saved, cur) {
-				m.Interleaved = true
-			}
+	// w2: after the restore, the index on disk must equal the saved bytes —
+	// anything else is a concurrent git that wrote past the restore.
+	// (The window DURING staging — while git add/plumbing hold the index
+	// lock between our steps — is honestly unobservable without holding
+	// the lock ourselves, which would deadlock git add; w1+w2 are the two
+	// windows reap can see, and both are surfaced.) The restore's own
+	// mtime bump is UNDONE so a refused discard does not flip the dir
+	// ACTIVE for 48h (the exact feedback loop Reverify fixes for
+	// FETCH_HEAD).
+	if len(savedBytes) > 0 && idxPath != "" {
+		if cur, cerr := readIndexBytes(idxPath); cerr == nil && !bytes.Equal(savedBytes, cur) {
+			m.Interleaved = true
 		}
 	}
 	if g, ok := gitDirForPath(dir); ok && !preMtime.IsZero() {
@@ -514,12 +560,14 @@ func pinTips(r gitx.Runner, opts Options, dir string, m *Manifest) ([]string, er
 
 	// jj colocated: pin every push-state commit under the same namespace
 	// (one rule covers everything recoverable) after exporting jj state to
-	// the git backend so the commits are visible to update-ref.
+	// the git backend so the commits are visible to update-ref. The revset
+	// is recorded (spec: "the revset and count go in the manifest").
 	if opts.Colocated && opts.JJ.Budget > 0 {
 		shas, jerr := opts.JJ.PushStateCommits(dir)
 		if jerr != nil {
 			return nil, fmt.Errorf("jj push state: %w", jerr)
 		}
+		m.Revset = "::@ ~ ::remote_bookmarks()"
 		if len(shas) > 0 {
 			if gerr := opts.JJ.GitExport(dir); gerr != nil {
 				return nil, fmt.Errorf("jj git export: %w", gerr)
@@ -610,7 +658,10 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		return rangesFor("refs/remotes/origin/HEAD"), nil
 	}
 	// Per-branch union: branches with their own upstream price against it
-	// (each base recorded); everything else is carried whole.
+	// (each base recorded AND revalidated — round 4 closed the gap where
+	// this tier skipped the capture-time baseAdvertised check the first
+	// two tiers get; a gone per-branch base now carries that ref whole);
+	// everything else is carried whole.
 	if ups := r.BranchUpstreams(dir); len(ups) > 0 {
 		m.BaseRef, m.SelfContained = "per-branch", false
 		out := make([]string, 0, len(refs))
@@ -618,9 +669,9 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 			base, baseSHA := "", ""
 			if strings.HasPrefix(ref, "refs/reap/unpushed-") {
 				if up, ok := ups[strings.TrimPrefix(ref, "refs/reap/unpushed-")]; ok {
-					baseSHA = r.ResolveRef(dir, up)
-					if baseSHA != "" {
-						base = up
+					sha := r.ResolveRef(dir, up)
+					if sha != "" && baseAdvertised(up, sha) {
+						base, baseSHA = up, sha
 					}
 				}
 			}
@@ -666,7 +717,11 @@ func writeManifest(sessionDir string, m *Manifest) error {
 
 // WritePlainCopy snapshots a non-git BLOCKED dir as a capped byte-for-byte
 // copy with an entries list. The cap prices the WHOLE tree (directories
-// included) before anything is written.
+// included) before anything is written; the session dir is created
+// EXCLUSIVELY (same collision contract as Snapshot — round 4); every
+// copied file is FSYNCED (the plain copy is often the ONLY recovery, and
+// it was the one artifact class that was not fsynced); BundleBytes carries
+// the copy's size so callers can decrement their free-space budgets.
 func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
 	m := &Manifest{Created: time.Now(), Source: source, Mode: "plain-copy", SelfContained: true}
 	var total int64
@@ -700,11 +755,20 @@ func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
 	if cap > 0 && total > cap {
 		return nil, &ErrTooLarge{Need: total, Cap: cap}
 	}
-	m.Entries, m.EmptyDirs = files, emptyDirs
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		return nil, err
+	m.Entries, m.EmptyDirs, m.BundleBytes = files, emptyDirs, total
+	if serr := os.Mkdir(sessionDir, 0o755); serr != nil {
+		if os.IsExist(serr) {
+			return nil, &ErrSessionExists{Dir: sessionDir}
+		}
+		return nil, fmt.Errorf("session dir %s: %w", sessionDir, serr)
 	}
 	if err := copyTree(source, filepath.Join(sessionDir, "files")); err != nil {
+		removeSession(sessionDir)
+		return nil, err
+	}
+	// Sweep-fsync the copied tree + the manifest: a power cut in the
+	// delete-that-follows window must not tear the only recovery copy.
+	if err := fsyncTree(filepath.Join(sessionDir, "files")); err != nil {
 		removeSession(sessionDir)
 		return nil, err
 	}
@@ -712,7 +776,26 @@ func WritePlainCopy(sessionDir, source string, cap int64) (*Manifest, error) {
 		removeSession(sessionDir)
 		return nil, err
 	}
+	if err := syncFile(filepath.Join(sessionDir, "manifest.json")); err != nil {
+		removeSession(sessionDir)
+		return nil, err
+	}
 	return m, nil
+}
+
+// fsyncTree flushes every file under root (plain-copy durability).
+func fsyncTree(root string) error {
+	return filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		f, oerr := os.OpenFile(p, os.O_RDWR, 0)
+		if oerr != nil {
+			return nil // best-effort: closed files still readable
+		}
+		defer f.Close()
+		return f.Sync()
+	})
 }
 
 func copyTree(src, dst string) error {

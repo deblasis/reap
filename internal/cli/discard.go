@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -581,9 +582,12 @@ func planEntriesOf(work []discardWork) []applycmd.PlanEntry {
 }
 
 // isSessionExistsErr reports a Snapshot refusal caused by the session dir
-// already existing (an external creator won the name race).
+// already existing (an external creator won the name race). TYPED match
+// (round 4): the old prose substring also burned the retry on unrelated
+// mkdir failures like access-denied.
 func isSessionExistsErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "a same-named session exists")
+	var exists *quarantine.ErrSessionExists
+	return errors.As(err, &exists)
 }
 
 func dirExists(p string) bool {
@@ -767,7 +771,15 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 	}
 	for _, r := range rows {
 		if !r.ManifestOK {
-			fmt.Fprintf(stdout, "%6d MB  %3dd  %s  (manifest unreadable — bundle may still restore)\n", r.Bytes>>20, r.AgeDays, filepath.Base(r.Session))
+			hasBundle := false
+			if _, serr := os.Stat(filepath.Join(r.Session, "bundle.git")); serr == nil {
+				hasBundle = true
+			}
+			note := "interrupted capture; verify with git bundle verify before trusting"
+			if hasBundle {
+				note = "manifest unreadable; bundle may still restore"
+			}
+			fmt.Fprintf(stdout, "%6d MB  %3dd  %s  (%s)\n", r.Bytes>>20, r.AgeDays, filepath.Base(r.Session), note)
 			continue
 		}
 		shape := "delta"
@@ -1036,7 +1048,7 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		}
 	}
 	if len(prereqs) > 0 && m.Origin != "" {
-		if err := fetchRemote(dest, m.Origin); err != nil {
+		if err := fetchRemote(dest, m.Origin, prereqs); err != nil {
 			fmt.Fprintf(stderr, "reap quarantine restore: fetching base from %s: %v (prerequisites: %s)\n",
 				m.Origin, err, strings.Join(prereqs, ", "))
 			return ExitState
@@ -1069,7 +1081,16 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 	return ExitOK
 }
 
-func fetchRemote(dest, origin string) error {
+func fetchRemote(dest, origin string, prereqs []string) error {
+	// Fetch ONLY the recorded prerequisite SHAs first (fetching the whole
+	// remote cloned the world for a small delta); fall back to the branch
+	// set when the server refuses direct SHA wants.
+	if len(prereqs) > 0 {
+		args := append([]string{"fetch", "-q", origin}, prereqs...)
+		if err := execGit(dest, args...); err == nil {
+			return nil
+		}
+	}
 	return execGit(dest, "fetch", "-q", origin, "+refs/heads/*:refs/remotes/restore/*")
 }
 
@@ -1081,11 +1102,20 @@ func wireInitRestore(_ io.Writer, dir string) {
 	_ = execGit(dir, "init", "-q", "-b", "main")
 }
 
+// execGit runs git for restore under the FETCH BUDGET (round 4: the one
+// unbudgeted exec in the codebase ran while holding apply.lock — a wedged
+// endpoint would hold the global state lock forever).
 func execGit(dir string, args ...string) error {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=reap", "GIT_AUTHOR_EMAIL=reap@reap",
 		"GIT_COMMITTER_NAME=reap", "GIT_COMMITTER_EMAIL=reap@reap")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("git %v: timeout after 120s", args)
+	}
+	if err != nil {
 		return fmt.Errorf("git %v: %v: %s", args, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -1111,10 +1141,20 @@ func restorePlainCopy(sessionDir, dest string, m *quarantine.Manifest) error {
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
-		data, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
+		// Streamed: a near-cap single file must not spike RSS by its size.
+		in, oerr := os.Open(p)
+		if oerr != nil {
+			return oerr
 		}
-		return os.WriteFile(target, data, 0o644)
+		defer in.Close()
+		out, cerr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if cerr != nil {
+			return cerr
+		}
+		if _, cerr = io.Copy(out, in); cerr != nil {
+			out.Close()
+			return cerr
+		}
+		return out.Close()
 	})
 }

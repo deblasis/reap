@@ -24,8 +24,11 @@ func TestCounterHardlinkCountedOnce(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a, "solo.bin"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Capability probe: some volumes (ReFS/Dev Drive) do not expose
-	// classic file indexes; the pass degrades to logical there.
+	// Capability probe: ReFS/Dev Drive volumes genuinely lack classic file
+	// indexes (the pass degrades to logical there, by design). On NTFS the
+	// presence-fixed IndexesAvailable MUST hold — the round-3 value-test
+	// bug made it constant-false and this fixture self-skipped everywhere,
+	// so the broken pass never failed a test.
 	if !IndexesAvailable(src) {
 		t.Skip("filesystem does not expose file indexes (ReFS/Dev Drive); pass degrades to logical")
 	}

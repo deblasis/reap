@@ -25,7 +25,7 @@ type key struct {
 // identity map gives set semantics: content hardlinked within the set
 // counts once.
 type Counter struct {
-	seen     map[key]bool
+	seen     map[key]struct{}
 	max      int
 	files    int
 	over     bool
@@ -39,7 +39,7 @@ func NewCounter(maxFiles int) *Counter {
 	if maxFiles <= 0 {
 		maxFiles = 50000
 	}
-	return &Counter{seen: map[key]bool{}, max: maxFiles}
+	return &Counter{seen: map[key]struct{}{}, max: maxFiles}
 }
 
 // Add walks one path into the counter.
@@ -72,9 +72,11 @@ func (c *Counter) Over() bool { return c.over }
 
 // IndexesAvailable reports whether the filesystem exposes classic file
 // indexes for path's volume (ReFS/Dev Drive volumes do not; the pass
-// degrades to the logical upper bound there).
+// degrades to the logical upper bound there). Round-4 fix: presence in the
+// map, never the stored value — the bool-value version was constant-false
+// and made every volume "unsupported".
 func IndexesAvailable(path string) bool {
-	c := Counter{seen: map[key]bool{}}
+	c := Counter{seen: map[key]struct{}{}}
 	c.sharedUnder(path)
 	return c.sharedUnder(path)
 }
@@ -96,9 +98,9 @@ func (c *Counter) sharedUnder(p string) bool {
 		return false
 	}
 	k := key{vol: info.VolumeSerialNumber, idxLo: info.FileIndexLow, idxHi: info.FileIndexHigh}
-	if c.seen[k] {
+	if _, ok := c.seen[k]; ok {
 		return true
 	}
-	c.seen[k] = false
+	c.seen[k] = struct{}{}
 	return false
 }

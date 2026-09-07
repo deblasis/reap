@@ -136,7 +136,7 @@ func TestCaptureRefContainsIgnored(t *testing.T) {
 	}
 }
 
-// Plain copy: capped, byte-for-byte, entries listed.
+// Plain copy: capped, byte-for-byte, entries listed, priced.
 func TestPlainCopy(t *testing.T) {
 	src := t.TempDir()
 	if err := os.WriteFile(filepath.Join(src, "a.bin"), []byte("hello"), 0o644); err != nil {
@@ -150,11 +150,18 @@ func TestPlainCopy(t *testing.T) {
 	if m.Mode != "plain-copy" || len(m.Entries) != 1 {
 		t.Fatalf("manifest: %+v", m)
 	}
+	if m.BundleBytes != 5 {
+		t.Fatalf("plain copy not priced: %d", m.BundleBytes)
+	}
 	if b, _ := os.ReadFile(filepath.Join(session, "files", "a.bin")); string(b) != "hello" {
 		t.Fatal("copy is not byte-for-byte")
 	}
+	// A pre-existing session dir is a typed collision, never an overwrite.
+	if _, err := WritePlainCopy(session, src, 1<<20); err == nil || !strings.Contains(err.Error(), "same-named session") {
+		t.Fatalf("want session-exists refusal, got %v", err)
+	}
 	// Cap refusal leaves nothing behind to mistake for a snapshot.
-	if _, err := WritePlainCopy(t.TempDir(), src, 1); err == nil {
+	if _, err := WritePlainCopy(filepath.Join(t.TempDir(), "s2"), src, 1); err == nil {
 		t.Fatal("cap must refuse")
 	}
 }
@@ -508,6 +515,77 @@ func TestSnapshotInterleaveFalseQuiet(t *testing.T) {
 	after, _ := os.Stat(idx)
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatalf("index mtime changed across capture: %v -> %v", before.ModTime(), after.ModTime())
+	}
+}
+
+// RED-FIRST (round 4): a concurrent git's mid-window write IS detected.
+// Deterministic through the readIndexBytes seam — a live race cannot be
+// timed reliably, and the round-3 fold's fixture could only assert the
+// quiet side (which is why the dead code survived a panel round).
+func TestSnapshotInterleavedDetected(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "-A")
+	gitRun(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+
+	// The seam reports an index that DIFFERS from what reap saved — the
+	// exact shape of a concurrent write landing inside the capture window.
+	orig := readIndexBytes
+	readIndexBytes = func(p string) ([]byte, error) {
+		if b, err := orig(p); err == nil {
+			return append([]byte("CONCURRENT-WRITE"), b...), nil
+		}
+		return orig(p)
+	}
+	defer func() { readIndexBytes = orig }()
+
+	m, err := Snapshot(filepath.Join(t.TempDir(), "s"), repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !m.Interleaved {
+		t.Fatal("concurrent index write NOT detected (the interlock is dead code again)")
+	}
+}
+
+// The unborn HEAD (fresh git init, no commits) quarantines fine: the spec
+// fixture the round-3 reflog error-propagation broke (git reflog show HEAD
+// exits 128 there).
+func TestSnapshotUnbornHead(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("ONLY COPY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	session := filepath.Join(t.TempDir(), "s")
+	m, err := Snapshot(session, repo, gr, Options{Mode: "bundle"})
+	if err != nil {
+		t.Fatalf("unborn HEAD must quarantine: %v", err)
+	}
+	if m.CaptureRef == "" {
+		t.Fatal("no capture ref on the unborn shape")
+	}
+	// The capture tree materializes the untracked file.
+	treeOf := gitRun(t, repo, "rev-parse", m.CaptureRef+"^{tree}")
+	ls := gitRun(t, repo, "ls-tree", "--name-only", treeOf)
+	if !strings.Contains(ls, "untracked.txt") {
+		t.Fatalf("untracked-only tree not captured:\n%s", ls)
 	}
 }
 

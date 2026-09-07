@@ -508,8 +508,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitOK
 	}
 
-	// Preflight floor: a refusal, not a print.
+	// Preflight floor: a refusal, not a print. Carve-out runs raise the
+	// floor to cap x margin (the spec: a confirmed snapshot is never
+	// replaced by a silent no-snapshot deletion — the quarantine write
+	// itself needs the headroom).
 	minFree := uint64(core.cfg.Thresholds.MinFreeMB) << 20
+	if carveOutActive {
+		raised := uint64(float64(core.cfg.Thresholds.QuarantineCapGB) * core.cfg.Thresholds.QuarantineMargin * float64(1<<30))
+		if raised > minFree {
+			minFree = raised
+		}
+	}
 	free := auditlog.FreeBytes(stateDir)
 	widened := planWidenedCodes(plan)
 	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes, ErrOut: stderr})
@@ -590,6 +599,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		PRHeads: core.prHeads,
 	}
 	deletedInRun := map[string]bool{}
+	carveOutFailed := false // any 125-class carve-out quarantine failure
 	for _, p := range ordered {
 		intent := auditlog.Line{
 			Event: "intent", Path: p.Path, Kind: p.Kind, SizeBytes: p.SizeBytes,
@@ -615,12 +625,46 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		// The carve-out rows: a capped plain-copy quarantine BEFORE the
 		// deletion (the orphan has no git backend to bundle; the plain
-		// copy is its only recovery).
+		// copy is its only recovery). Over-cap is the operator's call via
+		// the spec's Proceed prompt (deletion unrecoverable except for the
+		// file manifest, mode=plain-copy-skipped-overcap); a FAILED copy
+		// is a 125-band quarantine refusal with the dir untouched.
 		var qPtrVal *string
+		carveMode := ""
 		if p.Orphaned {
-			session := quarantine.FreshSessionDir(stateDir, p.Path, time.Now())
 			capBytes := int64(core.cfg.Thresholds.QuarantineCapGB * float64(1<<30))
-			if _, qerr := quarantine.WritePlainCopy(session, p.Path, capBytes); qerr != nil {
+			session := ""
+			var qerr error
+			for attempt := 0; attempt < 2; attempt++ {
+				session = quarantine.FreshSessionDir(stateDir, p.Path, time.Now())
+				_, qerr = quarantine.WritePlainCopy(session, p.Path, capBytes)
+				if qerr == nil || !isSessionExistsErr(qerr) {
+					break
+				}
+			}
+			var tooLarge *quarantine.ErrTooLarge
+			switch {
+			case qerr == nil:
+				qPtrVal = &session
+				carveMode = "plain-copy"
+			case errors.As(qerr, &tooLarge):
+				// The TTY-only over-cap consent (the carve-out is TTY-gated
+				// by construction; --yes never reached this path).
+				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs ~%d MB, cap %d MB): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
+					tooLarge.Need>>20, tooLarge.Cap>>20)
+				var answer string
+				if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil || strings.ToLower(strings.TrimSpace(answer)) != "y" {
+					fmt.Fprintln(stdout, "declined")
+					ok := false
+					if rc := appendOrAbort(auditlog.Line{Event: "result", Path: p.Path, OK: &ok,
+						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,
+						Residue: "carve-out declined at the over-cap confirm"}); rc >= 0 {
+						return rc
+					}
+					continue
+				}
+				carveMode = "plain-copy-skipped-overcap"
+			default:
 				fmt.Fprintf(stderr, "reap apply: %s: carve-out quarantine failed: %v (dir untouched)\n", p.Path, qerr)
 				ok := false
 				if rc := appendOrAbort(auditlog.Line{Event: "result", Path: p.Path, OK: &ok,
@@ -628,9 +672,9 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					Residue: "carve-out plain-copy failed: " + qerr.Error()}); rc >= 0 {
 					return rc
 				}
+				carveOutFailed = true
 				continue
 			}
-			qPtrVal = &session
 		}
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
@@ -669,6 +713,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		result.Manifest = rv.Manifest
 		result.Residue = rv.Residue
+		if carveMode != "" {
+			// The carve-out modes label exactly what recovery exists
+			// (files only, no git objects) — the mode is never silently
+			// rewritten to the deletion mechanism.
+			result.Mode = carveMode
+			if result.Residue == "" {
+				result.Residue = "carve-out plain copy: files only, no git objects"
+			} else {
+				result.Residue += "; carve-out plain copy: files only, no git objects"
+			}
+		}
 		ok := true
 		result.OK = &ok
 		if rc := appendOrAbort(result); rc >= 0 {
@@ -691,6 +746,12 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
+	}
+	if carveOutFailed {
+		// A confirmed carve-out whose quarantine write failed is a
+		// 125-band refusal (spec L420-422), never a silent exit 0 on a
+		// run that deleted nothing (the round-3 spec finding).
+		return applycmd.ExitQuarantine
 	}
 	if len(summary.Skipped) > 0 {
 		return applycmd.ExitWithSkips

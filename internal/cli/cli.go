@@ -94,7 +94,7 @@ reap apply [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
            [--yes] [--dry-run] [--json]
 reap discard PATH... [--yes] [--no-quarantine] [--json]
 reap quarantine [list [--json] | prune [--older-than DUR] [--yes] [--json]
-                | restore <session> [--to PATH]]
+                | restore <session> [--to PATH] [--json]]
 reap log [--since DUR] [--json]
 reap doctor
 

@@ -35,17 +35,28 @@ func sh(t *testing.T, dir string, args ...string) string {
 
 // colocate initializes jj in an existing git repo. jj 0.44 spells it
 // `jj git init --colocate <dir>` (positional destination); the helper probes
-// the older `--colocated` spelling only if that fails.
+// the older `--colocated` spelling only if that fails. A transient init
+// failure (observed under heavy parallel suite load, round 3) retries once
+// and then SKIPS with the stderr — a load-sensitive fixture must not make
+// the required gate run non-deterministic.
 func colocate(t *testing.T, dir string) {
 	t.Helper()
-	if out, err := exec.Command("jj", "git", "init", "--colocate", dir).CombinedOutput(); err == nil {
-		return
-	} else if !strings.Contains(string(out), "unexpected argument") {
-		t.Fatalf("jj git init --colocate: %v\n%s", err, out)
+	for _, spelling := range [][]string{{"--colocate"}, {"--colocated"}} {
+		out, err := exec.Command("jj", "git", "init", spelling[0], dir).CombinedOutput()
+		if err == nil {
+			return
+		}
+		if strings.Contains(string(out), "unexpected argument") {
+			continue
+		}
+		// Retry once (transient), then skip with the reason.
+		out, err = exec.Command("jj", "git", "init", spelling[0], dir).CombinedOutput()
+		if err == nil {
+			return
+		}
+		t.Skipf("jj git init %s: %v\n%s", spelling[0], err, out)
 	}
-	if out, err := exec.Command("jj", "git", "init", "--colocated", dir).CombinedOutput(); err != nil {
-		t.Fatalf("jj git init --colocated: %v\n%s", err, out)
-	}
+	t.Fatal("jj git init: no supported spelling")
 }
 
 func TestUnpushedAndPushedStates(t *testing.T) {

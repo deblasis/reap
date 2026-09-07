@@ -742,8 +742,14 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // a rev-list of a stale reflog-heavy repo mints thousands of refs and blows
 // the Windows command-line bound (the round-2 reliability finding). Errors
 // PROPAGATE: pinning nothing on unreadable evidence is the completeness lie
-// the manifest must never tell.
+// the manifest must never tell — EXCEPT the unborn HEAD (fresh git init,
+// no commits): `git reflog show HEAD` exits 128 there, but that is the
+// unpushed-HEAD shape, not unreadable state, and quarantine must capture it
+// fine (spec fixture list; the round-3 regression that broke exactly this).
 func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
+	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil || strings.TrimSpace(out) == "" {
+		return nil, nil // unborn HEAD: no reflog to pin
+	}
 	out, err := r.run(dir, r.GitBudget, "reflog", "show", "--format=%H", "HEAD")
 	if err != nil {
 		return nil, err
