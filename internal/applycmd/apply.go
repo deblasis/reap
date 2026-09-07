@@ -69,6 +69,7 @@ type PlanEntry struct {
 	ParentRepo   string   `json:"parentRepoPath,omitempty"`
 	Orphaned     bool     `json:"orphanedCarveOut,omitempty"`
 	OrphanCounts string   `json:"-"` // knowable counts for the hardened confirm
+	Flavor       string   `json:"-"` // verdict.Flavor (deregistered vs default orphan copy)
 	Residue      string   `json:"residue,omitempty"` // nested/reflog overlap note
 	PlanChildren []string `json:"-"` // scan-time live children; unlock-only
 }

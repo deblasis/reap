@@ -117,7 +117,17 @@ type Verdict struct {
 	// refusal.
 	BlockedClassFact string
 	OrphanedCarveOut bool
+
+	// Flavor distinguishes SAME-CODE shapes whose copy must differ: the
+	// deregistered workspace (parent alive, dir out of its registry - the
+	// forget-then-rm crash window) is an orphaned-workspace row whose hint,
+	// refusal, and hardened-confirm copy must NOT say "parent gone".
+	// Empty = the default flavor.
+	Flavor string
 }
+
+// The deregistered-workspace flavor (set by the re-route sites).
+const FlavorDeregistered = "deregistered"
 
 // Decide applies the matrix and stamps every BLOCKED row with the in-tool
 // resolver (the spec's presentation: "commit+push origin main, or reap

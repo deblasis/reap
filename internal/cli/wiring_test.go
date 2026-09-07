@@ -166,6 +166,16 @@ func TestWiringApplyDeletesWithManifest(t *testing.T) {
 	if intent["event"] != "intent" || result["event"] != "result" {
 		t.Fatalf("write-ahead order: %v then %v", intent["event"], result["event"])
 	}
+	// The INTENT line's manifest decodes to real entries (round 11: the
+	// write-ahead recovery story, not just the result's post-hoc record).
+	if im, ok := intent["manifest"].(string); ok && im != "" {
+		dec, derr := base64.StdEncoding.DecodeString(im)
+		if derr != nil || !strings.Contains(string(dec), "junk1.bin") {
+			t.Fatalf("intent manifest missing real entries: %v %q", derr, dec)
+		}
+	} else {
+		t.Fatal("intent line missing its write-ahead manifest")
+	}
 	if intent["ts"].(string) > result["ts"].(string) {
 		t.Fatal("intent not ahead of result")
 	}
@@ -932,6 +942,37 @@ func answerStdin(t *testing.T, answers string) *os.File {
 		t.Fatal(err)
 	}
 	return f
+}
+
+// discard on an IGNORANCE row (locked index = state-unreadable): the
+// refusal carries the fix-the-tool remedy, never the plan/--override-manual
+// pointers that would refuse it too (round 11's pin of the round-10 fold).
+func TestWiringDiscardIgnoranceRemedy(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "locked")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	wireGit(t, repo, "commit", "-q", "--allow-empty", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, ".git", "index.lock"), []byte("held"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	var e bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, &e, os.Stdin); code != ExitUsage {
+		t.Fatalf("locked-index discard: %d (want 120)", code)
+	}
+	// The contract is NO DEAD GATES on ignorance rows: neither the
+	// plan/--override-manual pointers nor a false remedy may appear (the
+	// two honest shapes are the unreadable-state retry and the
+	// fix-the-tool remedy).
+	if strings.Contains(e.String(), "--include") || strings.Contains(e.String(), "--override-manual") {
+		t.Fatalf("dead-gate pointers advertised on an ignorance row: %q", e.String())
+	}
+	if !strings.Contains(e.String(), "fix the tool") && !strings.Contains(e.String(), "unreadable") {
+		t.Fatalf("ignorance remedy copy missing: %q", e.String())
+	}
 }
 
 // The TTY carve-out choreography end to end through the ForceTerminal

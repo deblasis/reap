@@ -189,7 +189,10 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 			// The forget-then-rm crash shape, in the SHARED pipeline (round
 			// 10: round 9 wired only the scan display, leaving the carve-out
 			// unreachable here while the hint advertised it). KEEP rails
-			// first, then the orphaned-workspace row.
+			// first, then the orphaned-workspace row. The FLAVOR rides the
+			// verdict so every copy site (refusal, hardened confirm, intent
+			// residue) can say 'parent alive, deregistered' instead of the
+			// false 'parent gone'.
 			in.Kind = classify.KindJJWorkspaceOrphaned
 			in.GitBackend = false
 			in.JJ = nil
@@ -197,9 +200,16 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 			in.Protected, _ = config.MatchProtect(info.Path, c.protectExpanded)
 			in.PRHeads = c.prHeads
 			v := verdict.Decide(in)
+			v.Flavor = verdict.FlavorDeregistered
+			if v.Code == "orphaned-workspace" {
+				v.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
+				v.Hint = "deregistered workspace (parent alive, this dir is out of its registry); reap apply --override-manual asks a TTY-only hardened confirm"
+			}
 			e.Verdict, e.ReasonCode, e.Reason, e.Hint = v.Verdict, v.Code, v.Reason, v.Hint
+			e.Kind = string(classify.KindJJWorkspaceOrphaned)
 			e.Held = in.Held
 			e.OrphanedCarveOut = v.OrphanedCarveOut
+			e.BlockedClassFact = v.BlockedClassFact
 			return e, v, classify.Info{Kind: classify.KindJJWorkspaceOrphaned}, nil
 		}
 		in.JJ = &f
@@ -261,7 +271,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		case c.vd.Verdict == verdict.Safe:
 			take = true
 		case c.vd.OrphanedCarveOut && (inc[c.vd.Code] || ovr[config.Canonical(c.entry.Path)]):
-			counts := "counts unknowable, parent gone"
+			counts := countsFor(c.vd.Flavor)
 			if c.vd.BlockedClassFact != "" {
 				counts = c.vd.BlockedClassFact
 			}
@@ -313,6 +323,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		if c.vd.OrphanedCarveOut && c.vd.BlockedClassFact != "" {
 			pe.OrphanCounts = c.vd.BlockedClassFact
 		}
+		pe.Flavor = c.vd.Flavor
 		if widened && c.vd.BlockedClassFact != "" {
 			// Shadowed BLOCKED facts ride the plan row (spec: residue noted
 			// in the plan row)  -  the deletion is accepted WITH this overlap.
@@ -406,7 +417,7 @@ func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.Exc
 	if len(orphaned) > 0 {
 		fmt.Fprintln(w, "OVERRIDDEN-ORPHANED (TTY-only hardened confirm; capped plain-copy quarantine first):")
 		for _, p := range orphaned {
-			counts := "counts unknowable, parent gone"
+			counts := countsFor(p.Flavor)
 			if p.OrphanCounts != "" {
 				counts = p.OrphanCounts
 			}
@@ -629,7 +640,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if !p.Orphaned {
 				continue
 			}
-			counts := "counts unknowable, parent gone"
+			counts := countsFor(p.Flavor)
 			if p.OrphanCounts != "" {
 				counts = p.OrphanCounts + " (parent present but broken)"
 			}
@@ -867,7 +878,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		if p.Orphaned && carveMode == "plain-copy" {
 			counts := p.OrphanCounts
 			if counts == "" {
-				counts = "counts unknowable, parent gone"
+				counts = countsFor(p.Flavor)
 			}
 			if rc := writeIntent("hardened confirm shown (counts: "+counts+"); plain copy taken", rv.Manifest); rc >= 0 {
 				return rc
@@ -1022,11 +1033,32 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 		// planned row: refuse naming the row  -  INCLUDING the shadowed case
 		// (the displayed code differs from the include code; the BLOCKED
 		// fact still rides this candidate).
-		if inc[c.vd.Code] && !planned[cp] {
+		// The UNDERLYING SHAPE survives rails: a held/protected orphan
+		// still matched --include orphaned-workspace by shape even though
+		// the KEEP rail rewrote its displayed code (the round-10
+		// held-shadow silent zero).
+		shapeCode := ""
+		switch c.cls.Kind {
+		case classify.KindJJWorkspaceOrphaned:
+			shapeCode = "orphaned-workspace"
+		case classify.KindGitWorktreeOrphaned:
+			shapeCode = "orphaned-worktree"
+		}
+		if (inc[c.vd.Code] || (shapeCode != "" && inc[shapeCode])) && !planned[cp] {
 			out = append(out, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, c.vd.Code, fact))
 		}
 	}
 	return out
+}
+
+// countsFor is the carve-out's counts line, flavor-aware: the
+// deregistered workspace's parent is ALIVE one directory up, and the
+// consent gate must not assert otherwise.
+func countsFor(flavor string) string {
+	if flavor == verdict.FlavorDeregistered {
+		return "deregistered workspace (parent alive, this dir is out of its registry)"
+	}
+	return "counts unknowable, parent gone"
 }
 
 func sumExcluded(below []applycmd.ExcludedRef) int64 {

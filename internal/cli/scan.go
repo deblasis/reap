@@ -348,12 +348,17 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 			in.GitBackend = false
 			e.Kind = string(classInfo.Kind)
 			v := verdict.Decide(in)
+			v.Flavor = verdict.FlavorDeregistered
 			e.Verdict = v.Verdict
 			e.ReasonCode = v.Code
 			// The reason must not say "parent gone" when the parent is
 			// alive: this shape is DEREGISTERED (the forget-then-rm crash
-			// window), not parent-less.
-			e.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
+			// window), not parent-less. KEEP rows keep the rail's own
+			// story (held-by-user), not the flavor's.
+			if v.Code == "orphaned-workspace" {
+				e.Reason = "deregistered workspace (parent alive, this dir is out of its registry)"
+				v.Hint = "deregistered workspace (parent alive, this dir is out of its registry); reap apply --override-manual asks a TTY-only hardened confirm"
+			}
 			e.Hint = v.Hint
 			e.Held = in.Held
 			e.OrphanedCarveOut = v.OrphanedCarveOut
