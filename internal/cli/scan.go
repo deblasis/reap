@@ -89,7 +89,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	// Corrupt protective state must fail the scan rather than silently
 	// vanish: a truncated holds.json (or a bad protect glob) un-protecting
 	// dirs is the worst failure direction reap has.
-	holds, err := loadHolds(stateDir)
+	holds, expiredHolds, err := loadHoldsWithExpired(stateDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap scan: %v\n", err)
 		return ExitState
@@ -116,7 +116,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 		go func() {
 			defer wg.Done()
 			for info := range jobs {
-				e := buildEntry(info, now, cfg, holds, useGit, useJJ, prHeads,
+				e := buildEntry(info, now, cfg, holds, expiredHolds, useGit, useJJ, prHeads,
 					gitBudget, jjBudget, fetchBudget, remoteStale, protectedExpanded)
 				mu.Lock()
 				entries = append(entries, e)
@@ -191,7 +191,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	return ExitOK
 }
 
-func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool,
+func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool, expiredHolds map[string]time.Time,
 	useGit, useJJ bool, prHeads *ghx.PRHeads,
 	gitBudget, jjBudget, fetchBudget, remoteStale time.Duration, protectExpanded []string) report.Entry {
 
@@ -301,6 +301,12 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	e.Held = in.Held
 	e.BlockedClassFact = v.BlockedClassFact
 	e.OrphanedCarveOut = v.OrphanedCarveOut
+	// Expiry-at-consequence, scan half: a pin that lapsed within 7 days
+	// marks the row so the KEEP->other flip is visible on the main screen
+	// (plan renders its own distinct section from the same side map).
+	if exp, ok := expiredHolds[config.Canonical(info.Path)]; ok {
+		e.Reason = e.Reason + fmt.Sprintf(" [hold expired %s (%dd ago)]", exp.Format("2006-01-02"), int(now.Sub(exp).Hours()/24))
+	}
 	e.OpenPR = v.OpenPRSlug != ""
 	// The orphaned detail: counts when they are knowable, honestly
 	// "unknowable" when the parent is gone (the M2 hardened confirm needs
