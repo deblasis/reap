@@ -10,8 +10,10 @@ verdict SAFE on stale, missing, or errored evidence, and no path may reach
 deletion for a directory carrying any BLOCKED-class fact, except the one named
 orphaned carve-out behind a TTY-only hardened confirm.
 
-Status: under construction (M1: scan + verdict engine). The command surface,
-verdict matrix, and every safety contract live in the design spec.
+Status: M3 shipped (scan, plan, apply, discard + quarantine, holds, log,
+doctor, carve-out). `reap activity` lands with M4 (incoda lane.log
+attribution). The verdict matrix and every safety contract live in the
+design spec.
 
 ```
 reap scan      [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj] [--json]
@@ -30,5 +32,18 @@ reap unhold PATH
 reap holds     [--json]
 reap doctor
 ```
+
+## Testing
+
+The gate is the full local suite:
+
+```
+go test -p 1 ./... -count=1 -timeout 40m
+```
+
+Serialized (`-p 1`) deliberately: the git-heavy packages run long, and the
+parallel default's per-package timeout trips on a loaded workstation
+(every package passes; the default just times out mid-flight). CI-less by
+policy; this command is the milestone gate.
 
 Private tool for one workstation; sibling of [incoda](https://github.com/deblasis/incoda).

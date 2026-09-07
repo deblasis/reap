@@ -75,9 +75,13 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// Children: workspace list prints `<name>: <relative-path> <change-id>...`
 	// (verified 0.44). The path is the first token after ": ", relative to the
 	// parent; the default workspace ("." — the repo itself) is not a child.
-	// Paths containing spaces would defeat the first-token split; workspace
-	// roots with spaces are vanishingly rare and the miss fails soft (an
-	// unreadable path simply never matches a candidate).
+	// CRITICAL when run FROM a workspace: the default workspace's path then
+	// resolves to the PARENT, which passes the plain self-filter and would
+	// make every live workspace's only "child" its own immortal parent —
+	// parent-of-live-children forever, advertising a gate re-verify can
+	// never execute (the round-6 engineering finding). The pointer target
+	// (the repo this workspace BELONGS to) is excluded alongside dir.
+	pointerTarget := jjRepoPointerPath(dir)
 	if out, err := r.run(dir, "workspace", "list"); err == nil {
 		for _, line := range nonEmpty(out) {
 			i := strings.Index(line, ": ")
@@ -102,6 +106,9 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 			// the parent, not a child.
 			if config.Canonical(p) == config.Canonical(dir) {
 				continue
+			}
+			if pointerTarget != "" && config.Canonical(p) == config.Canonical(pointerTarget) {
+				continue // this workspace's own parent: not its child
 			}
 			f.Children = append(f.Children, p)
 		}
@@ -325,6 +332,33 @@ func hasGitRemote(dir string) bool {
 		}
 	}
 	return false
+}
+
+// jjRepoPointerPath reads .jj/repo and returns the repo path it names
+// ("" for root repos or absent markers) — the parent a workspace belongs
+// to, used to exclude it from the workspace's own children.
+func jjRepoPointerPath(dir string) string {
+	raw, err := os.ReadFile(filepath.Join(dir, ".jj", "repo"))
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "." {
+		return ""
+	}
+	if !filepath.IsAbs(s) {
+		// jj's semantics: relative to the .jj directory (mirrors classify).
+		if jjRel := filepath.Join(dir, ".jj", s); dirExistsJJ(jjRel) {
+			return jjRel
+		}
+		return filepath.Clean(filepath.Join(dir, s))
+	}
+	return s
+}
+
+func dirExistsJJ(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // Available reports whether jj is on PATH.

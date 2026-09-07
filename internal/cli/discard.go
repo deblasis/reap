@@ -356,9 +356,9 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// intent-before-DELETION, and the skip/refusal lines above cover
 		// everything that did not get this far.
 		intent := auditlog.Line{Event: "intent", Path: path, Kind: string(cls.Kind), SizeBytes: w.size, Quarantine: nil}
-		if len(rv.Nested) > 0 {
-			intent.Residue = "nested: " + strings.Join(rv.Nested, ", ")
-		}
+		// (No nested residue here: discard structurally REFUSES any dir
+		// with nested repos before this line — the round-6 engineering
+		// finding killed the dead branch that claimed parity.)
 		if rc := appendOrAbort(intent); rc >= 0 {
 			return rc
 		}

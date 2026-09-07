@@ -768,6 +768,41 @@ func TestSnapshotUnbornRefusedNoIndexPoison(t *testing.T) {
 	}
 }
 
+// The unborn hoist RED-FIRST (round 7): fail AddAll on an unborn repo
+// (locked file) and assert no .git/index survives the ERROR branch — the
+// round-5 fixture refused at post-capture pricing, which the old
+// success-tail cleanup already handled, so it could not fail on the bug.
+func TestSnapshotUnbornAddAllFailNoIndex(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	big := make([]byte, 1<<20)
+	if _, err := crand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(repo, "locked.bin")
+	if err := os.WriteFile(victim, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, herr := holdNoShare(t, victim)
+	if herr != nil {
+		t.Skipf("cannot hold file: %v", herr)
+	}
+	defer held.Close()
+
+	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
+	_, err := Snapshot(filepath.Join(t.TempDir(), "s"), repo, gr, Options{Mode: "bundle"})
+	if err == nil {
+		t.Fatal("locked file must fail the capture")
+	}
+	if _, serr := os.Stat(filepath.Join(repo, ".git", "index")); serr == nil {
+		t.Fatal("AddAll-failure path left a .git/index behind (ACTIVE poisoning on the error branch)")
+	}
+}
+
 // Revalidate's three states, pinned: advertised base = verified-ok; base
 // absent from a reachable remote = at-risk; unreachable remote =
 // unverified (never conflated with at-risk).

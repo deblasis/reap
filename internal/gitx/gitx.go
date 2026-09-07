@@ -9,6 +9,7 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -243,6 +244,27 @@ func (r Runner) Remotes(dir string) map[string]string {
 	return m
 }
 
+// gitError carries the structured shape of a failed git call: exit code
+// (when git exited), captured stderr, and whether it was a timeout. The
+// unborn-HEAD discrimination (quiet exit 1 with empty stderr) keys on
+// THESE fields, never on string suffixes of the formatted message.
+type gitError struct {
+	ExitCode int
+	Stderr   string
+	Timeout  bool
+	msg      string
+}
+
+func (e *gitError) Error() string { return e.msg }
+
+// isQuietUnborn is the ONE unborn-HEAD predicate, shared: git exited 1
+// with nothing on stderr — `rev-parse --verify -q` on a missing HEAD.
+// Fatals (corrupt repo, missing dir) and timeouts are NOT unborn.
+func isQuietUnborn(err error) bool {
+	ge, ok := err.(*gitError)
+	return ok && !ge.Timeout && ge.ExitCode == 1 && ge.Stderr == ""
+}
+
 func (r Runner) run(dir string, budget time.Duration, args ...string) (string, error) {
 	if budget <= 0 {
 		return "", fmt.Errorf("no exec budget configured; refusing to run unbounded")
@@ -263,10 +285,15 @@ func (r Runner) run(dir string, budget time.Duration, args ...string) (string, e
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("timeout after %s", budget)
+		return "", &gitError{Timeout: true, msg: fmt.Sprintf("timeout after %s", budget)}
 	}
 	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+		ge := &gitError{Stderr: strings.TrimSpace(stderr.String()), msg: fmt.Sprintf("%v: %s", err, strings.TrimSpace(stderr.String()))}
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			ge.ExitCode = ee.ExitCode()
+		}
+		return "", ge
 	}
 	return stdout.String(), nil
 }
@@ -748,15 +775,13 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // fine (spec fixture list; the round-3 regression that broke exactly this).
 func (r Runner) ReflogOnlyCommits(dir string) ([]string, error) {
 	// The unborn probe must NOT swallow a timeout or a corrupt repo (the
-	// round-4 completeness hole Facts guards at line ~117). The unborn
-	// shape is EXACTLY quiet-exit-1 with empty stderr (`rev-parse
-	// --verify -q` on a missing HEAD prints nothing); our run() wrapper
-	// formats errors "%v: %s" so a quiet failure ends with ": " — anything
-	// else (a fatal from a corrupt .git, a timeout) PROPAGATES: pinning
-	// nothing while claiming completeness is the forbidden lie.
+	// round-4 completeness hole Facts guards). The ONE predicate — quiet
+	// exit 1, empty stderr — is typed (gitError), never a string suffix:
+	// a git killed by a signal with empty stderr must not read as unborn
+	// (the round-6 engineering nit).
 	if out, err := r.run(dir, r.GitBudget, "rev-parse", "--verify", "-q", "HEAD"); err != nil {
-		if strings.HasSuffix(err.Error(), ": ") {
-			return nil, nil // quiet missing-ref: unborn HEAD, no reflog to pin
+		if isQuietUnborn(err) {
+			return nil, nil // unborn HEAD: no reflog to pin
 		}
 		return nil, err
 	} else if strings.TrimSpace(out) == "" {

@@ -867,6 +867,62 @@ func TestWiringCarveOutTTYFlows(t *testing.T) {
 	if _, err := os.Stat(wt2); err != nil {
 		t.Fatal("dir deleted after a decline")
 	}
+
+	// The over-cap branch (tiny cap): accept-accept-accept deletes with
+	// mode=plain-copy-skipped-overcap on the ledger; accept-accept-decline
+	// skips with skipWhy=snapshot-overcap and exit 2 (dir intact).
+	tinyCfg := func(stateDir, root string) {
+		cfg := `{
+  "roots": ["` + filepath.ToSlash(root) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 0.001, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 8, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": false,
+  "jj": true
+}`
+		if err := os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wt3 := makeOrphan(t)
+	if err := os.WriteFile(filepath.Join(wt3, "bulk.bin"), make([]byte, 4<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, wt3, 30*24*time.Hour)
+	tinyCfg(stateDir, filepath.Dir(wt3))
+	// TTY-gated runs must pass an *os.File stdout: IsTerminal type-asserts
+	// it (the seam forces the fd probe, but not the type check).
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt3}, os.Stdout, os.Stderr, answerFile(t, "y\ny\ny\n")); code != ExitOK {
+		t.Fatalf("TTY over-cap accept: %d", code)
+	}
+	if _, err := os.Stat(wt3); !os.IsNotExist(err) {
+		t.Fatal("over-cap-accepted dir survived three confirms")
+	}
+	wt4 := makeOrphan(t)
+	if err := os.WriteFile(filepath.Join(wt4, "bulk.bin"), make([]byte, 4<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, wt4, 30*24*time.Hour)
+	tinyCfg(stateDir, filepath.Dir(wt4))
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt4}, os.Stdout, os.Stderr, answerFile(t, "y\ny\nn\n")); code != applycmd.ExitWithSkips {
+		t.Fatalf("TTY over-cap decline: %d (want 2)", code)
+	}
+	if _, err := os.Stat(wt4); err != nil {
+		t.Fatal("over-cap-declined dir was deleted")
+	}
+	ledger, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(ledger), `"skipWhy":"snapshot-overcap"`) {
+		t.Fatalf("decline skip line must carry snapshot-overcap:\n%s", ledger)
+	}
+
+	// --include can NEVER reach the carve-out (spec) — even on a TTY.
+	wt5 := makeOrphan(t)
+	writeWireConfig(t, stateDir, filepath.Dir(wt5))
+	if code := cmdApply([]string{"--no-gh", "--include", "orphaned-worktree"}, os.Stdout, os.Stderr, answerFile(t, "y\ny\n")); code != ExitUsage {
+		t.Fatalf("TTY --include orphaned-worktree must refuse (120), got %d", code)
+	}
+	if _, err := os.Stat(wt5); err != nil {
+		t.Fatal("dir deleted via --include reach-through")
+	}
 }
 
 // A LIVE split jj workspace classifies as jj-workspace with its parent
