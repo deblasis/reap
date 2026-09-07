@@ -32,8 +32,13 @@ func Resolve(dir string) (Layout, bool) {
 		return Layout{}, false
 	}
 	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "." || s == filepath.Clean(dir) {
-		return Layout{}, true // root repo (or unresolvable relative)
+	if s == "" || s == "." {
+		return Layout{}, true // root repo
+	}
+	// Case-folded self-compare (round 9): a hand-rolled pointer naming the
+	// dir itself with different case is still the dir itself.
+	if strings.EqualFold(filepath.Clean(s), filepath.Clean(dir)) {
+		return Layout{}, true
 	}
 	if !filepath.IsAbs(s) {
 		// jj's semantics: relative to the .jj directory.
@@ -48,7 +53,7 @@ func Resolve(dir string) (Layout, bool) {
 	// a store under .jj\repo\store\... — the owning root is the first
 	// .jj-repo ancestor's parent either way.
 	l.ParentRoot = parentRootOf(s)
-	if filepath.Clean(l.ParentRoot) == filepath.Clean(dir) {
+	if strings.EqualFold(filepath.Clean(l.ParentRoot), filepath.Clean(dir)) {
 		return Layout{}, true // the dir is its own parent: root repo
 	}
 	return l, true

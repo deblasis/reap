@@ -794,6 +794,67 @@ func TestWiringWideningGateRefusesIgnorance(t *testing.T) {
 	}
 }
 
+// The spec-listed --override-manual refusal trio (L658-661), pinned two
+// rounds late: KEEP (held) and BLOCKED-class-shadowed refuse at 120 naming
+// the row and the shadowed fact, in plan AND apply (ignorance was already
+// pinned). A regression deleting the refusal pass must fail here.
+func TestWiringOverrideRefusalTrio(t *testing.T) {
+	root, _ := wireFixture(t)
+
+	// KEEP: hold a scratch dir, then --override-manual it.
+	held := filepath.Join(root, "held")
+	if err := os.MkdirAll(held, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(held, "x.bin"), make([]byte, 3000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-40 * 24 * time.Hour)
+	filepath.WalkDir(held, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+	if code := cmdHold([]string{"--for", "168h", held}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+	var e2 bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes", "--override-manual", held}, &bytes.Buffer{}, &e2, os.Stdin); code != ExitUsage {
+		t.Fatalf("apply override held: %d (want 120)", code)
+	}
+	if !strings.Contains(e2.String(), "not override-eligible") {
+		t.Fatalf("held refusal copy: %q", e2.String())
+	}
+
+	// BLOCKED-class-shadowed: a dirty repo (BLOCKED dirty-files) given as
+	// --override-manual must refuse naming the shadowed fact, not widen.
+	dirty := filepath.Join(root, "dirtyrepo")
+	if err := os.MkdirAll(dirty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, dirty, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dirty, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, dirty, "add", "-A")
+	wireGit(t, dirty, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(dirty, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, dirty, 30*24*time.Hour)
+	var e3 bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes", "--override-manual", dirty}, &bytes.Buffer{}, &e3, os.Stdin); code != ExitUsage {
+		t.Fatalf("apply override dirty: %d (want 120)", code)
+	}
+	if !strings.Contains(e3.String(), "not override-eligible") || !strings.Contains(e3.String(), "shadowed fact") {
+		t.Fatalf("shadowed refusal copy: %q", e3.String())
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatal("dirty dir deleted by an override refusal")
+	}
+}
+
 // The TTY carve-out choreography end to end through the ForceTerminal
 // seam (round-6: ~80 lines of the tool's most dangerous surface had zero
 // automated coverage because the terminal probe was untestable under

@@ -127,7 +127,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		cls := classify.Dir(path)
 		if cls.Kind == classify.KindJJRepo && !cls.GitBackend {
-			fmt.Fprintf(stderr, "reap discard: %s: refused: pure jj repo (no colocated git backend); quarantine capture needs the git backend — resolve manually (jj git init --colocate, or push), then discard again\n", path)
+			fmt.Fprintf(stderr, "reap discard: %s: refused: pure jj repo (no colocated git backend); quarantine capture needs the git backend; resolve manually (jj git init --colocate, or push), then discard again\n", path)
 			refused = true
 			continue
 		}
@@ -171,7 +171,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 		} else {
 			// TTY guaranteed by the usage gate above.
-			fmt.Fprintln(stdout, "NO quarantine: dirty files, untracked files, ignored files, stashes, unpushed commits (branch and reflog-only), and jj changes will NOT be captured — deletion is UNRECOVERABLE")
+			fmt.Fprintln(stdout, "NO quarantine: dirty files, untracked files, ignored files, stashes, unpushed commits (branch and reflog-only), and jj changes will NOT be captured; deletion is UNRECOVERABLE")
 			for _, w := range work {
 				fmt.Fprintf(stdout, "  discard %s (%.1f GB)\n", w.path, float64(w.size)/(1<<30))
 			}
@@ -334,7 +334,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if rv.Verdict.Verdict == verdict.Safe {
 				refuse("SAFE; reap plan/apply is the deletion path for this dir", rv.Verdict.Code)
 			} else if rv.Verdict.Verdict == verdict.Active {
-				refuse(fmt.Sprintf("ACTIVE (%s); let it idle past the activity window — discard is the BLOCKED resolver, not the activity override", rv.Verdict.Code), rv.Verdict.Code)
+				refuse(fmt.Sprintf("ACTIVE (%s); let it idle past the activity window; discard is the BLOCKED resolver, not the activity override", rv.Verdict.Code), rv.Verdict.Code)
 			} else {
 				refuse(fmt.Sprintf("no BLOCKED-class fact (verdict %s: %s); run reap plan --include %s or reap apply --override-manual",
 					rv.Verdict.Verdict, rv.Verdict.Code, rv.Verdict.Code), rv.Verdict.Code)
@@ -469,7 +469,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					if named == "" {
 						named = "refs/reap/*"
 					}
-					fmt.Fprintf(stderr, "reap discard: %s: bundle verify FAILED — the captured content provably lives at %s inside %s (dir untouched); recover manually before discarding\n", path, named, path)
+					fmt.Fprintf(stderr, "reap discard: %s: bundle verify FAILED; the captured content provably lives at %s inside %s (dir untouched); recover manually before discarding\n", path, named, path)
 					ok := false
 					_ = log.Append(auditlog.Line{Event: "result", Path: path, Mode: "verify-failed", OK: &ok,
 						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,

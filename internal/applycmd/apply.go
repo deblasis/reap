@@ -573,7 +573,11 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 		_ = d.Git.WorktreePrune(classInfo.ParentRepo)
 		return "worktree-remove+rm", nil
 	}
-	if (classInfo.Kind == classify.KindJJWorkspace || classInfo.Kind == classify.KindJJRepo) && classInfo.ParentRepo != "" {
+	// WORKSPACES only (round 9): a jj ROOT repo has no workspace to forget
+	// — jj 0.44's forget of a nonexistent name is an exit-0 "Nothing
+	// changed" warning, so running it anyway labeled root deletions
+	// mode=jj-forget+rm, asserting a deregistration that never happened.
+	if classInfo.Kind == classify.KindJJWorkspace && classInfo.ParentRepo != "" {
 		if err := d.JJ.WorkspaceForget(classInfo.ParentRepo, workspaceName(classInfo.ParentRepo, path, d.JJ)); err != nil {
 			// Spec: forget must succeed before rm; failure routes MANUAL.
 			return mode, fmt.Errorf("%w: jj workspace forget: %v", errDeregister, err)

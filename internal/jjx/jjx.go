@@ -32,6 +32,13 @@ type Runner struct {
 type Facts struct {
 	Unavailable bool
 	Why         string
+	// Deregistered: the workspace's parent is alive but this working copy
+	// is no longer in its registry (the forget-then-rm crash window): jj
+	// fails with "doesn't have a working-copy commit". Without this flag
+	// the row lands facts-unavailable — the one verdict class with no
+	// deletion path — instead of orphaned-workspace, which the carve-out
+	// covers.
+	Deregistered bool
 	// UnpushedChanges counts commits in ::@ that no remote bookmark reaches.
 	UnpushedChanges int
 	// RemoteStale: remote bookmarks are older than the caller's window (or a
@@ -67,6 +74,14 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 		restore()
 		f.Unavailable = true
 		f.Why = fmt.Sprintf("jj log: %v", err)
+		// The deregistered-but-standing shape (forget succeeded, the rm
+		// crashed): the parent is alive, this dir is out of its registry,
+		// and jj refuses with "doesn't have a working-copy commit".
+		// Route it to the carve-out, not the no-deletion-path ignorance
+		// class (the round-8 reliability finding).
+		if strings.Contains(err.Error(), "doesn't have a working-copy commit") {
+			f.Deregistered = true
+		}
 		return f
 	}
 	f.UnpushedChanges = len(nonEmpty(out))
@@ -332,33 +347,6 @@ func hasGitRemote(dir string) bool {
 		}
 	}
 	return false
-}
-
-// jjRepoPointerPath reads .jj/repo and returns the repo path it names
-// ("" for root repos or absent markers) — the parent a workspace belongs
-// to, used to exclude it from the workspace's own children.
-func jjRepoPointerPath(dir string) string {
-	raw, err := os.ReadFile(filepath.Join(dir, ".jj", "repo"))
-	if err != nil {
-		return ""
-	}
-	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "." {
-		return ""
-	}
-	if !filepath.IsAbs(s) {
-		// jj's semantics: relative to the .jj directory (mirrors classify).
-		if jjRel := filepath.Join(dir, ".jj", s); dirExistsJJ(jjRel) {
-			return jjRel
-		}
-		return filepath.Clean(filepath.Join(dir, s))
-	}
-	return s
-}
-
-func dirExistsJJ(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && fi.IsDir()
 }
 
 // Available reports whether jj is on PATH.

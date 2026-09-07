@@ -362,7 +362,9 @@ func TestWorktreeOwnIndexLockDetected(t *testing.T) {
 
 // The candidate is never its own child: an only-child worktree lists its own
 // registration in the parent's worktrees dir, and that self-entry must not
-// display parent-of-live-children over the worktree's real row.
+// display parent-of-live-children over the worktree's real row. Extended
+// (round 9) with the SIBLING shape: neither worktree counts the other
+// (the shared common dir lists them all; only the ROOT enumerates children).
 func TestWorktreeNotItsOwnChild(t *testing.T) {
 	base := t.TempDir()
 	repo, _ := newRepoAt(t, base)
@@ -370,15 +372,24 @@ func TestWorktreeNotItsOwnChild(t *testing.T) {
 	run(t, repo, "worktree", "add", "-q", "--detach", wt)
 
 	f := runner().Facts(wt, time.Now(), 72*time.Hour)
-	for _, c := range f.Children {
-		if strings.EqualFold(filepath.Clean(longPath(c)), filepath.Clean(longPath(wt))) {
-			t.Fatalf("worktree lists itself as a child: %v", f.Children)
-		}
+	if len(f.Children) != 0 {
+		t.Fatalf("worktree must row NO children (self or sibling): %v", f.Children)
 	}
-	// The PARENT still sees it as a live child (that is correct and wanted).
+
+	wt2 := filepath.Join(base, "wt2")
+	run(t, repo, "worktree", "add", "-q", "--detach", wt2)
+	f2 := runner().Facts(wt2, time.Now(), 72*time.Hour)
+	if len(f2.Children) != 0 {
+		t.Fatalf("second worktree must row NO children: %v", f2.Children)
+	}
+	f1 := runner().Facts(wt, time.Now(), 72*time.Hour)
+	if len(f1.Children) != 0 {
+		t.Fatalf("first worktree must not adopt its sibling: %v", f1.Children)
+	}
+	// The PARENT still sees both as live children (correct and wanted).
 	pf := runner().Facts(repo, time.Now(), 72*time.Hour)
-	if len(pf.Children) != 1 {
-		t.Fatalf("parent must see the live worktree: %v", pf.Children)
+	if len(pf.Children) != 2 {
+		t.Fatalf("parent must see both live worktrees: %v", pf.Children)
 	}
 }
 

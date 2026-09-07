@@ -138,7 +138,8 @@ func NewRunID() string {
 
 // FreeBytes reports free space on the volume holding path (0 on error: the
 // envelope fields are diagnostics, not gates - the preflight floors use
-// their own checked reads).
-func FreeBytes(path string) uint64 {
+// their own checked reads). It is a VAR so tests can drive mid-run
+// free-space drops (the floor-stop choreography reads real disk otherwise).
+var FreeBytes = func(path string) uint64 {
 	return diskFree(path)
 }

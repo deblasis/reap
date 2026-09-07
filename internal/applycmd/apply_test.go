@@ -2,6 +2,7 @@ package applycmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/gitx"
+	"github.com/deblasis/reap/internal/jjx"
 )
 
 // Lineage: children (worktrees/workspaces whose parent is also in the set)
@@ -116,6 +118,61 @@ func TestDeleteRemovesEverything(t *testing.T) {
 	}
 	if _, err := os.Stat(longPath(target)); !os.IsNotExist(err) {
 		t.Fatal("target must be gone")
+	}
+}
+
+// The goal-4 deregister-then-delete pin (round 9; its only previous
+// incarnation lived in a deleted probe package): Delete on a jj workspace
+// forgets against the ROOT shape, removes the dir, and leaves the parent's
+// registry clean.
+func TestWorkspaceDeleteE2E(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	parent := filepath.Join(base, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "w")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "g.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := classify.Dir(ws)
+	if info.Kind != classify.KindJJWorkspace {
+		t.Fatalf("kind: %s", info.Kind)
+	}
+	d := Deleter{
+		Git: gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second},
+		JJ:  jjx.Runner{Budget: 60 * time.Second},
+	}
+	mode, derr := Delete(ws, info, d)
+	if derr != nil {
+		t.Fatalf("delete: %v", derr)
+	}
+	if mode != "jj-forget+rm" {
+		t.Fatalf("mode: %s", mode)
+	}
+	if _, serr := os.Stat(ws); !os.IsNotExist(serr) {
+		t.Fatal("workspace dir survived")
+	}
+	if _, serr := os.Stat(parent); serr != nil {
+		t.Fatal("parent was damaged")
+	}
+	if out, lerr := exec.Command("jj", "-R", parent, "workspace", "list").CombinedOutput(); lerr != nil {
+		t.Fatalf("parent jj broken after forget: %v\n%s", lerr, out)
+	} else if strings.Contains(string(out), filepath.Join(base, "w")) {
+		t.Fatalf("parent registry still lists the deleted workspace:\n%s", out)
 	}
 }
 

@@ -734,7 +734,15 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return appendOrAbort(intent)
 		}
 		if !p.Orphaned {
-			if rc := writeIntent("", nil); rc >= 0 {
+			// Manifest write-ahead for EVERY non-clean deletion (round 9:
+			// carve-out rows had it; widened scratch/ignored/nested rows
+			// are the same crash-window shape — 'gone is never contents
+			// unknown' rides the fsynced ledger, not the post-Delete line).
+			intentManifest := []byte(nil)
+			if p.Code != "clean-pushed" {
+				intentManifest = rv.Manifest
+			}
+			if rc := writeIntent("", intentManifest); rc >= 0 {
 				return rc
 			}
 		}
@@ -773,6 +781,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
 						SkipWhy: applycmd.SkipSnapshotOvercap, OK: &ok, Quarantine: &session,
 						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code,
+						Residue: "free space below floor after the plain copy; session kept",
 					}); rc >= 0 {
 						return rc
 					}

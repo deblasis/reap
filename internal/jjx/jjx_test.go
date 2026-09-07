@@ -60,23 +60,37 @@ func colocate(t *testing.T, dir string) {
 	t.Fatal("jj git init: no supported spelling")
 }
 
-// The round-7/8 children semantics, pinned from the WORKSPACE side: a
-// workspace enumerates NO children (its parent is the default workspace's
-// ROOT — never its child; siblings belong to the parent's row, not this
-// one). The round-7 fold shipped as a no-op because the exclusion compared
-// the pointer's REPO-DIR shape against list's ROOT shape.
-func TestWorkspaceFromWorkspaceSideHasNoChildren(t *testing.T) {
+// jjRoot gives jj-executing fixtures a SHORT temp root: t.TempDir names
+// itself after the test, and jj's 128-hex op-store filenames under a long
+// name cross MAX_PATH 260, which made round-8's headline pin
+// deterministically self-skip (and is the root cause of the chronic
+// "op-store write flakes under load" as TempDir suffixes grow).
+func jjRoot(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
+}
+
+// TestWSideNoChildren: a workspace enumerates NO children (its parent is
+// the default workspace's ROOT; siblings belong to the parent's row).
+// Short name + short root: this test deterministically self-skipped under
+// the default gate in round 8 (its 43-char name made the op path 261).
+func TestWSideNoChildren(t *testing.T) {
 	needJJ(t)
-	base := t.TempDir()
-	parent := filepath.Join(base, "parent")
+	base := jjRoot(t)
+	parent := filepath.Join(base, "p")
 	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
 		t.Skipf("jj git init --colocate: %v\n%s", err, out)
 	}
-	ws1 := filepath.Join(base, "ws1")
+	ws1 := filepath.Join(base, "w1")
 	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws1).CombinedOutput(); err != nil {
 		t.Skipf("jj workspace add: %v\n%s", err, out)
 	}
-	ws2 := filepath.Join(base, "ws2")
+	ws2 := filepath.Join(base, "w2")
 	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws2).CombinedOutput(); err != nil {
 		t.Skipf("jj workspace add 2: %v\n%s", err, out)
 	}

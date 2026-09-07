@@ -413,7 +413,7 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 			if rerr = r.RestoreBackup(dir, backup); rerr != nil {
 				// The all-staged index is live on disk; do not hide it.
 				_ = r.ResetIndex(dir)
-				return fmt.Errorf("index restore failed (%v); index reset to HEAD — staged state may be lost, .git/index.reap-backup may remain", rerr)
+				return fmt.Errorf("index restore failed (%v); index reset to HEAD; staged state may be lost, .git/index.reap-backup may remain", rerr)
 			}
 		} else {
 			rerr = r.ResetIndex(dir)

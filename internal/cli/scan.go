@@ -331,6 +331,21 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	jjReachable := classInfo.Kind == classify.KindJJRepo || classInfo.Kind == classify.KindJJWorkspace
 	if useJJ && jjReachable {
 		f := jr.Facts(info.Path, now, remoteStale)
+		if f.Deregistered {
+			// The forget-then-rm crash shape (parent alive, this dir out of
+			// its registry): route to the carve-out, NOT the no-deletion-path
+			// ignorance class. Rebuild the verdict input for the orphaned
+			// kind; the facts are honestly "unknown" for a deregistered copy.
+			classInfo = classify.Info{Kind: classify.KindJJWorkspaceOrphaned}
+			in.Kind = classInfo.Kind
+			in.GitBackend = false
+			v := verdict.Decide(in)
+			e.Verdict = v.Verdict
+			e.ReasonCode = v.Code
+			e.Reason = v.Reason
+			e.Hint = v.Hint
+			return e
+		}
 		in.JJ = &f
 		if f.Unavailable {
 			e.DowngradedBy = strPtr("jj")
