@@ -17,6 +17,7 @@ import (
 	"github.com/deblasis/reap/internal/gitx"
 	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/verdict"
+	"github.com/deblasis/reap/internal/walk"
 )
 
 // cmdDiscard implements `reap discard PATH...`: BLOCKED resolution with
@@ -134,6 +135,12 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			_ = m
 		}
 
+		// Manifest capture BEFORE Delete (the M2 lesson, applied at birth
+		// here): after removal the path cannot be read. The match gate also
+		// returns before manifest capture on a BLOCKED fresh verdict —
+		// discard's expected outcome — so rv.Manifest is empty for BLOCKED.
+		manifest := walk.CappedManifest(path)
+
 		// Confirmation for the batch happens once, before the loop's deletions
 		// (the caller-facing choreography in Confirm covers this path too when
 		// --yes is absent).
@@ -147,8 +154,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		qp := qPtr(qPath)
 		result := auditlog.Line{Event: "result", Path: path, Mode: mode, OK: boolPtr(true), Quarantine: qp,
-			Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Residue: rv.Verdict.BlockedClassFact}
-		result.Manifest = rv.Manifest
+			Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Residue: rv.Verdict.BlockedClassFact, Manifest: manifest}
 		if rv.Git != nil {
 			result.Branch = rv.Git.Branch
 			result.HeadSHA = rv.Git.HEAD
