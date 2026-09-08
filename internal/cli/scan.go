@@ -16,6 +16,7 @@ import (
 	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
+	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/report"
@@ -74,6 +75,17 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	useJJ := !*noJJ && cfg.JJ && jjx.Available()
 	useGit := gitx.Available()
 
+	// incoda attribution (M4): the lane.log digest + live-ticket probe,
+	// computed ONCE per scan. Open records backed by a held ticket at/under
+	// a candidate dir drive the ACTIVE incoda-live rail; attribution is
+	// enrichment, so a missing incoda state dir weakens nothing.
+	incodaLive := map[string]bool{}
+	for _, r := range incodaDigestAll() {
+		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
+			incodaLive[config.Canonical(r.Dir)] = true
+		}
+	}
+
 	// Unreadable roots are named, not silently skipped: a configured root
 	// that cannot be listed yields a marker DirInfo, and hiding it would let
 	// a denied-ACL root read as "scanned, found nothing".
@@ -119,7 +131,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 			defer wg.Done()
 			for info := range jobs {
 				e := buildEntry(info, now, cfg, holds, expiredHolds, useGit, useJJ, prHeads,
-					gitBudget, jjBudget, fetchBudget, remoteStale, protectedExpanded)
+					gitBudget, jjBudget, fetchBudget, remoteStale, protectedExpanded, incodaLive)
 				mu.Lock()
 				entries = append(entries, e)
 				done++
@@ -245,9 +257,32 @@ func stateDirOfScan() string {
 	return d
 }
 
+// anyIncodaUnder reports whether any live-incoda dir sits at or under path
+// (component-boundary match, mirroring anyHoldUnder).
+func anyIncodaUnder(live map[string]bool, path string) bool {
+	if len(live) == 0 {
+		return false
+	}
+	pc := config.Canonical(path)
+	parts := strings.Split(pc, string(os.PathSeparator))
+	for i := len(parts); i >= 1; i-- {
+		if live[strings.Join(parts[:i], string(os.PathSeparator))] {
+			return true
+		}
+	}
+	return false
+}
+
+// incodaDigestAll reads and digests incoda's lane.log (one pass per scan).
+func incodaDigestAll() map[string]*incodalog.Record {
+	records, _ := incodalog.Digest(incodalog.ReadAll())
+	return records
+}
+
 func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool, expiredHolds map[string]time.Time,
 	useGit, useJJ bool, prHeads *ghx.PRHeads,
-	gitBudget, jjBudget, fetchBudget, remoteStale time.Duration, protectExpanded []string) report.Entry {
+	gitBudget, jjBudget, fetchBudget, remoteStale time.Duration, protectExpanded []string,
+	incodaLive map[string]bool) report.Entry {
 
 	e := report.Entry{
 		Path:         info.Path,
@@ -383,6 +418,9 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	if prHeads != nil && prHeads.Unavailable {
 		e.DowngradedBy = strPtr("gh")
 	}
+	// incoda attribution (M4): a live ticket at/under the dir is the
+	// ACTIVE incoda-live rail (enrichment; the empty map weakens nothing).
+	in.IncodaLive = anyIncodaUnder(incodaLive, info.Path)
 	in.Held = anyHoldUnder(holds, info.Path)
 	protected, _ := config.MatchProtect(info.Path, protectExpanded)
 	in.Protected = protected

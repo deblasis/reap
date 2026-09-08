@@ -18,6 +18,7 @@ import (
 	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
+	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/report"
@@ -36,6 +37,9 @@ type scanCore struct {
 	useGit, useJJ   bool
 	protectExpanded []string
 	holds           map[string]bool
+	// incodaLive: canonical live-incoda dirs (M4 enrichment; ACTIVE rail
+	// parity with the scan display pipeline).
+	incodaLive map[string]bool
 	// expiredHolds: canonical path -> expiry, for pins that lapsed within
 	// the last 7 days (the spec's expiry-at-consequence marking).
 	expiredHolds                               map[string]time.Time
@@ -82,6 +86,13 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 		return nil, ExitState
 	}
 	core.holds = holds
+	// incoda attribution (M4): same one-pass digest the scan display uses.
+	core.incodaLive = map[string]bool{}
+	for _, r := range incodaDigestAll() {
+		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
+			core.incodaLive[config.Canonical(r.Dir)] = true
+		}
+	}
 	core.expiredHolds = expired
 	core.remoteStale = time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 	return core, ExitOK
@@ -223,6 +234,7 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 	if c.prHeads != nil && c.prHeads.Unavailable {
 		e.DowngradedBy = strPtr("gh")
 	}
+	in.IncodaLive = anyIncodaUnder(c.incodaLive, info.Path)
 	in.Held = anyHoldUnder(c.holds, info.Path)
 	in.Protected, _ = config.MatchProtect(info.Path, c.protectExpanded)
 	v := verdict.Decide(in)

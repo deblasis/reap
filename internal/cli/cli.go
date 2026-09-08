@@ -42,6 +42,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return cmdDiscard(rest, stdout, stderr, os.Stdin)
 	case "log":
 		return cmdLog(rest, stdout, stderr)
+	case "activity":
+		return cmdActivity(rest, stdout, stderr)
 	case "quarantine":
 		return cmdQuarantine(rest, stdout, stderr, os.Stdin)
 	case "doctor":
@@ -78,6 +80,7 @@ commands:
   plan       resolve the deletion set (SAFE default; --include widens)
   apply      re-verify and delete the plan (write-ahead audit; --yes or TTY)
   discard    quarantine-then-delete BLOCKED dirs (reap discard PATH...)
+  activity   digest incoda lane.log across queues (not reap's history)
   log        read the deletion ledger (reap log [--since DUR])
   quarantine list / prune / restore snapshot sessions
   doctor     state-of-the-world readout (roots, lock, quarantine, ledger)
@@ -93,12 +96,11 @@ reap apply [--roots PATH]... [--min-gb N] [--no-gh] [--no-jj]
            [--include CODE]... [--exclude CODE]... [--override-manual PATH]...
            [--yes] [--dry-run] [--json]
 reap discard PATH... [--yes] [--no-quarantine] [--json]
+reap activity [--since DUR] [--json]
 reap quarantine [list [--json] | prune [--older-than DUR] [--yes] [--json]
                 | restore <session> [--to PATH] [--json]]
 reap log [--since DUR] [--json]
 reap doctor
-
-activity lands with its milestone (see the design spec's normative grammar).
 `)
 }
 

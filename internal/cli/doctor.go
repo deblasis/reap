@@ -12,6 +12,7 @@ import (
 	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
+	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
@@ -110,6 +111,19 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "jj: installed\n")
 	} else {
 		fmt.Fprintf(stdout, "jj: not on PATH (jj facts degrade to facts-unavailable)\n")
+	}
+
+	// incoda state (M4): the dir= coverage share (the attribution PR's
+	// before/after readout) and the live-ticket scan's reachability.
+	incEvents := incodalog.ReadAll()
+	if len(incEvents) == 0 {
+		fmt.Fprintf(stdout, "incoda: no lane.log found (attribution off; %s)\n", incodalog.StateDir())
+	} else {
+		a, tot := incodalog.CoverageShare(incEvents)
+		if tot > 0 {
+			fmt.Fprintf(stdout, "incoda: %d event(s), dir= attribution %d/%d (%.0f%%; until the dir= PR ships, attribution is weak cmd-substring matching)\n",
+				len(incEvents), a, tot, float64(a)/float64(tot)*100)
+		}
 	}
 
 	// Stray healing UNDER apply.lock, HELD ACROSS the heal loop (round-3
