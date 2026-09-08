@@ -8,6 +8,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -123,6 +124,10 @@ func Load(dir string) (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read config: %w", err)
 	}
+	// Strip a leading UTF-8 BOM: PowerShell 5's Set-Content -Encoding UTF8
+	// writes one, and json.Unmarshal treats it as garbage (a Windows-first
+	// tool WILL meet BOM'd JSON from common Windows tooling).
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Default(), fmt.Errorf("parse %s: %w", ConfigPath(dir), err)
 	}
