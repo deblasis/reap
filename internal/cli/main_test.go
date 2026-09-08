@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,9 +14,14 @@ import (
 // Tests that deliberately build rail fixtures t.Setenv their own, which
 // wins for that test and restores to this on cleanup.
 func TestMain(m *testing.M) {
-	if dir, err := os.MkdirTemp("", "reap-no-rail"); err == nil {
-		defer os.RemoveAll(dir)
-		os.Setenv("INCODA_DIR", filepath.Join(dir, "no-rail"))
+	dir, err := os.MkdirTemp("", "reap-no-rail")
+	if err != nil {
+		// Hard-fail, never proceed unpinned (the R7 spec seat's nit): an
+		// unpinned run reads the machine's live rail.
+		fmt.Fprintln(os.Stderr, "reap cli tests: cannot create the hermetic INCODA_DIR:", err)
+		os.Exit(1)
 	}
+	defer os.RemoveAll(dir)
+	os.Setenv("INCODA_DIR", filepath.Join(dir, "no-rail"))
 	os.Exit(m.Run())
 }
