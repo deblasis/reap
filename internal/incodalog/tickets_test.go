@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/deblasis/reap/internal/config"
 )
 
 // The spec's named M4 fixture: the live-ticket probe against a byte-range
@@ -92,7 +94,7 @@ func TestOpenRecordWithLiveTicketJoinsLive(t *testing.T) {
 	defer f.Close()
 
 	records, _ := Digest([]Event{{Queue: "q", Type: "enqueue", Dir: work}})
-	r := records[work]
+	r := records[config.Canonical(work)]
 	if r == nil || !r.Open {
 		t.Fatalf("record: %+v", r)
 	}

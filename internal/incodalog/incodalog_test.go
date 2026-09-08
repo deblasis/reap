@@ -87,7 +87,7 @@ func TestDigestSameSecondTie(t *testing.T) {
 		{Queue: "q", Time: ts, Type: "enqueue", Dir: `C:\a`},
 		{Queue: "q", Time: ts, Type: "release", Dir: `C:\a`},
 	})
-	r := records[`C:\a`]
+	r := records[`c:\a`] // keys are canonical (lowercased) since round 4
 	if r == nil || r.Open {
 		t.Fatalf("same-second release lost to the tie: %+v", r)
 	}
@@ -110,15 +110,15 @@ func TestDigestJoin(t *testing.T) {
 	if len(records) != 3 {
 		t.Fatalf("records: %d", len(records))
 	}
-	a := records[`C:\a`]
+	a := records[`c:\a`] // canonical (lowercased) keys
 	if a.Open || a.LastType != "release" {
 		t.Fatalf("closed record: %+v", a)
 	}
-	o := records[`C:\open`]
+	o := records[`c:\open`]
 	if !o.Open || o.LastType != "acquire" {
 		t.Fatalf("open record: %+v", o)
 	}
-	k := records[`C:\killed`]
+	k := records[`c:\killed`]
 	if k.Open { // kill is a release-equivalent terminator
 		t.Fatalf("kill not treated as terminator: %+v", k)
 	}

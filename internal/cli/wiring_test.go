@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/deblasis/reap/internal/applycmd"
 	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
+	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
 )
 
@@ -1280,6 +1282,157 @@ func TestWiringHeldDirtyRepoCarriesAlso(t *testing.T) {
 	if !strings.Contains(scanOut.String(), "dirty/untracked files") {
 		t.Fatalf("the shadowed fact text missing:\n%s", scanOut.String())
 	}
+}
+
+// The mid-run incoda re-probe, PINNED at BOTH deletion paths (round 4; the
+// round-3 discard half printed the refusal and deleted anyway - live-caught
+// by the panel): a ticket taken during the confirm window leaves the dir
+// standing, at apply AND at discard.
+func TestWiringConfirmWindowTicketSurvival(t *testing.T) {
+	d := t.TempDir()
+	root := filepath.Join(d, "root")
+	stateDir := filepath.Join(d, "state")
+	for _, p := range []string{root, stateDir, filepath.Join(d, "queues", "q")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+
+	// A dirty repo to discard.
+	repo := filepath.Join(root, "wip")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+
+	// A held ticket naming the repo (the mid-run job).
+	ticket := filepath.Join(d, "queues", "q", "1-2.ticket")
+	body := fmt.Sprintf(`{"pid":1,"queue":"q","cwd":%q}`, repo)
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTestCli(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+
+	// Discard: the dir must SURVIVE (round 3 deleted it after the refusal).
+	var dOut bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &dOut, os.Stderr, os.Stdin); code != ExitUsage {
+		t.Fatalf("discard under a live ticket: %d (%s)", code, dOut.String())
+	}
+	if _, serr := os.Stat(repo); serr != nil {
+		t.Fatal("discard DELETED the dir under a live ticket (the round-3 bug back)")
+	}
+
+	// Apply: a ticket naming the SCAN ROW's dir (scratch-old) is caught at
+	// scan time — the row verdicts ACTIVE/incoda-live and never plans. (The
+	// under-lock abort covers the scan-to-lock window, which a pre-created
+	// ticket cannot exercise deterministically: the scan already caught it.)
+	ticket2 := filepath.Join(d, "queues", "q", "3-4.ticket")
+	body2 := fmt.Sprintf(`{"pid":3,"queue":"q","cwd":%q}`, filepath.Join(root, "scratch-old"))
+	if err := os.WriteFile(ticket2, []byte(body2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f2, err2 := lockfileOpenForTestCli(ticket2)
+	if err2 != nil {
+		t.Skipf("open ticket2: %v", err2)
+	}
+	held2, terr2 := f2.TryLock()
+	if err2 != nil || !held2 {
+		t.Fatalf("hold2: %v", terr2)
+	}
+	defer f2.Close()
+	var js bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &js, os.Stderr); code != ExitOK {
+		t.Fatalf("scan under a live root ticket: %d", code)
+	}
+	if !strings.Contains(js.String(), "incoda-live") {
+		t.Fatalf("scan does not mark the live-ticket dir incoda-live:\n%s", js.String())
+	}
+	// And apply with nothing plannable deletes nothing (exit 0, 0 planned).
+	var aOut bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, &aOut, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("apply under a live ticket at the root: %d (%s)", code, aOut.String())
+	}
+	if _, serr := os.Stat(repo); serr != nil {
+		t.Fatal("apply deleted the live-ticket dir")
+	}
+}
+
+// lastIncoda end-to-end (round 4 pin): a natural-casing dir= record
+// joins (the canonicalization), the row renders the record, the no-record
+// form renders on rows without one, and scan --json carries the field.
+func TestWiringLastIncodaEndToEnd(t *testing.T) {
+	d := t.TempDir()
+	root := t.TempDir()
+	stateDir := filepath.Join(d, "state")
+	qd := filepath.Join(d, "queues", "q")
+	for _, p := range []string{stateDir, qd, filepath.Join(root, "with-record"), filepath.Join(root, "no-record")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+
+	// A CLOSED release naming the with-record dir in NATURAL casing (the
+	// canonicalization probe: the raw key must join the canonical lookup).
+	withDir := filepath.Join(root, "With-Record") // distinct casing
+	if err := os.MkdirAll(withDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := fmt.Sprintf("2026-09-07 12:00:00 queue=q event=release pid=1 dir=%s reason=\"probe run\" owner=agent dur=1h\n", withDir)
+	if err := os.WriteFile(filepath.Join(qd, "lane.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var text bytes.Buffer
+	if code := cmdScan([]string{"--no-gh"}, &text, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(text.String(), `last: agent, `+"2h"+`, "probe run"`) && !strings.Contains(text.String(), "agent, ") {
+		t.Fatalf("with-record 'last:' detail missing:\n%s", text.String())
+	}
+	if !strings.Contains(text.String(), "last: no incoda record") {
+		t.Fatalf("no-record form missing:\n%s", text.String())
+	}
+
+	var js bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &js, os.Stderr); code != ExitOK {
+		t.Fatalf("scan --json: %d", code)
+	}
+	if !strings.Contains(js.String(), `"lastIncoda"`) || !strings.Contains(js.String(), "probe run") {
+		t.Fatalf("scan --json lastIncoda field missing or recordless:\n%s", js.String()[:min(400, len(js.String()))])
+	}
+	_ = d
+}
+
+func lockfileOpenForTestCli(path string) (*lockfile.File, error) {
+	return lockfile.Open(path)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // The TTY carve-out choreography end to end through the ForceTerminal

@@ -700,13 +700,15 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// planned dir in that window is invisible to the match gate otherwise,
 	// and an enqueued-not-yet-writing job touches no files and holds no
 	// handles, so the tripwire and rename probe cannot see it either. One
-	// fresh sweep under the lock; a hit aborts naming the dir (the same
-	// named-abort shape as the holds re-read - the job may be the reason
-	// the operator ran apply in the first place).
+	// fresh sweep under the lock; a hit aborts the run naming the dir
+	// (the same named-abort shape as the holds re-read - the job may be
+	// the reason the operator ran apply in the first place; round 4 fixed
+	// the copy: nothing is skipped, the whole run stops before any
+	// deletion or ledger line).
 	freshLive := incodaLiveSet(time.Duration(core.cfg.Thresholds.ActiveHours) * time.Hour)
 	for _, p := range plan {
 		if anyIncodaUnder(freshLive, p.Path) {
-			fmt.Fprintf(stderr, "reap apply: %s: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is skipped, rerun when it finishes\n", p.Path)
+			fmt.Fprintf(stderr, "reap apply: %s: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); run aborted, nothing deleted; rerun apply when the job finishes\n", p.Path)
 			return ExitState
 		}
 	}

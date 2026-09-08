@@ -52,11 +52,13 @@ type Entry struct {
 	LastIncoda *Incoda `json:"lastIncoda"`
 }
 
-// Incoda is the per-entry attribution detail (ago, owner, reason).
+// Incoda is the per-entry attribution detail (ago, owner, reason). The
+// fields serialize PRESENT (no omitempty): a null owner and a present
+// owner are different facts, and the schema shows both keys.
 type Incoda struct {
 	Ago    string `json:"ago"`
-	Owner  string `json:"owner,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Owner  string `json:"owner"`
+	Reason string `json:"reason"`
 }
 
 // RootSummary aggregates one scanned root.
@@ -203,11 +205,15 @@ func (r *ScanReport) Table(w io.Writer) {
 		}
 		for _, e := range shown {
 			fmt.Fprintf(w, "%7.1f GB  %-44s %s\n", gb(e.SizeBytes), truncate(e.Path, 44), e.Reason)
+			// The 'last:' detail, mock-worded: owner, compact ago, %q reason
+			// (spec L447: 'last: sess-42, 2h, "seam930 verify"'); the
+			// explicit 'last: no incoda record' on eligible rows without one.
 			if e.LastIncoda != nil {
-				last := e.LastIncoda.Ago
-				if e.LastIncoda.Owner != "" {
-					last += ", " + e.LastIncoda.Owner
+				last := e.LastIncoda.Owner
+				if last == "" {
+					last = "-"
 				}
+				last += ", " + e.LastIncoda.Ago
 				if e.LastIncoda.Reason != "" {
 					last += fmt.Sprintf(", %q", e.LastIncoda.Reason)
 				}

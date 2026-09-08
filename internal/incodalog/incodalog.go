@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/deblasis/reap/internal/config"
 )
 
 // Event is one parsed lane.log line.
@@ -253,6 +255,9 @@ type Record struct {
 // ACTIVE via the live-ticket probe or the active-hours window). Old-format
 // events (no dir=) are EXCLUDED from the digest and counted instead —
 // their attribution would be cmd-substring guesswork, reported separately.
+// Records are keyed by config.Canonical: the join at the scan side uses
+// canonical paths, and a raw-cased dir=C:\... key would miss it (round 4;
+// the live rail canonicalizes both sides, the enrichment must too).
 func Digest(events []Event) (records map[string]*Record, weakCount int) {
 	records = map[string]*Record{}
 	for _, ev := range events {
@@ -262,10 +267,11 @@ func Digest(events []Event) (records map[string]*Record, weakCount int) {
 			}
 			continue
 		}
-		r := records[ev.Dir]
+		key := config.Canonical(ev.Dir)
+		r := records[key]
 		if r == nil {
 			r = &Record{Dir: ev.Dir}
-			records[ev.Dir] = r
+			records[key] = r
 		}
 		// !Before, not After: lane.log timestamps are 1-second resolution, and
 		// an enqueue+release in the same second left LastType=enqueue and the

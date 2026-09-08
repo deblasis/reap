@@ -333,8 +333,22 @@ func lastIncodaFor(r *incodalog.Record, now time.Time) *LastIncoda {
 	if r == nil {
 		return nil
 	}
-	ago := now.Sub(r.LastEvent).Truncate(time.Second).String()
-	return &LastIncoda{Ago: ago, Owner: r.Owner, Reason: r.Reason}
+	return &LastIncoda{Ago: humanAgo(now.Sub(r.LastEvent)), Owner: r.Owner, Reason: r.Reason}
+}
+
+// humanAgo renders the mock's compact units ('2h', '3d', '45m', '30s') -
+// Go's Duration.String spells '72h0m0s' where every surface here says '3d'.
+func humanAgo(d time.Duration) string {
+	switch {
+	case d >= 48*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
 }
 
 func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool, expiredHolds map[string]time.Time,
