@@ -46,6 +46,17 @@ type Entry struct {
 	DowngradedBy       *string    `json:"downgradedBy"`
 	BlockedClassFact   string     `json:"blockedClassFact,omitempty"`
 	OrphanedCarveOut   bool       `json:"orphanedCarveOut,omitempty"`
+	// LastIncoda is the attribution enrichment (spec data model): the dir's
+	// most recent incoda activity, null when no record exists (the row then
+	// renders the explicit 'no incoda record').
+	LastIncoda *Incoda `json:"lastIncoda"`
+}
+
+// Incoda is the per-entry attribution detail (ago, owner, reason).
+type Incoda struct {
+	Ago    string `json:"ago"`
+	Owner  string `json:"owner,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // RootSummary aggregates one scanned root.
@@ -192,6 +203,18 @@ func (r *ScanReport) Table(w io.Writer) {
 		}
 		for _, e := range shown {
 			fmt.Fprintf(w, "%7.1f GB  %-44s %s\n", gb(e.SizeBytes), truncate(e.Path, 44), e.Reason)
+			if e.LastIncoda != nil {
+				last := e.LastIncoda.Ago
+				if e.LastIncoda.Owner != "" {
+					last += ", " + e.LastIncoda.Owner
+				}
+				if e.LastIncoda.Reason != "" {
+					last += fmt.Sprintf(", %q", e.LastIncoda.Reason)
+				}
+				fmt.Fprintf(w, "         %s\n", dim("last: "+last))
+			} else if s.name == "ACTIVE" || s.name == "BLOCKED" || s.name == "MANUAL" {
+				fmt.Fprintf(w, "         %s\n", dim("last: no incoda record"))
+			}
 			if e.Hint != "" && (s.name == "BLOCKED" || s.name == "MANUAL") {
 				fmt.Fprintf(w, "         %s\n", dim("hint: "+e.Hint))
 			}

@@ -79,8 +79,10 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	// computed ONCE per scan. The live set carries BOTH triggers (spec
 	// L320-322/L342): a held ticket backing an open record (incl pure
 	// tickets the best-effort log never recorded) AND open events within
-	// the active-hours window.
+	// the active-hours window. The digest records ride alongside for the
+	// 'last:' row enrichment.
 	incodaLive := incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	incodaRecords := incodaDigestAll()
 
 	// Unreadable roots are named, not silently skipped: a configured root
 	// that cannot be listed yields a marker DirInfo, and hiding it would let
@@ -127,7 +129,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 			defer wg.Done()
 			for info := range jobs {
 				e := buildEntry(info, now, cfg, holds, expiredHolds, useGit, useJJ, prHeads,
-					gitBudget, jjBudget, fetchBudget, remoteStale, protectedExpanded, incodaLive)
+					gitBudget, jjBudget, fetchBudget, remoteStale, protectedExpanded, incodaLive, incodaRecords)
 				mu.Lock()
 				entries = append(entries, e)
 				done++
@@ -264,6 +266,11 @@ func anyIncodaUnder(live map[string]bool, path string) bool {
 	if len(live) == 0 {
 		return false
 	}
+	// The unknown-live sentinel (an existing-but-unlistable queues dir):
+	// every candidate is live-unknown, never silently unmarked.
+	if live[""] {
+		return true
+	}
 	pc := config.Canonical(path)
 	for k := range live {
 		if k == pc || strings.HasPrefix(k, pc+string(os.PathSeparator)) {
@@ -273,41 +280,67 @@ func anyIncodaUnder(live map[string]bool, path string) bool {
 	return false
 }
 
-// incodaLiveSet builds the canonical live-dir set: dirs whose OPEN lane.log
-// record is within the active-hours window (spec L320-322's second trigger;
-// live-backed open events), PLUS the pure-ticket half (a held ticket with
-// no log record at all - Queue.Logf swallows write failures, so the ticket
-// is the authoritative signal; L521-522). The pure-ticket scan is the
-// expensive half: it runs once per run, not per candidate.
+// incodaLiveSet builds the canonical live-dir set in ONE ticket sweep:
+// the sweep's dir set feeds a membership map, and the log triggers
+// (live-backed + active-hours opens) join against it - per-record
+// LiveTicketsUnder calls would re-Readdir every queue per open record
+// (O(records x queues x tickets) once the dir= PR ships).
 func incodaLiveSet(activeHours time.Duration) map[string]bool {
 	live := map[string]bool{}
+	// ONE sweep: every held ticket's dir (the authoritative signal -
+	// Queue.Logf swallows write failures, so the log may have missed it).
+	// A "" entry is the unknown-live sentinel (an existing-but-unlistable
+	// queues dir): the conservative direction, not a silent-empty rail.
+	ticketDirs := incodalog.LiveTicketDirs()
+	ticketSet := map[string]bool{}
+	for _, d := range ticketDirs {
+		if d == "" {
+			live[""] = true
+			continue
+		}
+		d = config.Canonical(d)
+		ticketSet[d] = true
+		live[d] = true
+	}
+	// Log triggers, joined against the ONE sweep (membership, not probing).
 	records, _ := incodalog.Digest(incodalog.ReadAll())
 	cutoff := time.Now().Add(-activeHours)
 	for _, r := range records {
-		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
+		if r.Open && ticketSet[config.Canonical(r.Dir)] {
 			live[config.Canonical(r.Dir)] = true
 		}
 		if r.Open && !r.LastEvent.Before(cutoff) {
 			live[config.Canonical(r.Dir)] = true
 		}
 	}
-	// Pure tickets: held tickets whose dir never reached the log.
-	for _, d := range incodalog.LiveTicketDirs() {
-		live[config.Canonical(d)] = true
-	}
 	return live
 }
 
-// incodaDigestAll reads and digests incoda's lane.log (one pass per scan).
+// incodaDigestAll reads and digests incoda's lane.log (one pass per scan;
+// the lastIncoda enrichment source for both pipelines' entry rows).
 func incodaDigestAll() map[string]*incodalog.Record {
 	records, _ := incodalog.Digest(incodalog.ReadAll())
 	return records
 }
 
+// LastIncoda is the per-entry attribution enrichment (spec L501): the
+// digest's record for the dir, rendered as the 'last:' row detail.
+type LastIncoda = report.Incoda
+
+// lastIncodaFor shapes a digest record into the entry enrichment (nil when
+// the dir has no record - the renderer's explicit 'no incoda record').
+func lastIncodaFor(r *incodalog.Record, now time.Time) *LastIncoda {
+	if r == nil {
+		return nil
+	}
+	ago := now.Sub(r.LastEvent).Truncate(time.Second).String()
+	return &LastIncoda{Ago: ago, Owner: r.Owner, Reason: r.Reason}
+}
+
 func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[string]bool, expiredHolds map[string]time.Time,
 	useGit, useJJ bool, prHeads *ghx.PRHeads,
 	gitBudget, jjBudget, fetchBudget, remoteStale time.Duration, protectExpanded []string,
-	incodaLive map[string]bool) report.Entry {
+	incodaLive map[string]bool, incodaRecords map[string]*incodalog.Record) report.Entry {
 
 	e := report.Entry{
 		Path:         info.Path,
@@ -446,6 +479,9 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 	// incoda attribution (M4): a live ticket at/under the dir is the
 	// ACTIVE incoda-live rail (enrichment; the empty map weakens nothing).
 	in.IncodaLive = anyIncodaUnder(incodaLive, info.Path)
+	// The 'last:' enrichment: this exact dir's digest record (the records
+	// map is computed once per scan, passed in).
+	e.LastIncoda = lastIncodaFor(incodaRecords[config.Canonical(info.Path)], now)
 	in.Held = anyHoldUnder(holds, info.Path)
 	protected, _ := config.MatchProtect(info.Path, protectExpanded)
 	in.Protected = protected

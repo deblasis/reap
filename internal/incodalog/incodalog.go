@@ -327,7 +327,10 @@ func ReadAll() []Event {
 	for _, q := range Queues() {
 		out = append(out, Parse(q, filepath.Join(StateDir(), "queues", q, "lane.log"))...)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	// STABLE: the digest's same-second tie relies on append-only order
+	// surviving the sort (an unstable sort can swap equal-second events and
+	// resurrect a closed record as OPEN).
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	return out
 }
 

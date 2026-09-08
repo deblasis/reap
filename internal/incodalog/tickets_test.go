@@ -3,6 +3,7 @@
 package incodalog
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,7 +23,11 @@ func TestTicketProbeAt2ToThe62(t *testing.T) {
 	}
 	work := t.TempDir()
 	ticket := filepath.Join(qd, "123-456.ticket")
-	if err := os.WriteFile(ticket, []byte("dir="+work+"\nreason=probe\n"), 0o644); err != nil {
+	// The DEPLOYED body shape: single-line JSON with cwd (the field the
+	// real tickets carry; the dir=-line form is the forward-compat path,
+	// not what incoda writes today).
+	body := fmt.Sprintf(`{"pid":123,"queue":"q","slots":1,"cwd":%q,"reason":"probe","owner":"agent"}`, work)
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,9 +74,11 @@ func TestOpenRecordWithLiveTicketJoinsLive(t *testing.T) {
 	if err := os.MkdirAll(qd, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// An open enqueue (never released) naming work.
+	// An open enqueue (never released) naming work (the deployed JSON-cwd
+	// body shape).
 	ticket := filepath.Join(qd, "999-1.ticket")
-	if err := os.WriteFile(ticket, []byte("dir="+work+"\n"), 0o644); err != nil {
+	body := fmt.Sprintf(`{"pid":999,"queue":"q","cwd":%q}`, work)
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	f, err := lockfileOpenForTest(ticket)

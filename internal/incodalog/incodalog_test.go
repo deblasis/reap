@@ -61,6 +61,38 @@ func TestParseGoldens(t *testing.T) {
 	}
 }
 
+// The adversarial parser shapes: a quoted reason CONTAINING a cmd=-prefixed
+// token (the joinQuoted-before-cmd ordering) and a same-second
+// enqueue+release (the !Before tie; a closed record must not read OPEN).
+func TestParseQuotedCmdInsideReason(t *testing.T) {
+	d := t.TempDir()
+	writeLog(t, d, "q", `2026-09-07 20:00:00 queue=q event=enqueue pid=1 dir=C:\a reason="run cmd=now please" owner=me cmd=zig build test`)
+	t.Setenv("INCODA_DIR", d)
+	events := ReadAll()
+	if len(events) != 1 {
+		t.Fatalf("events: %d", len(events))
+	}
+	e := events[0]
+	if e.Reason != "run cmd=now please" {
+		t.Fatalf("reason corrupted: %q", e.Reason)
+	}
+	if e.Cmd != "zig build test" {
+		t.Fatalf("cmd corrupted: %q", e.Cmd)
+	}
+}
+
+func TestDigestSameSecondTie(t *testing.T) {
+	ts := time.Now().Truncate(time.Second)
+	records, _ := Digest([]Event{
+		{Queue: "q", Time: ts, Type: "enqueue", Dir: `C:\a`},
+		{Queue: "q", Time: ts, Type: "release", Dir: `C:\a`},
+	})
+	r := records[`C:\a`]
+	if r == nil || r.Open {
+		t.Fatalf("same-second release lost to the tie: %+v", r)
+	}
+}
+
 // The digest join: max(enqueue, acquire, release) per dir; open without a
 // terminator; old-format events counted weak, not joined.
 func TestDigestJoin(t *testing.T) {

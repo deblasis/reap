@@ -219,6 +219,15 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			refused = true
 		}
 	}
+	// The incoda re-probe (hold-parity): a ticket taken during the confirm
+	// window on a to-be-discarded dir - the same blind window apply closes.
+	freshLive := incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	for _, w := range work {
+		if anyIncodaUnder(freshLive, w.path) {
+			fmt.Fprintf(stderr, "reap discard: %s: refused: live incoda ticket at/under it DURING the confirm window (a job landed mid-run)\n", w.path)
+			refused = true
+		}
+	}
 
 	log, err := auditlog.Open(stateDir, runID)
 	if err != nil {

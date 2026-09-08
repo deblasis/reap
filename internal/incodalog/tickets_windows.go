@@ -88,11 +88,17 @@ func ticketDir(body []byte) string {
 
 // LiveTicketDirs returns every held ticket's dir= (the pure-ticket half of
 // the ACTIVE rail: a ticket the best-effort log never recorded is still
-// the authoritative liveness signal).
+// the authoritative liveness signal). An existing-but-unlistable queues
+// dir reads as a single "" sentinel (LiveTicketsUnder's live-or-unknown
+// policy at the enumeration level: silent-empty is the unsafe direction -
+// the caller treats the sentinel as unknown-live).
 func LiveTicketDirs() []string {
 	qd := filepath.Join(StateDir(), "queues")
 	queues, err := os.ReadDir(qd)
 	if err != nil {
+		if stateDirExisted() {
+			return []string{""} // unknown-live sentinel
+		}
 		return nil
 	}
 	var out []string
