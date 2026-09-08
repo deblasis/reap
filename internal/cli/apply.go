@@ -698,14 +698,21 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitState
 	}
 	freeBefore := auditlog.FreeBytes(stateDir)
-	// A gate abort still leaves its trace: one result line naming the
-	// path and cause, then the envelope (every planned path skipped by
-	// the abort - planned N, deleted 0 is the reconciled truth).
+	// A gate abort still leaves its trace: one explicit event:'abort' line
+	// naming the path and cause (a result ok=false renders 'FAILED' in
+	// reap log and is indistinguishable from a failed deletion attempt),
+	// then the envelope (every planned path skipped by the abort -
+	// planned N, deleted 0 is the reconciled truth). Append failures are
+	// LOUD: an abort whose trace silently fails is the tracelessness this
+	// exists to fix (disk full is exactly when aborts happen).
 	gateAbort := func(path, cause string) int {
-		ok := false
-		_ = log.Append(auditlog.Line{Event: "result", Path: path, OK: &ok, Quarantine: nil, Residue: cause})
-		_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(plan), Deleted: 0,
-			Skipped: len(plan), FreeBefore: freeBefore, FreeAfter: auditlog.FreeBytes(stateDir), Quarantine: nil})
+		if aerr := log.Append(auditlog.Line{Event: "abort", Path: path, Quarantine: nil, Residue: cause}); aerr != nil {
+			fmt.Fprintf(stderr, "reap apply: HARD ABORT: audit append failed after the gate abort: %v\n", aerr)
+		}
+		if aerr := log.Append(auditlog.Line{Event: "envelope", Planned: len(plan), Deleted: 0,
+			Skipped: len(plan), FreeBefore: freeBefore, FreeAfter: auditlog.FreeBytes(stateDir), Quarantine: nil}); aerr != nil {
+			fmt.Fprintf(stderr, "reap apply: HARD ABORT: audit append failed after the gate abort: %v\n", aerr)
+		}
 		return ExitState
 	}
 
@@ -731,6 +738,12 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// deletion; round 5 made the abort legible on the ledger).
 	freshLive := confirmReprobeLive(time.Duration(core.cfg.Thresholds.ActiveHours) * time.Hour)
 	for _, p := range plan {
+		if freshLive[""] {
+			// The rail could not enumerate, not 'a job landed': the copy must
+			// name the real condition (fix-the-rail, not wait-for-the-job).
+			fmt.Fprintf(stderr, "reap apply: %s: %s; run aborted, nothing deleted\n", p.Path, unknownRailNote)
+			return gateAbort(p.Path, unknownRailNote+"; run aborted, nothing deleted")
+		}
 		if anyIncodaUnder(freshLive, p.Path) {
 			fmt.Fprintf(stderr, "reap apply: %s: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); run aborted, nothing deleted; rerun apply when the job finishes\n", p.Path)
 			return gateAbort(p.Path, "live incoda ticket at/under it DURING the confirm window (a job landed mid-run); run aborted, nothing deleted")
@@ -770,11 +783,65 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return ExitState
 		}
 		if rv.SkipWhy != "" {
-			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: rv.SkipWhy})
+			// A path that vanished under a parent THIS RUN deleted is a
+			// victim of ordering, not an unreadable-state row: the copy must
+			// not blame the dir (round 6; the R5 trace showed destroyed
+			// children recorded as ignorance-unreadable).
+			note := ""
+			if !dirExists(p.Path) {
+				for _, del := range summary.Deleted {
+					if applycmd.NestedUnder(config.Canonical(p.Path), config.Canonical(del)) {
+						note = "vanished under a parent this run deleted"
+						break
+					}
+				}
+			}
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: rv.SkipWhy, Note: note})
 			summary.SkippedBytes += p.SizeBytes
 			ok := false
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: rv.SkipWhy,
-				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, OK: &ok, Quarantine: nil}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
+		// Overlapping-roots backstops (round 6; the R5 reliability major):
+		// lineage ordering cannot see nesting ACROSS roots, so a parent
+		// candidate could destroy an inner dir no lineage relation covers.
+		// A hold at/under the path stops it outright (holds beat every rule
+		// and every flag); a scan row still standing at/under it skips the
+		// parent as parent-of-live-children (children-first ordering makes
+		// that a backstop: rows deleted earlier in this run no longer exist
+		// on disk and do not trip it).
+		if heldDir, held := applycmd.HoldUnderPath(core.holds, p.Path); held {
+			note := fmt.Sprintf("held dir at/under it (%s; reap hold beats every rule); remove the hold or reap the inner dir explicitly", heldDir)
+			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
+			ok := false
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipParentLive, Note: note})
+			summary.SkippedBytes += p.SizeBytes
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipParentLive,
+				Verdict: rv.Verdict.Verdict, ReasonCode: "held-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
+		blockingRow := ""
+		for _, c := range cands {
+			other := c.entry.Path
+			oc, pc := config.Canonical(other), config.Canonical(p.Path)
+			if oc != pc && applycmd.NestedUnder(oc, pc) && dirExists(other) {
+				blockingRow = other
+				break
+			}
+		}
+		if blockingRow != "" {
+			note := fmt.Sprintf("scan row at/under it still standing (%s); delete the inner dir first - it was not in this run's plan", blockingRow)
+			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
+			ok := false
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipParentLive, Note: note})
+			summary.SkippedBytes += p.SizeBytes
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipParentLive,
+				Verdict: rv.Verdict.Verdict, ReasonCode: "row-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue
@@ -941,10 +1008,15 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// and this path's deletion, and an enqueued-not-yet-writing job
 		// touches no files and holds no handles the tripwire or rename probe
 		// can see. The sweep is cheap (one ReadDir + lock probes); a hit
-		// skips the path with the session kept - the dir stands.
-		if perPathTicketLive(p.Path) {
+		// skips the path with the session kept - the dir stands. The copy
+		// carries the CAUSE (round 6): an unknown rail is never worded as
+		// 'a ticket sits here'.
+		if hit, unknownRail := perPathTicketHit(p.Path); hit {
 			ok := false
-			note := "live or unknown-live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT deleted"
+			note := "live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT deleted"
+			if unknownRail {
+				note = unknownRailNote
+			}
 			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
 				SkipWhy: applycmd.SkipVerdictChanged, OK: &ok,
@@ -958,6 +1030,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		// The dedupe pass walks each path now, before the deletion.
 		applyReclaim.Add(p.Path)
+		// Canonicalize WHILE THE DIR STILL EXISTS: config.Canonical expands
+		// 8.3 components by resolving them, and a deleted path cannot be
+		// resolved (round 6: the post-delete canonicalization left
+		// ALESSA~1-style components unexpanded, so the deleted set's keys
+		// never matched the parent's fully-expanded canonical - the
+		// overlapping-roots tripwire/self-bump protections silently
+		// inert on every %TEMP% fixture).
+		pathCanonical := config.Canonical(p.Path)
 		mode, err := applycmd.Delete(p.Path, rv.Class, d)
 		if err != nil {
 			// Deregistration failure is a deletion failure (spec's exit
@@ -970,7 +1050,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		// The in-run deletion set feeds the both-clean unlock (round-3: the
 		// map existed but was never written  -  dead wiring).
-		deletedInRun[config.Canonical(p.Path)] = true
+		deletedInRun[pathCanonical] = true
 		// Full audit enrichment from the fresh facts (round-1: the line
 		// shape's fields were all dead) + capped manifest for non-clean
 		// deletions (spec: gone is never contents unknown).

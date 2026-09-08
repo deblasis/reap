@@ -18,5 +18,8 @@ func LiveTicketDirs() []string { return nil }
 // LiveTicketsUnder: no probe off-Windows (the rail is Windows-only).
 func LiveTicketsUnder(root string) bool { return false }
 
+// LiveTicketHit: no probe off-Windows (the rail is Windows-only).
+func LiveTicketHit(root string) (hit, unknown bool) { return false, false }
+
 // ProbeRail: no enumeration off-Windows (the rail is Windows-only).
 func ProbeRail() RailHealth { return RailHealth{} }

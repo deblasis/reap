@@ -175,14 +175,81 @@ func TestPerQueueUnreadableSentinel(t *testing.T) {
 		_ = out
 	})
 
-	dirs, unknown := SweepTickets()
-	if !unknown {
-		t.Fatalf("one unreadable queue dir reads as a complete enumeration: %q", dirs)
+	h := ProbeRail()
+	if !h.Unknown {
+		t.Fatalf("one unreadable queue dir reads as a complete enumeration: %+v", h)
 	}
-	if len(dirs) != 0 {
-		t.Fatalf("partial dir set beside the unknown flag: %q", dirs)
+	if len(h.Dirs) != 0 {
+		t.Fatalf("partial dir set beside the unknown flag: %q", h.Dirs)
+	}
+	if len(h.UnreadableQueues) != 1 {
+		t.Fatalf("the unreadable queue is not named: %+v", h)
 	}
 	if !LiveTicketsUnder(`C:\anywhere`) {
 		t.Fatal("per-queue unknown must read live-or-unknown for every root")
+	}
+}
+
+// The unknown-live sentinel at the QUEUES level (round 6 pin of the
+// amendment's first-named level): the queues dir existing but unlistable
+// reads wholly unknown - and doctor's readout NAMES it (the path is
+// appended to UnreadableQueues). Best-effort icacls fixture, skip never
+// fake.
+func TestQueuesLevelSentinel(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "q")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		t.Skip("no USERNAME for the ACL fixture")
+	}
+	if out, err := exec.Command("icacls", qd, "/deny", user+":(RD)").CombinedOutput(); err != nil {
+		t.Skipf("icacls deny: %v %s", err, out)
+	}
+	t.Cleanup(func() {
+		out, _ := exec.Command("icacls", qd, "/remove:d", user).CombinedOutput()
+		_ = out
+	})
+
+	h := ProbeRail()
+	if !h.Unknown || len(h.UnreadableQueues) == 0 {
+		t.Fatalf("denied queues dir must read unknown AND be named: %+v", h)
+	}
+	hit, unknown := LiveTicketHit(`C:\anywhere`)
+	if !hit || !unknown {
+		t.Fatal("queues-level unknown must carry its cause through LiveTicketHit")
+	}
+}
+
+// The mid-sweep TRANSITIONS must not trip the sentinel (round 6; the R5
+// gate-red root cause): a ticket that VANISHES between the enumeration and
+// the read is a RELEASED one (incoda deletes tickets at release), inert -
+// not machine-wide unknown. The deterministic shape: a ticket path whose
+// OPEN and READ both fail IsNotExist while ReadDir still lists it (a
+// symlink to a nowhere target reproduces exactly that triple).
+func TestVanishedTicketIsReleased(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "q")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ticket := filepath.Join(qd, "7-1.ticket")
+	if err := os.Symlink(filepath.Join(d, "nowhere"), ticket); err != nil {
+		t.Skipf("symlink (dev mode): %v", err)
+	}
+
+	h := ProbeRail()
+	if h.Unknown {
+		t.Fatalf("a vanished (released) ticket tripped the sentinel: %+v", h)
+	}
+	if len(h.Dirs) != 0 {
+		t.Fatalf("vanished ticket contributed a dir: %q", h.Dirs)
+	}
+	if LiveTicketsUnder(`C:\anywhere`) {
+		t.Fatal("a released ticket must not read live")
 	}
 }

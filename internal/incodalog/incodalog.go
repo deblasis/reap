@@ -3,10 +3,13 @@
 // %LOCALAPPDATA%\incoda\queues\<key>\lane.log, shaped
 // "2006-01-02 15:04:05 queue=<key> event=<event> pid=<pid> k=v ... cmd=<rest>".
 //
-// Two generations must parse: the OLD format (no dir=; attribution runs on
-// release-line cmd substrings only and is labeled weak) and the NEW format
+// Two generations must parse: the OLD format (no dir=) and the NEW format
 // (the proposed incoda PR: dir= always, reason=/owner= when set, %q-quoted,
-// dur= on release). Malformed lines are skipped, never fatal: Queue.Logf
+// dur= on release). Old-format events carry no dir key, so they are COUNTED
+// and surfaced as weak - never attributed (release lines carry no cmd=
+// either, so there is nothing sound to attribute them by; the interim
+// cmd-substring idea the spec originally sketched is unimplementable on the
+// real log shape). Malformed lines are skipped, never fatal: Queue.Logf
 // swallows write failures on incoda's side, so a torn line is expected.
 package incodalog
 
@@ -34,7 +37,8 @@ type Event struct {
 	Reason string
 	Owner  string
 	Dur    time.Duration // release only
-	// Weak attribution (old logs): the cmd substring match ran against it.
+	// Weak (old logs): the event carries no dir=, so it is counted and
+	// surfaced, never attributed.
 	Weak bool
 }
 
@@ -163,6 +167,14 @@ func parseLine(queue, line string) (Event, bool) {
 				e.PID = n
 			}
 		case "dir":
+			// A SECOND dir= with a different value is malformed (the
+			// round-6 guard: an unquoted owner= free tail containing a
+			// 'dir=...' token would otherwise mint a spurious pair whose
+			// last-wins override misattributes the event to the wrong dir -
+			// a false-SAFE-direction channel in the enrichment).
+			if e.Dir != "" && e.Dir != unquote(v) {
+				return Event{}, false
+			}
 			e.Dir = unquote(v)
 		case "reason":
 			e.Reason = unquote(v)

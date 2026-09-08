@@ -86,6 +86,26 @@ func CappedManifest(path string) []byte {
 
 func longPathLocal(p string) string { return p }
 
+// ChildrenMaxMtime returns the max mtime over path's REMAINING children
+// (zero time when none). The caller has established that path's OWN stamp
+// is its own doing (a child it deleted bumped the listing) and needs the
+// user's activity instead (round 6: children-first ordering made
+// parent-after-child deletion a first-class shape).
+func ChildrenMaxMtime(path string, now time.Time) time.Time {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return time.Time{}
+	}
+	var max time.Time
+	for _, e := range entries {
+		ci := Entry(path, filepath.Join(path, e.Name()), now)
+		if ci.MaxMtime.After(max) {
+			max = ci.MaxMtime
+		}
+	}
+	return max
+}
+
 // Entry sizes one directory tree. It never crosses reparse points (junctions,
 // symlinks): a junction under the tree can loop, escape to protected paths, or
 // double-count OneDrive placeholders, so reparse children are skipped entirely

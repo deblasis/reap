@@ -230,11 +230,16 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// post-filter, and --json named no path).
 	plannedPaths := pathsOfDiscardWork(work)
 	freshLive := confirmReprobeLive(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	railUnknown := freshLive[""] // the sentinel: enumeration incomplete, not 'a job landed'
 	var kept []discardWork
 	var incodaRefused []string
 	for _, w := range work {
-		if anyIncodaUnder(freshLive, w.path) {
-			fmt.Fprintf(stderr, "reap discard: %s: refused: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded\n", w.path)
+		if railUnknown || anyIncodaUnder(freshLive, w.path) {
+			if railUnknown {
+				fmt.Fprintf(stderr, "reap discard: %s: refused: %s; the dir is NOT discarded\n", w.path, unknownRailNote)
+			} else {
+				fmt.Fprintf(stderr, "reap discard: %s: refused: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded\n", w.path)
+			}
 			refused = true
 			incodaRefused = append(incodaRefused, w.path)
 			continue
@@ -266,10 +271,14 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	for _, p := range incodaRefused {
 		ok := false
+		note := "live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded"
+		if railUnknown {
+			note = unknownRailNote
+		}
 		summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p, Why: applycmd.SkipVerdictChanged,
-			Note: "live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded"})
+			Note: note})
 		if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p, SkipWhy: applycmd.SkipVerdictChanged,
-			OK: &ok, Quarantine: nil}); rc >= 0 {
+			OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 			return rc
 		}
 	}
@@ -552,14 +561,53 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 		}
 
+		// Overlapping-roots backstops (round 6; the R5 reliability major):
+		// a hold at/under the path stops it (holds beat every rule); a
+		// sibling path still standing at/under it skips the parent as
+		// parent-of-live-children (children-first ordering over the batch
+		// makes that a backstop: siblings deleted earlier no longer exist).
+		if heldDir, held := applycmd.HoldUnderPath(holdsBool, path); held {
+			note := fmt.Sprintf("held dir at/under it (%s; reap hold beats every rule); remove the hold or reap the inner dir explicitly", heldDir)
+			fmt.Fprintf(stderr, "reap discard: %s: %s\n", path, note)
+			ok := false
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipParentLive, Note: note})
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipParentLive,
+				Verdict: rv.Verdict.Verdict, ReasonCode: "held-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
+		blocking := ""
+		for _, w2 := range ordered {
+			oc, pc := config.Canonical(w2.path), config.Canonical(path)
+			if oc != pc && applycmd.NestedUnder(oc, pc) && dirExists(w2.path) {
+				blocking = w2.path
+				break
+			}
+		}
+		if blocking != "" {
+			note := fmt.Sprintf("path at/under it still standing (%s); discard the inner dir first", blocking)
+			fmt.Fprintf(stderr, "reap discard: %s: %s\n", path, note)
+			ok := false
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipParentLive, Note: note})
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipParentLive,
+				Verdict: rv.Verdict.Verdict, ReasonCode: "row-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
 		// Per-path ticket re-sweep (round 5): the confirm-window probe covers
 		// only up to the lock; a batch run spends minutes between that sweep
 		// and this path's deletion, and an enqueued-not-yet-writing job
 		// touches no files and holds no handles the tripwire or rename probe
 		// can see. The sweep is cheap (one ReadDir + lock probes); a hit
-		// skips the path with the session kept - the dir stands.
-		if perPathTicketLive(path) {
-			note := "live or unknown-live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT discarded"
+		// skips the path with the session kept - the dir stands. The copy
+		// carries the CAUSE (round 6).
+		if hit, unknownRail := perPathTicketHit(path); hit {
+			note := "live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT discarded"
+			if unknownRail {
+				note = unknownRailNote
+			}
 			fmt.Fprintf(stderr, "reap discard: %s: %s\n", path, note)
 			ok := false
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path,
@@ -658,10 +706,14 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	switch {
 	case exitQuarantine:
 		return applycmd.ExitQuarantine
+	case len(summary.Skipped) > 0:
+		// Executed-with-skips: the ledger already records an executed run
+		// (skip lines + envelope) for these - including an all-refused run -
+		// so the band and the record agree (round 6; the R5 nit: exit 120
+		// beside a ledger that says the run executed).
+		return applycmd.ExitWithSkips
 	case len(summary.Deleted) == 0 && refused:
 		return ExitUsage
-	case len(summary.Skipped) > 0:
-		return applycmd.ExitWithSkips
 	}
 	return applycmd.ExitOK
 }

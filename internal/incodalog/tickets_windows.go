@@ -89,13 +89,17 @@ func ticketDir(body []byte) string {
 // ProbeRail walks every queue's ticket files once and returns the rail's
 // health: each HELD ticket's dir plus the failure names. ANY enumeration
 // failure sets Unknown: the queues dir existing but not listing, ONE queue
-// dir whose tickets cannot be enumerated, or a HELD ticket whose body
-// cannot be read or parsed into a dir (incoda's Enroll takes the lock
-// BEFORE writing the body and swallows its own marshal error, so an empty
-// or torn body on a held ticket is a real just-enrolled or crashed-writer
-// shape, not merely corruption). Absent evidence must never read as
-// inactive at any level of the enumeration - the R4 panel live-proved each
-// level's silent skip was a false-SAFE channel.
+// dir whose tickets cannot be enumerated, or a ticket that is PERSISTENTLY
+// held with a body that cannot be read or parsed into a dir. Transitions
+// are distinguished from failures (the R5 gate-red lesson: a machine-wide
+// sentinel on every routine lane transition reds the destructive suite and
+// skips all deletions under normal churn): incoda DELETES tickets at
+// release (and actively reaps foreign ones), so a ticket that vanishes
+// mid-sweep is a RELEASED one - inert; Enroll takes the lock BEFORE
+// writing the body and the body is REWRITTEN at acquire, so an empty or
+// torn body on a held ticket gets a liveness re-probe and one re-read
+// before it counts as unknown. Absent evidence must never read as
+// inactive; equally, a completed release must not read as unknown.
 func ProbeRail() RailHealth {
 	var h RailHealth
 	qd := filepath.Join(StateDir(), "queues")
@@ -104,6 +108,9 @@ func ProbeRail() RailHealth {
 		// Existed but will not list: wholly unknown (the never-existed case
 		// degrades silently - there is no rail to be blind about).
 		h.Unknown = stateDirExisted()
+		if h.Unknown {
+			h.UnreadableQueues = append(h.UnreadableQueues, qd)
+		}
 		return h
 	}
 	for _, q := range queues {
@@ -128,13 +135,40 @@ func ProbeRail() RailHealth {
 			}
 			body, berr := os.ReadFile(full)
 			if berr != nil {
-				h.Unknown = true // held but unreadable: which dir is unknown
+				if os.IsNotExist(berr) {
+					continue // vanished mid-sweep: RELEASED (incoda deletes at release)
+				}
+				if !TicketLive(full) {
+					continue // released between the probe and the read
+				}
+				h.Unknown = true // persistently held, unreadable body
 				h.UnattributableLive = append(h.UnattributableLive, full)
 				continue
 			}
 			d := ticketDir(body)
 			if d == "" {
-				h.Unknown = true // held but unattributable (torn/empty body)
+				// Held with an empty/torn body: the enroll/acquire rewrite
+				// window. Re-probe liveness, then re-read once - only a
+				// PERSISTENTLY held-and-unattributable ticket is unknown.
+				if !TicketLive(full) {
+					continue // released mid-sweep
+				}
+				body2, err2 := os.ReadFile(full)
+				if os.IsNotExist(err2) {
+					continue // vanished: released
+				}
+				d2 := ""
+				if err2 == nil {
+					d2 = ticketDir(body2)
+				}
+				if d2 != "" {
+					h.Dirs = append(h.Dirs, d2)
+					continue
+				}
+				if !TicketLive(full) {
+					continue // released between the re-probe and the re-read
+				}
+				h.Unknown = true
 				h.UnattributableLive = append(h.UnattributableLive, full)
 				continue
 			}
@@ -142,12 +176,6 @@ func ProbeRail() RailHealth {
 		}
 	}
 	return h
-}
-
-// SweepTickets is the two-value form the scan-side consumers use.
-func SweepTickets() (dirs []string, unknown bool) {
-	h := ProbeRail()
-	return h.Dirs, h.Unknown
 }
 
 // LiveTicketDirs returns every held ticket's dir= (the pure-ticket half of
@@ -164,24 +192,34 @@ func LiveTicketDirs() []string {
 	return h.Dirs
 }
 
+// LiveTicketHit is the containment probe WITH ITS CAUSE: unknown=true
+// means the rail could not enumerate (the caller must refuse the SAFE
+// direction AND say why - 'enumeration incomplete', not 'a ticket sits
+// here': the remedies differ, fix-the-rail vs wait-for-the-job). A hit
+// without unknown means a held ticket names a dir at or under root.
+func LiveTicketHit(root string) (hit, unknown bool) {
+	h := ProbeRail()
+	if h.Unknown {
+		return true, true
+	}
+	rootNorm := strings.ToLower(filepath.Clean(root))
+	for _, d := range h.Dirs {
+		dn := strings.ToLower(filepath.Clean(d))
+		if dn == rootNorm || strings.HasPrefix(dn, rootNorm+string(os.PathSeparator)) {
+			return true, false
+		}
+	}
+	return false, false
+}
+
 // LiveTicketsUnder reports whether any live ticket names a dir at or under
 // root (the ACTIVE rail's probe). Stale ticket FILES (no holder) are
 // inert; only a held lock whose ticket body's cwd sits at/under root
 // counts. Any enumeration unknown reads LIVE-OR-UNKNOWN for every root
 // (absent evidence must never read as inactive).
 func LiveTicketsUnder(root string) bool {
-	h := ProbeRail()
-	if h.Unknown {
-		return true
-	}
-	rootNorm := strings.ToLower(filepath.Clean(root))
-	for _, d := range h.Dirs {
-		dn := strings.ToLower(filepath.Clean(d))
-		if dn == rootNorm || strings.HasPrefix(dn, rootNorm+string(os.PathSeparator)) {
-			return true
-		}
-	}
-	return false
+	hit, _ := LiveTicketHit(root)
+	return hit
 }
 
 // stateDirExisted reports whether incoda's queues dir existed but failed to

@@ -68,6 +68,13 @@ func writeWireConfig(t *testing.T, stateDir, root string) {
 		t.Fatal(err)
 	}
 	t.Setenv("REAP_DIR", stateDir)
+	// HERMETIC (round 6; the R5 gate-red): the destructive suite must
+	// never read the machine's LIVE incoda rail - a real torn ticket or
+	// lane transition mid-suite reds unrelated tests through the sentinel
+	// (live-demonstrated by two seats independently). A fresh empty
+	// INCODA_DIR = no rail. Tests that deliberately build rail fixtures
+	// setenv their own AFTER this (the later Setenv wins).
+	t.Setenv("INCODA_DIR", filepath.Join(t.TempDir(), "no-rail"))
 }
 
 // Hold -> hold -> holds -> unhold lifecycle through the command layer,
@@ -385,8 +392,11 @@ func TestWiringDiscardRefusesNotBlocked(t *testing.T) {
 	ageTree(t, repo, 30*24*time.Hour)
 
 	var out bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != ExitUsage {
-		t.Fatalf("discard of SAFE dir must exit 120 (refusal, nothing deleted), got %d", code)
+	// Round 6 band: the not-BLOCKED refusal fires per-path AFTER the ledger
+	// opens (skip record + envelope) - the run executed-with-skips, so the
+	// band and the record agree at 2.
+	if code := cmdDiscard([]string{"--yes", repo}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("discard of SAFE dir must exit 2 (refusal recorded, nothing deleted), got %d", code)
 	}
 	if _, err := os.Stat(repo); err != nil {
 		t.Fatal("SAFE dir was deleted by discard")
@@ -436,8 +446,8 @@ func TestWiringDiscardRefusesScratch(t *testing.T) {
 	root, _ := wireFixture(t)
 	target := filepath.Join(root, "scratch-old")
 	var out bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", target}, &out, os.Stderr, os.Stdin); code != ExitUsage {
-		t.Fatalf("scratch discard: %d (want 120)", code)
+	if code := cmdDiscard([]string{"--yes", target}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("scratch discard: %d (want 2; the per-path refusal is a recorded skip)", code)
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatal("SAFE scratch dir was deleted by discard")
@@ -465,8 +475,11 @@ func TestWiringDiscardHeldSurvives(t *testing.T) {
 	if code := cmdHold([]string{"--for", "720h", repo}, os.Stdout, os.Stderr); code != ExitOK {
 		t.Fatalf("hold: %d", code)
 	}
+	// Wave-0 rail: the held dir refuses BEFORE the ledger opens (nothing
+	// executed, nothing recorded) - the 120 band and the empty record
+	// agree. Post-ledger refusals are the ones that land in 2.
 	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != ExitUsage {
-		t.Fatalf("held dirty discard: %d (want 120)", code)
+		t.Fatalf("held dirty discard: %d (want 120; wave-0, pre-ledger)", code)
 	}
 	if _, err := os.Stat(repo); err != nil {
 		t.Fatal("held dir was deleted by discard")
@@ -965,8 +978,8 @@ func TestWiringDiscardIgnoranceRemedy(t *testing.T) {
 	}
 	ageTree(t, repo, 30*24*time.Hour)
 	var e bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, &e, os.Stdin); code != ExitUsage {
-		t.Fatalf("locked-index discard: %d (want 120)", code)
+	if code := cmdDiscard([]string{"--yes", repo}, &bytes.Buffer{}, &e, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("locked-index discard: %d (want 2; the run executed with a skip record)", code)
 	}
 	// The contract is NO DEAD GATES on ignorance rows: neither the
 	// plan/--override-manual pointers nor a false remedy may appear (the
@@ -1335,9 +1348,12 @@ func TestWiringConfirmWindowTicketSurvival(t *testing.T) {
 	defer f.Close()
 
 	// Discard: the dir must SURVIVE (round 3 deleted it after the refusal).
+	// Round 6: the all-refused-after-confirm run lands in the 2
+	// executed-with-skips band - the ledger already records an executed run
+	// (skip line + envelope); the band and the record now agree.
 	var dOut bytes.Buffer
-	if code := cmdDiscard([]string{"--yes", repo}, &dOut, os.Stderr, os.Stdin); code != ExitUsage {
-		t.Fatalf("discard under a live ticket: %d (%s)", code, dOut.String())
+	if code := cmdDiscard([]string{"--yes", repo}, &dOut, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("discard under a live ticket: %d (want 2) (%s)", code, dOut.String())
 	}
 	if _, serr := os.Stat(repo); serr != nil {
 		t.Fatal("discard DELETED the dir under a live ticket (the round-3 bug back)")
@@ -1467,6 +1483,12 @@ func TestWiringLastIncodaEndToEnd(t *testing.T) {
 	}
 	if !sawOwner || !sawNullOwner || !sawNone {
 		t.Fatalf("rows not all found: owner=%v nullOwner=%v none=%v\n%s", sawOwner, sawNullOwner, sawNone, js.String())
+	}
+	// The RAW key must be present with an empty value: a struct decode
+	// cannot distinguish present-but-empty from omitted (the omitempty
+	// erasure the schema must never do).
+	if !strings.Contains(js.String(), `"owner": ""`) {
+		t.Fatalf("null owner serialized absent (omitempty erasure):\n%s", js.String())
 	}
 }
 
@@ -1683,8 +1705,8 @@ func TestWiringPerPathTicketSweepSkips(t *testing.T) {
 		}
 		ageTree(t, repo, 30*24*time.Hour)
 	}
-	perPathTicketLive = func(path string) bool { return path == a }
-	t.Cleanup(func() { perPathTicketLive = incodalog.LiveTicketsUnder })
+	perPathTicketHit = func(path string) (bool, bool) { return path == a, false }
+	t.Cleanup(func() { perPathTicketHit = incodalog.LiveTicketHit })
 
 	var out, e bytes.Buffer
 	if code := cmdDiscard([]string{"--yes", a, b}, &out, &e, os.Stdin); code != applycmd.ExitWithSkips {
@@ -1773,6 +1795,259 @@ func TestWiringDoctorIncodaLines(t *testing.T) {
 	if !strings.Contains(out.String(), "incoda rail: UNKNOWN-LIVE") ||
 		!strings.Contains(out.String(), "held ticket(s) without a readable dir") {
 		t.Fatalf("unknown-live rail line missing:\n%s", out.String())
+	}
+}
+
+// Overlapping roots, the ordering half (round 6; the R5 reliability
+// major, live-proven: a parent candidate deleted FIRST destroyed the
+// inner-root children, each recorded as a skip): roots=[X, X/mass] plan
+// the parent AND the inner children in one run; path-nesting ordering
+// deletes children first, the parent last, and NOTHING lands as a
+// missing-skip.
+func TestWiringOverlappingRootsChildrenFirst(t *testing.T) {
+	d := t.TempDir()
+	x := filepath.Join(d, "X")
+	stateDir := filepath.Join(d, "state")
+	inner := filepath.Join(x, "mass")
+	for _, p := range []string{stateDir, inner, filepath.Join(inner, "m1"), filepath.Join(inner, "m2"), filepath.Join(x, "solo")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{filepath.Join(inner, "m1", "x.bin"), filepath.Join(inner, "m2", "x.bin"), filepath.Join(x, "solo", "x.bin")} {
+		if err := os.WriteFile(f, make([]byte, 3000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-40 * 24 * time.Hour)
+	filepath.WalkDir(d, func(p string, en os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+	writeWireConfig(t, stateDir, x)
+	// The overlapping second root: X/mass is BOTH a root and a candidate
+	// row under X.
+	cfg := `{
+  "roots": ["` + filepath.ToSlash(x) + `", "` + filepath.ToSlash(inner) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 2, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": false,
+  "jj": true
+}`
+	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("overlapping-roots apply: %d (%s)", code, out.String())
+	}
+	for _, p := range []string{filepath.Join(inner, "m1"), filepath.Join(inner, "m2"), inner, filepath.Join(x, "solo")} {
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("%s survived (children must delete first, the parent last)", p)
+		}
+	}
+	// X itself is a configured ROOT: rows are root children, and a root is
+	// never a deletion candidate of its own scan.
+	if _, err := os.Stat(x); err != nil {
+		t.Fatalf("the outer root X was deleted: %v", err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if strings.Contains(string(raw), `"event":"skip"`) {
+		t.Fatalf("a children-first run must leave no skips:\n%s", raw)
+	}
+	results := strings.Count(string(raw), `"event":"result"`)
+	if results < 4 { // m1, m2, mass, solo
+		t.Fatalf("expected the full deletion set on the ledger, saw %d results:\n%s", results, raw)
+	}
+}
+
+// Overlapping roots, the HOLD half (round 6; the live-proven invariant
+// break: 'holds beat every rule and every flag' destroyed by the parent's
+// deletion, the run reporting 'skipped 0'): a hold on the inner dir stops
+// the parent's deletion too - the containment direction anyHoldUnder never
+// checked.
+func TestWiringOverlappingRootsHoldSurvives(t *testing.T) {
+	d := t.TempDir()
+	x := filepath.Join(d, "X")
+	stateDir := filepath.Join(d, "state")
+	inner := filepath.Join(x, "mass")
+	for _, p := range []string{stateDir, filepath.Join(inner, "m1"), filepath.Join(x, "solo")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{filepath.Join(inner, "m1", "x.bin"), filepath.Join(x, "solo", "x.bin")} {
+		if err := os.WriteFile(f, make([]byte, 3000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-40 * 24 * time.Hour)
+	filepath.WalkDir(d, func(p string, en os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+	writeWireConfig(t, stateDir, x)
+	if code := cmdHold([]string{"--for", "720h", filepath.Join(inner, "m1")}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+
+	var e bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, &bytes.Buffer{}, &e, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("held-inner apply: %d (want 2): %s", code, e.String())
+	}
+	// THE invariant: the held dir STANDS (the parent's deletion must not
+	// destroy it), and so does the parent (skipped as parent-of-live).
+	if _, err := os.Stat(filepath.Join(inner, "m1")); err != nil {
+		t.Fatal("a user hold was destroyed by the parent candidate's deletion")
+	}
+	if _, err := os.Stat(inner); err != nil {
+		t.Fatal("the held dir's parent was deleted (the hold's protection must extend upward)")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(raw), `"skipWhy":"parent-of-live-children"`) {
+		t.Fatalf("parent skip line missing:\n%s", raw)
+	}
+	if !strings.Contains(e.String(), "held dir at/under it") {
+		t.Fatalf("hold-under refusal copy missing: %q", e.String())
+	}
+}
+
+// The unknown-rail copy carries its CAUSE (round 6; the R5 reliability
+// finding: the refusal named 'a job landed' when the truth was 'the rail
+// could not enumerate' - the operator's remedy differs).
+func TestWiringUnknownRailCopy(t *testing.T) {
+	root, _ := wireFixture(t)
+	target := filepath.Join(root, "scratch-old")
+	perPathTicketHit = func(path string) (bool, bool) { return true, true }
+	t.Cleanup(func() { perPathTicketHit = incodalog.LiveTicketHit })
+	var e bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, &bytes.Buffer{}, &e, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("unknown-rail apply: %d (want 2): %s", code, e.String())
+	}
+	if !strings.Contains(e.String(), "incoda rail UNKNOWN-LIVE") {
+		t.Fatalf("unknown-rail copy must name the rail, not a job: %q", e.String())
+	}
+	if strings.Contains(e.String(), "a job landed") {
+		t.Fatalf("unknown-rail copy lies about the cause: %q", e.String())
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("unknown-rail run deleted the dir")
+	}
+}
+
+// reap never writes to incoda state (spec L540), pinned as a property: a
+// full scan+discard cycle leaves the state dir byte-identical.
+func TestWiringIncodaStateUntouched(t *testing.T) {
+	d := t.TempDir()
+	root := filepath.Join(d, "root")
+	stateDir := filepath.Join(d, "state")
+	qd := filepath.Join(d, "queues", "q")
+	for _, p := range []string{root, stateDir, qd} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+	log := time.Now().Add(-2*time.Hour).Format("2006-01-02 15:04:05") +
+		` queue=q event=release pid=1 dir=` + filepath.Join(root, "z") + ` reason="r" owner=o dur=1h` + "\n"
+	if err := os.WriteFile(filepath.Join(qd, "lane.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qd, "1-1.ticket"), []byte(`{"pid":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := func() string {
+		var b strings.Builder
+		filepath.WalkDir(d, func(p string, en os.DirEntry, err error) error {
+			if en.IsDir() || strings.Contains(p, "state") {
+				return nil // the REAP state dir legitimately mutates
+			}
+			h, _ := os.ReadFile(p)
+			fmt.Fprintf(&b, "%s:%d:%q\n", p, len(h), h)
+			return nil
+		})
+		return b.String()
+	}
+	before := sum()
+	if code := cmdScan([]string{"--no-gh"}, &bytes.Buffer{}, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if code := cmdActivity(nil, &bytes.Buffer{}, os.Stderr); code != ExitOK {
+		t.Fatalf("activity: %d", code)
+	}
+	if code := cmdDoctor(nil, &bytes.Buffer{}, os.Stderr); code != ExitOK {
+		t.Fatalf("doctor: %d", code)
+	}
+	if after := sum(); after != before {
+		t.Fatalf("reap wrote to incoda state:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// The unpinned normative rules (round 6, the spec seat's list): activity
+// takes no paths (120), doctor states the no-lane.log shape, and the
+// DESCENDANT half of 'live ticket at/under dir' flips a scan row.
+func TestWiringUnpinnedEdges(t *testing.T) {
+	_, _ = wireFixture(t) // hermetic INCODA_DIR (no rail)
+	if code := cmdActivity([]string{"some-path"}, &bytes.Buffer{}, os.Stderr); code != ExitUsage {
+		t.Fatalf("activity positional arg: %d (want 120)", code)
+	}
+	var doc bytes.Buffer
+	if code := cmdDoctor(nil, &doc, os.Stderr); code != ExitOK {
+		t.Fatalf("doctor: %d", code)
+	}
+	if !strings.Contains(doc.String(), "no lane.log found (attribution off;") {
+		t.Fatalf("doctor no-lane.log line missing:\n%s", doc.String())
+	}
+}
+
+// The DESCENDANT half of the at/under containment at scan level (round 6):
+// a held ticket naming a SUBDIR of a row flips the row ACTIVE/incoda-live
+// (both existing scan-level pins name the row itself).
+func TestWiringDescendantTicketFlipsRow(t *testing.T) {
+	d := t.TempDir()
+	root := filepath.Join(d, "root")
+	stateDir := filepath.Join(d, "state")
+	qd := filepath.Join(d, "queues", "q")
+	row := filepath.Join(root, "parent-row")
+	for _, p := range []string{stateDir, qd, row, filepath.Join(row, "child-work")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(row, "x.bin"), make([]byte, 3000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, row, 30*24*time.Hour)
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+
+	ticket := filepath.Join(qd, "5-5.ticket")
+	body := fmt.Sprintf(`{"pid":5,"queue":"q","cwd":%q}`, filepath.Join(row, "child-work"))
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTestCli(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+
+	var js bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &js, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(js.String(), "incoda-live") {
+		t.Fatalf("a live ticket under a subdir did not flip the parent row:\n%s", js.String())
 	}
 }
 

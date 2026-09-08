@@ -240,6 +240,23 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 		}
 		depth[i] = d
 	}
+	// Overlapping roots (round 6): PATH NESTING counts toward depth too.
+	// roots=[X, X/mass] put a parent and its inner-root children in one
+	// plan with NO ParentRepo lineage between them; the parent deleting
+	// first destroyed the children (live-proven by the R5 reliability
+	// seat - including a user hold under the parent, 'holds beat every
+	// rule' broken by ordering alone).
+	for i, p := range plan {
+		pn := config.Canonical(p.Path)
+		for j, q := range plan {
+			if i == j || config.Canonical(q.Path) == pn {
+				continue
+			}
+			if NestedUnder(pn, config.Canonical(q.Path)) {
+				depth[i]++ // p sits under q: q is a plan-set ancestor
+			}
+		}
+	}
 	order := make([]int, len(plan))
 	for i := range order {
 		order[i] = i
@@ -258,6 +275,42 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 		out = append(out, plan[i])
 	}
 	return out
+}
+
+// hasDeletedChild reports whether this run deleted a path under parent.
+func hasDeletedChild(deletedInRun map[string]bool, path string) bool {
+	if len(deletedInRun) == 0 {
+		return false
+	}
+	pc := config.Canonical(path)
+	for d := range deletedInRun {
+		if NestedUnder(config.Canonical(d), pc) {
+			return true
+		}
+	}
+	return false
+}
+
+// NestedUnder reports whether child sits strictly under parent (canonical
+// paths; component-boundary prefix).
+func NestedUnder(child, parent string) bool {
+	return strings.HasPrefix(child, parent+string(os.PathSeparator))
+}
+
+// HoldUnderPath reports an ACTIVE hold naming a dir at or under path - the
+// CONTAINMENT direction anyHoldUnder never checked (it walks UP from the
+// candidate): a hold on an inner dir must stop its parent's deletion too
+// (holds beat every rule; overlapping roots made the inner dir invisible
+// to lineage ordering, live-proven by the R5 reliability seat).
+func HoldUnderPath(holds map[string]bool, path string) (string, bool) {
+	pn := config.Canonical(path)
+	for h := range holds {
+		hn := config.Canonical(h)
+		if hn == pn || NestedUnder(hn, pn) {
+			return h, true
+		}
+	}
+	return "", false
 }
 
 // Reverify re-runs the deletion-time checks for one PLANNED path at full
@@ -305,7 +358,18 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	if info.Partial {
 		return ReverifyResult{SkipWhy: SkipIgnorance, Verdict: verdict.Verdict{Verdict: verdict.Manual, Code: "state-unreadable"}}
 	}
-	if now.Sub(info.MaxMtime) < 2*time.Hour {
+	// A dir whose child THIS RUN deleted shows its own stamp bumped (the
+	// directory listing changed): that is this run's doing, not user
+	// activity, and the children-first ordering (lineage + path nesting,
+	// round 6) made parent-after-child deletion a first-class shape. When
+	// that is the case the tripwire re-reads over the REMAINING children:
+	// their stamps are the user's. (No equality dance between two stats of
+	// the parent - NTFS propagates the listing update lazily, and the two
+	// reads can disagree by milliseconds; the re-read is race-free.)
+	if now.Sub(info.MaxMtime) < 2*time.Hour && hasDeletedChild(deletedInRun, path) {
+		info.MaxMtime = walk.ChildrenMaxMtime(path, now)
+	}
+	if !info.MaxMtime.IsZero() && now.Sub(info.MaxMtime) < 2*time.Hour {
 		return ReverifyResult{SkipWhy: SkipActiveTripwire, Verdict: verdict.Verdict{Verdict: verdict.Active, Code: "active"}}
 	}
 

@@ -292,10 +292,16 @@ func defaultConfirmReprobeLive(activeHours time.Duration) map[string]bool {
 // ticket - tests inject the held set here (the auditlog.FreeBytes pattern).
 var confirmReprobeLive = defaultConfirmReprobeLive
 
-// perPathTicketLive is the per-path pre-deletion re-sweep seam (same
+// perPathTicketHit is the per-path pre-deletion re-sweep seam (same
 // pattern): the window it covers is between the confirm-window probe and
-// each path's deletion, unreachable with fixtures alone.
-var perPathTicketLive = incodalog.LiveTicketsUnder
+// each path's deletion, unreachable with fixtures alone. The CAUSE rides
+// along: an unknown-rail trip must not be worded as 'a ticket sits here'
+// (the remedies differ - fix-the-rail vs wait-for-the-job).
+var perPathTicketHit = incodalog.LiveTicketHit
+
+// unknownRailNote is the honest copy for an unknown-rail trip (the R5
+// reliability finding: the refusal named a mechanism that did not happen).
+const unknownRailNote = "incoda rail UNKNOWN-LIVE (enumeration incomplete; run reap doctor for the named failures)"
 
 // incodaSnapshot reads incoda state ONCE per invocation: one ticket sweep
 // plus ONE lane.log parse feed BOTH the live map and the enrichment
