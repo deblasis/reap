@@ -119,6 +119,20 @@ func TestLoadSaveRoundTripAndInvalid(t *testing.T) {
 	if _, err := Load(dir); err == nil {
 		t.Fatal("empty roots must refuse")
 	}
+
+	// A leading UTF-8 BOM (PowerShell 5 Set-Content -Encoding UTF8) is
+	// tolerated, not a parse error (round 5 pin of the strip).
+	bom := append([]byte{0xEF, 0xBB, 0xBF}, []byte(`{"roots": ["C:\\bom-ok"]}`)...)
+	if err := os.WriteFile(ConfigPath(dir), bom, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bomCfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("BOM'd config must load: %v", err)
+	}
+	if len(bomCfg.Roots) != 1 || bomCfg.Roots[0] != `C:\bom-ok` {
+		t.Fatalf("BOM'd config lost roots: %v", bomCfg.Roots)
+	}
 }
 
 func TestAtomicWriteLeavesNoTemp(t *testing.T) {

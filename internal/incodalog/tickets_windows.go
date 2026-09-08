@@ -86,28 +86,36 @@ func ticketDir(body []byte) string {
 	return ""
 }
 
-// LiveTicketDirs returns every held ticket's dir= (the pure-ticket half of
-// the ACTIVE rail: a ticket the best-effort log never recorded is still
-// the authoritative liveness signal). An existing-but-unlistable queues
-// dir reads as a single "" sentinel (LiveTicketsUnder's live-or-unknown
-// policy at the enumeration level: silent-empty is the unsafe direction -
-// the caller treats the sentinel as unknown-live).
-func LiveTicketDirs() []string {
+// ProbeRail walks every queue's ticket files once and returns the rail's
+// health: each HELD ticket's dir plus the failure names. ANY enumeration
+// failure sets Unknown: the queues dir existing but not listing, ONE queue
+// dir whose tickets cannot be enumerated, or a HELD ticket whose body
+// cannot be read or parsed into a dir (incoda's Enroll takes the lock
+// BEFORE writing the body and swallows its own marshal error, so an empty
+// or torn body on a held ticket is a real just-enrolled or crashed-writer
+// shape, not merely corruption). Absent evidence must never read as
+// inactive at any level of the enumeration - the R4 panel live-proved each
+// level's silent skip was a false-SAFE channel.
+func ProbeRail() RailHealth {
+	var h RailHealth
 	qd := filepath.Join(StateDir(), "queues")
 	queues, err := os.ReadDir(qd)
 	if err != nil {
-		if stateDirExisted() {
-			return []string{""} // unknown-live sentinel
-		}
-		return nil
+		// Existed but will not list: wholly unknown (the never-existed case
+		// degrades silently - there is no rail to be blind about).
+		h.Unknown = stateDirExisted()
+		return h
 	}
-	var out []string
 	for _, q := range queues {
 		if !q.IsDir() {
 			continue
 		}
 		tickets, terr := os.ReadDir(filepath.Join(qd, q.Name()))
 		if terr != nil {
+			// The queue just listed but its tickets cannot be enumerated:
+			// that queue's liveness is unknown (the sentinel one level down).
+			h.Unknown = true
+			h.UnreadableQueues = append(h.UnreadableQueues, filepath.Join(qd, q.Name()))
 			continue
 		}
 		for _, tf := range tickets {
@@ -118,56 +126,59 @@ func LiveTicketDirs() []string {
 			if !TicketLive(full) {
 				continue // stale file: no holder
 			}
-			if body, berr := os.ReadFile(full); berr == nil {
-				if d := ticketDir(body); d != "" {
-					out = append(out, d)
-				}
+			body, berr := os.ReadFile(full)
+			if berr != nil {
+				h.Unknown = true // held but unreadable: which dir is unknown
+				h.UnattributableLive = append(h.UnattributableLive, full)
+				continue
 			}
+			d := ticketDir(body)
+			if d == "" {
+				h.Unknown = true // held but unattributable (torn/empty body)
+				h.UnattributableLive = append(h.UnattributableLive, full)
+				continue
+			}
+			h.Dirs = append(h.Dirs, d)
 		}
 	}
-	return out
+	return h
+}
+
+// SweepTickets is the two-value form the scan-side consumers use.
+func SweepTickets() (dirs []string, unknown bool) {
+	h := ProbeRail()
+	return h.Dirs, h.Unknown
+}
+
+// LiveTicketDirs returns every held ticket's dir= (the pure-ticket half of
+// the ACTIVE rail: a ticket the best-effort log never recorded is still
+// the authoritative liveness signal). Any enumeration unknown collapses to
+// a single "" sentinel entry (live-or-unknown at the enumeration level:
+// silent-empty is the unsafe direction - the caller treats the sentinel as
+// unknown-live).
+func LiveTicketDirs() []string {
+	h := ProbeRail()
+	if h.Unknown {
+		h.Dirs = append(h.Dirs, "")
+	}
+	return h.Dirs
 }
 
 // LiveTicketsUnder reports whether any live ticket names a dir at or under
 // root (the ACTIVE rail's probe). Stale ticket FILES (no holder) are
 // inert; only a held lock whose ticket body's cwd sits at/under root
-// counts. An UNREADABLE queues dir reads LIVE-OR-UNKNOWN (the per-ticket
-// policy hoisted one level: absent evidence must never read as inactive)
-// when it plausibly contains the root.
+// counts. Any enumeration unknown reads LIVE-OR-UNKNOWN for every root
+// (absent evidence must never read as inactive).
 func LiveTicketsUnder(root string) bool {
-	qd := filepath.Join(StateDir(), "queues")
-	queues, err := os.ReadDir(qd)
-	if err != nil {
-		// The state dir existed when the run started but cannot be listed:
-		// the safe direction (an unreadable live set is not an empty one).
-		return stateDirExisted()
+	h := ProbeRail()
+	if h.Unknown {
+		return true
 	}
 	rootNorm := strings.ToLower(filepath.Clean(root))
-	for _, q := range queues {
-		if !q.IsDir() {
-			continue
-		}
-		tickets, terr := os.ReadDir(filepath.Join(qd, q.Name()))
-		if terr != nil {
-			continue
-		}
-		for _, tf := range tickets {
-			if tf.IsDir() || !strings.HasSuffix(tf.Name(), ".ticket") {
-				continue
-			}
-			full := filepath.Join(qd, q.Name(), tf.Name())
-			if !TicketLive(full) {
-				continue // stale file: no holder
-			}
-			// Live holder: its dir must sit at/under root.
-			if body, berr := os.ReadFile(full); berr == nil {
-				if d := ticketDir(body); d != "" {
-					dn := strings.ToLower(filepath.Clean(d))
-					if dn == rootNorm || strings.HasPrefix(dn, rootNorm+string(os.PathSeparator)) {
-						return true
-					}
-				}
-			}
+	for _, d := range h.Dirs {
+		dn := strings.ToLower(filepath.Clean(d))
+		if dn == rootNorm || strings.HasPrefix(dn, rootNorm+string(os.PathSeparator)) {
+			return true
 		}
 	}
 	return false

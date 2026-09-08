@@ -143,6 +143,20 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "incoda: state dir found; dir= attribution %d/%d candidate dir(s); old-format events are COUNTED, not attributed, until the dir= PR ships\n",
 			attributed, len(candidates))
 	}
+	// The live-ticket rail's enumeration honesty (round 5): any failure
+	// level makes every candidate read live-or-unknown; doctor NAMES the
+	// failures so the operator can fix the ACL / the torn ticket instead of
+	// wondering why everything rows ACTIVE.
+	if h := incodalog.ProbeRail(); h.Unknown {
+		fmt.Fprintf(stdout, "incoda rail: UNKNOWN-LIVE (enumeration incomplete: %d unreadable queue dir(s), %d held ticket(s) without a readable dir); every dir reads live-or-unknown until these resolve\n",
+			len(h.UnreadableQueues), len(h.UnattributableLive))
+		for _, q := range h.UnreadableQueues {
+			fmt.Fprintf(stdout, "  unreadable queue dir: %s\n", q)
+		}
+		for _, t := range h.UnattributableLive {
+			fmt.Fprintf(stdout, "  held ticket without a dir: %s\n", t)
+		}
+	}
 
 	// Stray healing UNDER apply.lock, HELD ACROSS the heal loop (round-3
 	// fix of the round-2 fold: releasing after TryLock left the heal racing

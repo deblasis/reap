@@ -81,8 +81,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	// tickets the best-effort log never recorded) AND open events within
 	// the active-hours window. The digest records ride alongside for the
 	// 'last:' row enrichment.
-	incodaLive := incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
-	incodaRecords := incodaDigestAll()
+	incodaLive, incodaRecords := incodaSnapshot(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
 
 	// Unreadable roots are named, not silently skipped: a configured root
 	// that cannot be listed yields a marker DirInfo, and hiding it would let
@@ -280,17 +279,38 @@ func anyIncodaUnder(live map[string]bool, path string) bool {
 	return false
 }
 
-// incodaLiveSet builds the canonical live-dir set in ONE ticket sweep:
-// the sweep's dir set feeds a membership map, and the log triggers
-// (live-backed + active-hours opens) join against it - per-record
-// LiveTicketsUnder calls would re-Readdir every queue per open record
-// (O(records x queues x tickets) once the dir= PR ships).
-func incodaLiveSet(activeHours time.Duration) map[string]bool {
-	live := map[string]bool{}
+// defaultConfirmReprobeLive is confirmReprobeLive's real implementation.
+func defaultConfirmReprobeLive(activeHours time.Duration) map[string]bool {
+	live, _ := incodaSnapshot(activeHours)
+	return live
+}
+
+// confirmReprobeLive is the under-lock confirm-window re-probe source.
+// A seam, not indirection: a ticket created BEFORE the run is caught at
+// scan time (the row verdicts ACTIVE/incoda-live and never plans), so the
+// mid-window abort cannot be hit deterministically with a pre-created
+// ticket - tests inject the held set here (the auditlog.FreeBytes pattern).
+var confirmReprobeLive = defaultConfirmReprobeLive
+
+// perPathTicketLive is the per-path pre-deletion re-sweep seam (same
+// pattern): the window it covers is between the confirm-window probe and
+// each path's deletion, unreachable with fixtures alone.
+var perPathTicketLive = incodalog.LiveTicketsUnder
+
+// incodaSnapshot reads incoda state ONCE per invocation: one ticket sweep
+// plus ONE lane.log parse feed BOTH the live map and the enrichment
+// records (the R4 panel measured ~1.8s per parse on a 923KB log - two
+// parses per scan and three per apply, with lane.log append-only and
+// unrotated upstream, was unbounded read amplification). The live set
+// carries BOTH triggers (spec L320-322/L342): a held ticket backing an
+// open record (incl pure tickets the best-effort log never recorded) AND
+// open events within the active-hours window. A "" entry is the
+// unknown-live sentinel (any enumeration failure in the sweep): the
+// conservative direction, not a silent-empty rail.
+func incodaSnapshot(activeHours time.Duration) (live map[string]bool, records map[string]*incodalog.Record) {
+	live = map[string]bool{}
 	// ONE sweep: every held ticket's dir (the authoritative signal -
 	// Queue.Logf swallows write failures, so the log may have missed it).
-	// A "" entry is the unknown-live sentinel (an existing-but-unlistable
-	// queues dir): the conservative direction, not a silent-empty rail.
 	ticketDirs := incodalog.LiveTicketDirs()
 	ticketSet := map[string]bool{}
 	for _, d := range ticketDirs {
@@ -303,7 +323,7 @@ func incodaLiveSet(activeHours time.Duration) map[string]bool {
 		live[d] = true
 	}
 	// Log triggers, joined against the ONE sweep (membership, not probing).
-	records, _ := incodalog.Digest(incodalog.ReadAll())
+	records, _ = incodalog.Digest(incodalog.ReadAll())
 	cutoff := time.Now().Add(-activeHours)
 	for _, r := range records {
 		if r.Open && ticketSet[config.Canonical(r.Dir)] {
@@ -313,14 +333,7 @@ func incodaLiveSet(activeHours time.Duration) map[string]bool {
 			live[config.Canonical(r.Dir)] = true
 		}
 	}
-	return live
-}
-
-// incodaDigestAll reads and digests incoda's lane.log (one pass per scan;
-// the lastIncoda enrichment source for both pipelines' entry rows).
-func incodaDigestAll() map[string]*incodalog.Record {
-	records, _ := incodalog.Digest(incodalog.ReadAll())
-	return records
+	return live, records
 }
 
 // LastIncoda is the per-entry attribution enrichment (spec L501): the

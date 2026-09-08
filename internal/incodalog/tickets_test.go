@@ -5,6 +5,7 @@ package incodalog
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,5 +102,87 @@ func TestOpenRecordWithLiveTicketJoinsLive(t *testing.T) {
 	// The rail's trigger: OPEN + a held ticket.
 	if !LiveTicketsUnder(r.Dir) {
 		t.Fatal("open record's live ticket not probed live")
+	}
+}
+
+// The unknown-live sentinel at the BODY level (round 5; the R4 panel
+// live-proved a held ticket with a torn body protected NOTHING): incoda's
+// Enroll takes the lock BEFORE writing the body and swallows its own
+// marshal error, so an empty or torn body on a genuinely held ticket is a
+// real shape. It must trip the sentinel - live-or-unknown for EVERY root -
+// never a silent drop.
+func TestHeldUnreadableTicketSentinel(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "q")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ticket := filepath.Join(qd, "5-1.ticket")
+	if err := os.WriteFile(ticket, []byte("torn{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTest(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+
+	dirs := LiveTicketDirs()
+	sawSentinel := false
+	for _, x := range dirs {
+		if x == "" {
+			sawSentinel = true
+		}
+	}
+	if !sawSentinel {
+		t.Fatalf("held-but-torn ticket did not trip the unknown-live sentinel: %q", dirs)
+	}
+	if !LiveTicketsUnder(`C:\somewhere\unrelated`) {
+		t.Fatal("unknown-live must read live for EVERY root, not just the ticket's dir")
+	}
+	h := ProbeRail()
+	if !h.Unknown || len(h.UnattributableLive) != 1 {
+		t.Fatalf("rail health: %+v", h)
+	}
+}
+
+// The unknown-live sentinel at the PER-QUEUE level (round 5; the R4 eng
+// major, live-proven: ONE ACL-denied queue dir while its ticket was held
+// flipped the held dir OUT of incoda-live - the false-SAFE direction). The
+// denial is best-effort (icacls /deny on a self-owned dir needs no
+// elevation but is environment-dependent): skip, never fake.
+func TestPerQueueUnreadableSentinel(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "qA")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		t.Skip("no USERNAME for the ACL fixture")
+	}
+	if out, err := exec.Command("icacls", qd, "/deny", user+":(RD)").CombinedOutput(); err != nil {
+		t.Skipf("icacls deny: %v %s", err, out)
+	}
+	t.Cleanup(func() {
+		out, _ := exec.Command("icacls", qd, "/remove:d", user).CombinedOutput()
+		_ = out
+	})
+
+	dirs, unknown := SweepTickets()
+	if !unknown {
+		t.Fatalf("one unreadable queue dir reads as a complete enumeration: %q", dirs)
+	}
+	if len(dirs) != 0 {
+		t.Fatalf("partial dir set beside the unknown flag: %q", dirs)
+	}
+	if !LiveTicketsUnder(`C:\anywhere`) {
+		t.Fatal("per-queue unknown must read live-or-unknown for every root")
 	}
 }

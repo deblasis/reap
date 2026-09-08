@@ -87,8 +87,10 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 	core.holds = holds
 	// incoda attribution (M4): the same BOTH-trigger live set the scan
 	// display builds (held tickets incl pure ones + open events in the
-	// active-hours window).
-	core.incodaLive = incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	// active-hours window). The records half of the snapshot is the scan
+	// table's 'last:' enrichment source; the plan pipeline does not render
+	// it (its own layout), so it is dropped here.
+	core.incodaLive, _ = incodaSnapshot(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
 	core.expiredHolds = expired
 	core.remoteStale = time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 	return core, ExitOK
@@ -685,6 +687,28 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitState
 	}
 	defer lock.Close()
+
+	// The ledger opens BEFORE the under-lock gates (round 5: the holds
+	// re-read and incoda re-probe aborts previously returned traceless -
+	// a CONFIRMED run that stopped for a mid-window reason left no session
+	// record at all, live-proven by the panel on a 300-dir run).
+	log, err := auditlog.Open(stateDir, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap apply: %v\n", err)
+		return ExitState
+	}
+	freeBefore := auditlog.FreeBytes(stateDir)
+	// A gate abort still leaves its trace: one result line naming the
+	// path and cause, then the envelope (every planned path skipped by
+	// the abort - planned N, deleted 0 is the reconciled truth).
+	gateAbort := func(path, cause string) int {
+		ok := false
+		_ = log.Append(auditlog.Line{Event: "result", Path: path, OK: &ok, Quarantine: nil, Residue: cause})
+		_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(plan), Deleted: 0,
+			Skipped: len(plan), FreeBefore: freeBefore, FreeAfter: auditlog.FreeBytes(stateDir), Quarantine: nil})
+		return ExitState
+	}
+
 	freshHolds := applycmd.ReadHoldsSnapshot(stateDir)
 	for h := range freshHolds {
 		core.holds[h] = true
@@ -692,7 +716,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	for _, p := range plan {
 		if applycmd.PathHeld(core.holds, p.Path) {
 			fmt.Fprintf(stderr, "reap apply: %s: held by user DURING the confirm window (reap hold landed mid-run); rerun apply if this is unexpected\n", p.Path)
-			return ExitState
+			return gateAbort(p.Path, "held by user DURING the confirm window (reap hold landed mid-run); run aborted, nothing deleted")
 		}
 	}
 	// The incoda re-probe, hold-parity: the live set was built at scan
@@ -704,21 +728,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// (the same named-abort shape as the holds re-read - the job may be
 	// the reason the operator ran apply in the first place; round 4 fixed
 	// the copy: nothing is skipped, the whole run stops before any
-	// deletion or ledger line).
-	freshLive := incodaLiveSet(time.Duration(core.cfg.Thresholds.ActiveHours) * time.Hour)
+	// deletion; round 5 made the abort legible on the ledger).
+	freshLive := confirmReprobeLive(time.Duration(core.cfg.Thresholds.ActiveHours) * time.Hour)
 	for _, p := range plan {
 		if anyIncodaUnder(freshLive, p.Path) {
 			fmt.Fprintf(stderr, "reap apply: %s: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); run aborted, nothing deleted; rerun apply when the job finishes\n", p.Path)
-			return ExitState
+			return gateAbort(p.Path, "live incoda ticket at/under it DURING the confirm window (a job landed mid-run); run aborted, nothing deleted")
 		}
 	}
-
-	log, err := auditlog.Open(stateDir, runID)
-	if err != nil {
-		fmt.Fprintf(stderr, "reap apply: %v\n", err)
-		return ExitState
-	}
-	freeBefore := auditlog.FreeBytes(stateDir)
 
 	ordered := applycmd.OrderChildrenFirst(plan)
 	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan),
@@ -918,6 +935,26 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if rc := writeIntent("hardened confirm shown (counts: "+counts+"); plain copy taken", rv.Manifest); rc >= 0 {
 				return rc
 			}
+		}
+		// Per-path ticket re-sweep (round 5): the confirm-window probe covers
+		// only up to the lock; a large run spends minutes between that sweep
+		// and this path's deletion, and an enqueued-not-yet-writing job
+		// touches no files and holds no handles the tripwire or rename probe
+		// can see. The sweep is cheap (one ReadDir + lock probes); a hit
+		// skips the path with the session kept - the dir stands.
+		if perPathTicketLive(p.Path) {
+			ok := false
+			note := "live or unknown-live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT deleted"
+			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
+				SkipWhy: applycmd.SkipVerdictChanged, OK: &ok,
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtrVal}); rc >= 0 {
+				return rc
+			}
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
+				Path: p.Path, Why: applycmd.SkipVerdictChanged, Note: note})
+			summary.SkippedBytes += p.SizeBytes
+			continue
 		}
 		// The dedupe pass walks each path now, before the deletion.
 		applyReclaim.Add(p.Path)

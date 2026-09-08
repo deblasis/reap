@@ -224,13 +224,19 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// A hit REMOVES the path from the work set (round 4: the round-3
 	// version printed the refusal and then deleted the dir anyway - a false
 	// safety message followed by the exact data loss this fold exists to
-	// prevent, live-proven by the panel).
-	freshLive := incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	// prevent, live-proven by the panel). Round 5: the removed paths become
+	// skip records once the ledger opens - they previously vanished (the
+	// run exited 0 in a mixed batch, the envelope's planned was computed
+	// post-filter, and --json named no path).
+	plannedPaths := pathsOfDiscardWork(work)
+	freshLive := confirmReprobeLive(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
 	var kept []discardWork
+	var incodaRefused []string
 	for _, w := range work {
 		if anyIncodaUnder(freshLive, w.path) {
 			fmt.Fprintf(stderr, "reap discard: %s: refused: live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded\n", w.path)
 			refused = true
+			incodaRefused = append(incodaRefused, w.path)
 			continue
 		}
 		kept = append(kept, w)
@@ -243,9 +249,11 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitState
 	}
 	freeBefore := auditlog.FreeBytes(stateDir)
-	summary := applycmd.Summary{RunID: runID, Planned: pathsOfDiscardWork(work)}
+	// Planned is the set the CONFIRM PROMPT advertised (pre-refusal), so
+	// planned/deleted/skipped reconcile with what the operator approved.
+	summary := applycmd.Summary{RunID: runID, Planned: plannedPaths}
 	defer func() {
-		_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(work),
+		_ = log.Append(auditlog.Line{Event: "envelope", Planned: len(plannedPaths),
 			Deleted: len(summary.Deleted), Skipped: len(summary.Skipped),
 			FreeBefore: freeBefore, FreeAfter: auditlog.FreeBytes(stateDir), Quarantine: nil})
 	}()
@@ -255,6 +263,15 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			return ExitState
 		}
 		return -1
+	}
+	for _, p := range incodaRefused {
+		ok := false
+		summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p, Why: applycmd.SkipVerdictChanged,
+			Note: "live incoda ticket at/under it DURING the confirm window (a job landed mid-run); the dir is NOT discarded"})
+		if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p, SkipWhy: applycmd.SkipVerdictChanged,
+			OK: &ok, Quarantine: nil}); rc >= 0 {
+			return rc
+		}
 	}
 
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}
@@ -535,6 +552,25 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 		}
 
+		// Per-path ticket re-sweep (round 5): the confirm-window probe covers
+		// only up to the lock; a batch run spends minutes between that sweep
+		// and this path's deletion, and an enqueued-not-yet-writing job
+		// touches no files and holds no handles the tripwire or rename probe
+		// can see. The sweep is cheap (one ReadDir + lock probes); a hit
+		// skips the path with the session kept - the dir stands.
+		if perPathTicketLive(path) {
+			note := "live or unknown-live incoda ticket at/under it (re-swept immediately before deletion); the dir is NOT discarded"
+			fmt.Fprintf(stderr, "reap discard: %s: %s\n", path, note)
+			ok := false
+			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path,
+				Why: applycmd.SkipVerdictChanged, Note: note})
+			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path,
+				SkipWhy: applycmd.SkipVerdictChanged, OK: &ok,
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtr(qPath)}); rc >= 0 {
+				return rc
+			}
+			continue
+		}
 		// Manifest capture BEFORE Delete (the M2 lesson): after removal the
 		// path cannot be read. The dedupe pass walks it now too.
 		manifest := walk.CappedManifest(path)

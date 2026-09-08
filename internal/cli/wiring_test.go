@@ -16,6 +16,8 @@ import (
 	"github.com/deblasis/reap/internal/applycmd"
 	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
+	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
 )
@@ -1376,15 +1378,19 @@ func TestWiringConfirmWindowTicketSurvival(t *testing.T) {
 	}
 }
 
-// lastIncoda end-to-end (round 4 pin): a natural-casing dir= record
-// joins (the canonicalization), the row renders the record, the no-record
-// form renders on rows without one, and scan --json carries the field.
+// lastIncoda end-to-end (round 4 pin, repaired round 5): a natural-casing
+// dir= record joins (the canonicalization), the exact mock-worded form
+// renders (owner, compact ago, %q reason - the fixture timestamp is
+// NOW-RELATIVE so the '2h' clause is reachable, not dead weight), the
+// null-owner and no-record forms render, and scan --json carries the
+// field with owner present-but-empty when no owner= was written (a null
+// owner and an absent field are different facts).
 func TestWiringLastIncodaEndToEnd(t *testing.T) {
 	d := t.TempDir()
 	root := t.TempDir()
 	stateDir := filepath.Join(d, "state")
 	qd := filepath.Join(d, "queues", "q")
-	for _, p := range []string{stateDir, qd, filepath.Join(root, "with-record"), filepath.Join(root, "no-record")} {
+	for _, p := range []string{stateDir, qd, filepath.Join(root, "no-owner"), filepath.Join(root, "no-record")} {
 		if err := os.MkdirAll(p, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1392,13 +1398,15 @@ func TestWiringLastIncodaEndToEnd(t *testing.T) {
 	writeWireConfig(t, stateDir, root)
 	t.Setenv("INCODA_DIR", d)
 
-	// A CLOSED release naming the with-record dir in NATURAL casing (the
-	// canonicalization probe: the raw key must join the canonical lookup).
-	withDir := filepath.Join(root, "With-Record") // distinct casing
+	// The with-record dir in NATURAL casing (the canonicalization probe:
+	// the raw key must join the canonical lookup).
+	withDir := filepath.Join(root, "With-Record")
 	if err := os.MkdirAll(withDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	log := fmt.Sprintf("2026-09-07 12:00:00 queue=q event=release pid=1 dir=%s reason=\"probe run\" owner=agent dur=1h\n", withDir)
+	ts := time.Now().Add(-2 * time.Hour).Format("2006-01-02 15:04:05")
+	log := fmt.Sprintf("%s queue=q event=release pid=1 dir=%s reason=\"probe run\" owner=agent dur=1h\n", ts, withDir) +
+		fmt.Sprintf("%s queue=q event=release pid=2 dir=%s reason=\"nightly\" dur=1h\n", ts, filepath.Join(root, "no-owner"))
 	if err := os.WriteFile(filepath.Join(qd, "lane.log"), []byte(log), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1407,8 +1415,11 @@ func TestWiringLastIncodaEndToEnd(t *testing.T) {
 	if code := cmdScan([]string{"--no-gh"}, &text, os.Stderr); code != ExitOK {
 		t.Fatalf("scan: %d", code)
 	}
-	if !strings.Contains(text.String(), `last: agent, `+"2h"+`, "probe run"`) && !strings.Contains(text.String(), "agent, ") {
-		t.Fatalf("with-record 'last:' detail missing:\n%s", text.String())
+	if !strings.Contains(text.String(), `last: agent, 2h, "probe run"`) {
+		t.Fatalf("with-record 'last:' exact form missing:\n%s", text.String())
+	}
+	if !strings.Contains(text.String(), `last: -, 2h, "nightly"`) {
+		t.Fatalf("null-owner 'last:' form missing:\n%s", text.String())
 	}
 	if !strings.Contains(text.String(), "last: no incoda record") {
 		t.Fatalf("no-record form missing:\n%s", text.String())
@@ -1418,21 +1429,355 @@ func TestWiringLastIncodaEndToEnd(t *testing.T) {
 	if code := cmdScan([]string{"--no-gh", "--json"}, &js, os.Stderr); code != ExitOK {
 		t.Fatalf("scan --json: %d", code)
 	}
-	if !strings.Contains(js.String(), `"lastIncoda"`) || !strings.Contains(js.String(), "probe run") {
-		t.Fatalf("scan --json lastIncoda field missing or recordless:\n%s", js.String()[:min(400, len(js.String()))])
+	var rep struct {
+		Entries []struct {
+			Path       string `json:"path"`
+			LastIncoda *struct {
+				Ago    string `json:"ago"`
+				Owner  string `json:"owner"`
+				Reason string `json:"reason"`
+			} `json:"lastIncoda"`
+		} `json:"entries"`
 	}
-	_ = d
+	if err := json.Unmarshal(js.Bytes(), &rep); err != nil {
+		t.Fatalf("scan json: %v", err)
+	}
+	sawOwner, sawNullOwner, sawNone := false, false, false
+	for _, e := range rep.Entries {
+		switch {
+		case strings.EqualFold(filepath.Clean(e.Path), filepath.Clean(withDir)):
+			if e.LastIncoda == nil || e.LastIncoda.Owner != "agent" || e.LastIncoda.Reason != "probe run" || e.LastIncoda.Ago != "2h" {
+				t.Fatalf("with-record lastIncoda: %+v", e.LastIncoda)
+			}
+			sawOwner = true
+		case strings.HasSuffix(filepath.Clean(e.Path), "no-owner"):
+			if e.LastIncoda == nil {
+				t.Fatal("no-owner row lost its lastIncoda entirely (omitempty erasure)")
+			}
+			if e.LastIncoda.Owner != "" || e.LastIncoda.Ago != "2h" {
+				t.Fatalf("no-owner lastIncoda: %+v", e.LastIncoda)
+			}
+			sawNullOwner = true
+		case strings.HasSuffix(filepath.Clean(e.Path), "no-record"):
+			if e.LastIncoda != nil {
+				t.Fatalf("no-record row carries a record: %+v", e.LastIncoda)
+			}
+			sawNone = true
+		}
+	}
+	if !sawOwner || !sawNullOwner || !sawNone {
+		t.Fatalf("rows not all found: owner=%v nullOwner=%v none=%v\n%s", sawOwner, sawNullOwner, sawNone, js.String())
+	}
+}
+
+// The ACTIVE-rail LOG triggers, pinned at the scan level (round 5; the
+// spec's named fixture half 'enqueued-not-released WITHOUT a live ticket'
+// had zero coverage - deleting both trigger lines failed no test): an OPEN
+// record within active-hours flips an otherwise-SAFE aged scratch dir to
+// ACTIVE/incoda-live; the same record beyond the window does not.
+func TestWiringIncodaLogTriggersActive(t *testing.T) {
+	d := t.TempDir()
+	root := filepath.Join(d, "root")
+	stateDir := filepath.Join(d, "state")
+	qd := filepath.Join(d, "queues", "q")
+	for _, p := range []string{root, stateDir, qd, filepath.Join(root, "recent-open"), filepath.Join(root, "stale-open")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"recent-open", "stale-open"} {
+		if err := os.WriteFile(filepath.Join(root, n, "x.bin"), make([]byte, 3000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ageTree(t, filepath.Join(root, n), 30*24*time.Hour)
+	}
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+
+	// OPEN acquires (no terminator, no ticket anywhere): one 10m ago, one
+	// 72h ago (beyond the 48h active-hours window).
+	recent := time.Now().Add(-10 * time.Minute).Format("2006-01-02 15:04:05")
+	stale := time.Now().Add(-72 * time.Hour).Format("2006-01-02 15:04:05")
+	log := fmt.Sprintf("%s queue=q event=acquire pid=1 dir=%s\n", recent, filepath.Join(root, "recent-open")) +
+		fmt.Sprintf("%s queue=q event=acquire pid=2 dir=%s\n", stale, filepath.Join(root, "stale-open"))
+	if err := os.WriteFile(filepath.Join(qd, "lane.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var js bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &js, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	var rep struct {
+		Entries []struct {
+			Path       string `json:"path"`
+			Verdict    string `json:"verdict"`
+			ReasonCode string `json:"reasonCode"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(js.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	row := func(suffix string) *struct {
+		Path       string `json:"path"`
+		Verdict    string `json:"verdict"`
+		ReasonCode string `json:"reasonCode"`
+	} {
+		for i := range rep.Entries {
+			if strings.HasSuffix(filepath.Clean(rep.Entries[i].Path), suffix) {
+				return &rep.Entries[i]
+			}
+		}
+		return nil
+	}
+	r := row("recent-open")
+	if r == nil {
+		t.Fatalf("recent-open row missing:\n%s", js.String())
+	}
+	if r.Verdict != "ACTIVE" || r.ReasonCode != "incoda-live" {
+		t.Fatalf("open-record-within-window not ACTIVE/incoda-live: %+v", r)
+	}
+	s := row("stale-open")
+	if s == nil {
+		t.Fatalf("stale-open row missing:\n%s", js.String())
+	}
+	if s.ReasonCode == "incoda-live" {
+		t.Fatalf("open record beyond the window fired the rail: %+v", s)
+	}
+}
+
+// The apply under-lock gate abort, TRACED and pinned (round 5; the branch
+// had zero coverage and previously returned with no ledger line at all):
+// a ticket the confirm-window re-probe sees aborts the whole run at 122
+// naming the dir, nothing deletes, and the ledger carries the abort result
+// line plus the envelope (planned N, deleted 0, skipped N - the aborted
+// run's reconciled truth).
+func TestWiringApplyGateAbortTraced(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	target := filepath.Join(root, "scratch-old")
+	restore := func() { confirmReprobeLive = defaultConfirmReprobeLive }
+	confirmReprobeLive = func(activeHours time.Duration) map[string]bool {
+		return map[string]bool{config.Canonical(target): true}
+	}
+	defer restore()
+
+	var e bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, &bytes.Buffer{}, &e, os.Stdin); code != ExitState {
+		t.Fatalf("gate abort: %d (want 122): %s", code, e.String())
+	}
+	if !strings.Contains(e.String(), "run aborted, nothing deleted") {
+		t.Fatalf("abort copy missing: %q", e.String())
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("gate-aborted run deleted the dir")
+	}
+	raw, err := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "run aborted, nothing deleted") {
+		t.Fatalf("ledger missing the abort result line:\n%s", raw)
+	}
+	var envelope map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) == nil && row["event"] == "envelope" {
+			envelope = row
+		}
+	}
+	if envelope == nil {
+		t.Fatal("gate-abort run wrote no envelope")
+	}
+	// Zero counts are omitempty in the ledger schema: absent means 0.
+	if d, ok := envelope["deleted"].(float64); ok && d != 0 {
+		t.Fatalf("gate-abort envelope deleted: %v", d)
+	}
+	if envelope["skipped"].(float64) == 0 {
+		t.Fatalf("gate-abort envelope must count every planned path skipped: %v", envelope)
+	}
+}
+
+// The discard confirm-window refusal in a MIXED batch (round 5; the R4
+// refusal vanished from the ledger and --json and the run exited 0): the
+// refused path becomes a skip record, the envelope's planned counts what
+// the prompt advertised, the sibling still deletes, exit 2.
+func TestWiringDiscardMixedRunTicketRefusalSkips(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	a := filepath.Join(root, "wip-a")
+	b := filepath.Join(root, "wip-b")
+	for _, repo := range []string{a, b} {
+		if err := os.MkdirAll(repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wireGit(t, repo, "init", "-q", "-b", "main")
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		wireGit(t, repo, "add", "-A")
+		wireGit(t, repo, "commit", "-q", "-m", "one")
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ageTree(t, repo, 30*24*time.Hour)
+	}
+	confirmReprobeLive = func(activeHours time.Duration) map[string]bool {
+		return map[string]bool{config.Canonical(a): true}
+	}
+	t.Cleanup(func() { confirmReprobeLive = defaultConfirmReprobeLive })
+
+	var out, e bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", a, b}, &out, &e, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("mixed refusal run: %d (want 2): %s / %s", code, out.String(), e.String())
+	}
+	if _, err := os.Stat(a); err != nil {
+		t.Fatal("refused dir was deleted")
+	}
+	if _, err := os.Stat(b); !os.IsNotExist(err) {
+		t.Fatal("sibling did not delete")
+	}
+	if !strings.Contains(e.String(), "the dir is NOT discarded") {
+		t.Fatalf("refusal copy missing: %q", e.String())
+	}
+	if !strings.Contains(out.String(), "skipped "+a) {
+		t.Fatalf("summary missing the refused skip: %q", out.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"skipWhy":"verdict-changed"`) {
+		t.Fatalf("ledger missing the refusal skip line:\n%s", raw)
+	}
+	var envelope map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) == nil && row["event"] == "envelope" {
+			envelope = row
+		}
+	}
+	if envelope == nil || envelope["planned"].(float64) != 2 || envelope["deleted"].(float64) != 1 || envelope["skipped"].(float64) != 1 {
+		t.Fatalf("mixed-run envelope must reconcile planned=2/deleted=1/skipped=1: %v", envelope)
+	}
+}
+
+// The per-path pre-deletion re-sweep (round 5): a ticket that lands AFTER
+// the confirm-window probe (injected at the sweep seam - the window is not
+// fixture-reachable) skips the path with the session kept, the sibling
+// still deletes, exit 2.
+func TestWiringPerPathTicketSweepSkips(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	a := filepath.Join(root, "sweep-a")
+	b := filepath.Join(root, "sweep-b")
+	for _, repo := range []string{a, b} {
+		if err := os.MkdirAll(repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wireGit(t, repo, "init", "-q", "-b", "main")
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		wireGit(t, repo, "add", "-A")
+		wireGit(t, repo, "commit", "-q", "-m", "one")
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ageTree(t, repo, 30*24*time.Hour)
+	}
+	perPathTicketLive = func(path string) bool { return path == a }
+	t.Cleanup(func() { perPathTicketLive = incodalog.LiveTicketsUnder })
+
+	var out, e bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", a, b}, &out, &e, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("per-path sweep run: %d (want 2): %s / %s", code, out.String(), e.String())
+	}
+	if _, err := os.Stat(a); err != nil {
+		t.Fatal("mid-run-ticketed dir was deleted")
+	}
+	if _, err := os.Stat(b); !os.IsNotExist(err) {
+		t.Fatal("sibling did not delete")
+	}
+	if !strings.Contains(e.String(), "re-swept immediately before deletion") {
+		t.Fatalf("re-sweep copy missing: %q", e.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawQPtr := false
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row struct {
+			Event      string  `json:"event"`
+			Path       string  `json:"path"`
+			SkipWhy    string  `json:"skipWhy"`
+			Quarantine *string `json:"quarantinePath"`
+		}
+		if json.Unmarshal([]byte(line), &row) == nil && row.Event == "skip" && strings.HasSuffix(filepath.ToSlash(row.Path), "sweep-a") {
+			if row.SkipWhy != "verdict-changed" {
+				t.Fatalf("sweep skip why: %q", row.SkipWhy)
+			}
+			// The session taken for the skipped path is KEPT and pointed at.
+			if row.Quarantine != nil && *row.Quarantine != "" {
+				sawQPtr = true
+			}
+		}
+	}
+	if !sawQPtr {
+		t.Fatalf("sweep skip line carries no session pointer:\n%s", raw)
+	}
+}
+
+// The doctor incoda readout (round 5 pins): the candidate-dir dir=
+// attribution share, and the UNKNOWN-LIVE rail line naming the failure
+// counts when a held ticket's body yields no dir.
+func TestWiringDoctorIncodaLines(t *testing.T) {
+	d := t.TempDir()
+	root := t.TempDir()
+	stateDir := filepath.Join(d, "state")
+	qd := filepath.Join(d, "queues", "q")
+	for _, p := range []string{stateDir, qd, filepath.Join(root, "attributed"), filepath.Join(root, "bare")} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	t.Setenv("INCODA_DIR", d)
+
+	ts := time.Now().Add(-2 * time.Hour).Format("2006-01-02 15:04:05")
+	log := fmt.Sprintf("%s queue=q event=release pid=1 dir=%s reason=\"d\" owner=o dur=1h\n", ts, filepath.Join(root, "attributed"))
+	if err := os.WriteFile(filepath.Join(qd, "lane.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A held ticket whose body parses to nothing: the rail must announce
+	// unknown-live, not enumerate as complete.
+	ticket := filepath.Join(qd, "9-9.ticket")
+	if err := os.WriteFile(ticket, []byte("torn"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTestCli(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+
+	var out bytes.Buffer
+	if code := cmdDoctor(nil, &out, os.Stderr); code != ExitOK {
+		t.Fatalf("doctor: %d (%s)", code, out.String())
+	}
+	if !strings.Contains(out.String(), "dir= attribution 1/2 candidate dir(s)") {
+		t.Fatalf("attribution share line wrong:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "incoda rail: UNKNOWN-LIVE") ||
+		!strings.Contains(out.String(), "held ticket(s) without a readable dir") {
+		t.Fatalf("unknown-live rail line missing:\n%s", out.String())
+	}
 }
 
 func lockfileOpenForTestCli(path string) (*lockfile.File, error) {
 	return lockfile.Open(path)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // The TTY carve-out choreography end to end through the ForceTerminal

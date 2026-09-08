@@ -81,6 +81,29 @@ func TestParseQuotedCmdInsideReason(t *testing.T) {
 	}
 }
 
+// An UNQUOTED multi-token owner= value spans its whitespace tokens (34 of
+// 544 deployed owner lines carry spaces; the plain k=v cut kept only the
+// first token) and stops at the next known key or cmd= (round 5).
+func TestParseOwnerSpansTokens(t *testing.T) {
+	d := t.TempDir()
+	writeLog(t, d, "q", `2026-09-07 21:00:00 queue=q event=release pid=7 dir=C:\w reason="nightly" owner=issue-1002 session (wintty-idle-badge) dur=1h cmd=zig build test`)
+	t.Setenv("INCODA_DIR", d)
+	events := ReadAll()
+	if len(events) != 1 {
+		t.Fatalf("events: %d", len(events))
+	}
+	e := events[0]
+	if e.Owner != "issue-1002 session (wintty-idle-badge)" {
+		t.Fatalf("owner truncated: %q", e.Owner)
+	}
+	if e.Reason != "nightly" || e.Dur != time.Hour {
+		t.Fatalf("neighbors corrupted: %+v", e)
+	}
+	if e.Cmd != "zig build test" {
+		t.Fatalf("cmd corrupted: %q", e.Cmd)
+	}
+}
+
 func TestDigestSameSecondTie(t *testing.T) {
 	ts := time.Now().Truncate(time.Second)
 	records, _ := Digest([]Event{

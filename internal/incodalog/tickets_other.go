@@ -2,14 +2,21 @@
 
 package incodalog
 
-// TicketLive on non-Windows: incoda itself is Windows-first; without the
-// kernel byte-range protocol the probe cannot distinguish held from free,
-// so it reports LIVE (the safe direction: absent evidence must never read
-// as inactive).
+// The live-ticket rail is WINDOWS-ONLY: incoda's ticket lock is a kernel
+// byte-range (LockFileEx) protocol, and without it held cannot be
+// distinguished from free. TicketLive alone keeps the per-ticket safe
+// direction (everything reads live); the enumeration functions below are
+// INERT off-Windows - they enumerate nothing, so the pure-ticket half of
+// the ACTIVE rail does not exist here. This is a stated gap, not a silent
+// safe default: reap is Windows-first, and these stubs exist so the
+// package compiles elsewhere.
 func TicketLive(path string) bool { return true }
 
-// LiveTicketDirs mirrors the conservative default (no dirs enumerable).
+// LiveTicketDirs: nothing enumerable off-Windows (the rail is Windows-only).
 func LiveTicketDirs() []string { return nil }
 
-// LiveTicketsUnder mirrors TicketLive's conservative default.
+// LiveTicketsUnder: no probe off-Windows (the rail is Windows-only).
 func LiveTicketsUnder(root string) bool { return false }
+
+// ProbeRail: no enumeration off-Windows (the rail is Windows-only).
+func ProbeRail() RailHealth { return RailHealth{} }

@@ -130,8 +130,11 @@ func parseLine(queue, line string) (Event, bool) {
 	rest := fields[2:]
 	// Quoted values span whitespace tokens ("reason=\"big build\""): rejoin
 	// FIRST (a cmd=-containing token inside a quoted span is not a field
-	// boundary), then locate the cmd= field among the joined pairs.
-	pairs := joinQuoted(rest)
+	// boundary), then absorb an UNQUOTED owner=/reason= free-text tail
+	// ("owner=issue-1002 session (badge)" is three tokens; the k=v cut
+	// alone keeps only "issue-1002" - 34 of 544 deployed owner lines carry
+	// spaces), then locate the cmd= field among the joined pairs.
+	pairs := absorbUnquoted(joinQuoted(rest))
 	cmdIdx := -1
 	for i, f := range pairs {
 		if strings.HasPrefix(f, "cmd=") {
@@ -220,6 +223,40 @@ func joinQuoted(tokens []string) []string {
 			continue
 		}
 		out = append(out, t)
+	}
+	return out
+}
+
+// absorbUnquoted merges the free-text tail of an UNQUOTED owner= or
+// reason= value with the whitespace tokens that follow it, stopping at the
+// next known key or the cmd= field. The writer emits owner= unquoted
+// (owner=issue-1002 session (wintty-idle-badge) spans three tokens); the
+// plain k=v cut would truncate at the first space, which live-measures to
+// 34 of 544 deployed owner lines.
+func absorbUnquoted(tokens []string) []string {
+	known := map[string]bool{
+		"queue": true, "event": true, "pid": true, "dir": true,
+		"reason": true, "owner": true, "dur": true, "slots": true,
+		"rc": true, "peak_mem": true, "cpu": true, "exclusive": true, "cmd": true,
+	}
+	var out []string
+	for i := 0; i < len(tokens); i++ {
+		t := tokens[i]
+		k, v, ok := cut(t, "=")
+		if !ok || (k != "owner" && k != "reason") || strings.HasPrefix(v, `"`) {
+			out = append(out, t)
+			continue // not a free-text value, or quoted (joinQuoted spanned it)
+		}
+		joined := t
+		for i+1 < len(tokens) {
+			nk, _, nok := cut(tokens[i+1], "=")
+			if nok && known[nk] {
+				break
+			}
+			i++
+			joined += " " + tokens[i]
+		}
+		out = append(out, joined)
 	}
 	return out
 }
