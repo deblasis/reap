@@ -21,7 +21,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "reap cli tests: cannot create the hermetic INCODA_DIR:", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(dir)
 	os.Setenv("INCODA_DIR", filepath.Join(dir, "no-rail"))
-	os.Exit(m.Run())
+	code := m.Run()
+	os.RemoveAll(dir) // before Exit: a defer would never run (the R7 eng seat)
+	os.Exit(code)
 }

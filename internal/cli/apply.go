@@ -594,6 +594,13 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB, false)
 	carveOutActive := false
+	if len(plan) == 0 && err == nil && !*dryRun { // dry-run stays byte-identical to plan
+		// An empty plan has nothing to confirm (round 8; under an unknown
+		// rail the run would otherwise print the rail note AND a pointless
+		// 'will permanently delete 0 directories' prompt).
+		fmt.Fprintln(stdout, "nothing to delete (0 planned)")
+		return ExitOK
+	}
 	if err != nil {
 		var co *carveOutRefusal
 		if errors.As(err, &co) {
@@ -772,6 +779,13 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	for _, p := range ordered {
 		canonOf[p.Path] = config.Canonical(p.Path)
 	}
+	// The blocking-row scan reuses these plus the candidates' canonical
+	// forms, precomputed once (round 8: the per-pair config.Canonical calls
+	// were O(paths x candidates) GetLongPathNameW syscalls).
+	candCanon := make(map[string]string, len(cands))
+	for _, c := range cands {
+		candCanon[c.entry.Path] = config.Canonical(c.entry.Path)
+	}
 	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan),
 		Widened: widenedPaths(plan), ExcludedBelow: below, ExcludedCodes: byCode}
 	// The envelope is written on EVERY exit path from here (deferred):
@@ -850,7 +864,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		blockingRow := ""
 		for _, c := range cands {
 			other := c.entry.Path
-			oc, pc := config.Canonical(other), config.Canonical(p.Path)
+			oc, pc := candCanon[other], canonOf[p.Path]
 			if oc != pc && applycmd.NestedUnder(oc, pc) && dirExists(other) {
 				blockingRow = other
 				break
@@ -1042,7 +1056,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
 				SkipWhy: applycmd.SkipVerdictChanged, OK: &ok,
-				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtrVal}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtrVal, Residue: note}); rc >= 0 {
 				return rc
 			}
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{

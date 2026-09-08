@@ -614,7 +614,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 				Why: applycmd.SkipVerdictChanged, Note: note})
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path,
 				SkipWhy: applycmd.SkipVerdictChanged, OK: &ok,
-				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtr(qPath)}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: qPtr(qPath), Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue
