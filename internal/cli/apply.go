@@ -18,7 +18,6 @@ import (
 	"github.com/deblasis/reap/internal/dedupe"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/gitx"
-	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/quarantine"
 	"github.com/deblasis/reap/internal/report"
@@ -86,13 +85,10 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 		return nil, ExitState
 	}
 	core.holds = holds
-	// incoda attribution (M4): same one-pass digest the scan display uses.
-	core.incodaLive = map[string]bool{}
-	for _, r := range incodaDigestAll() {
-		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
-			core.incodaLive[config.Canonical(r.Dir)] = true
-		}
-	}
+	// incoda attribution (M4): the same BOTH-trigger live set the scan
+	// display builds (held tickets incl pure ones + open events in the
+	// active-hours window).
+	core.incodaLive = incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
 	core.expiredHolds = expired
 	core.remoteStale = time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 	return core, ExitOK

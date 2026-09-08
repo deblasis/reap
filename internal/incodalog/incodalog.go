@@ -126,23 +126,22 @@ func parseLine(queue, line string) (Event, bool) {
 	e.Time = ts
 	e.Queue = queue
 	rest := fields[2:]
-	// The k=v prefix ends at cmd= (everything after is the command).
+	// Quoted values span whitespace tokens ("reason=\"big build\""): rejoin
+	// FIRST (a cmd=-containing token inside a quoted span is not a field
+	// boundary), then locate the cmd= field among the joined pairs.
+	pairs := joinQuoted(rest)
 	cmdIdx := -1
-	for i, f := range rest {
-		if f == "cmd=" || strings.HasPrefix(f, "cmd=") {
+	for i, f := range pairs {
+		if strings.HasPrefix(f, "cmd=") {
 			cmdIdx = i
 			break
 		}
 	}
-	kvEnd := len(rest)
+	kvEnd := len(pairs)
 	if cmdIdx >= 0 {
 		kvEnd = cmdIdx
 	}
-	// Quoted values span whitespace tokens ("reason=\"big build\""): a value
-	// opening with an unclosed quote consumes tokens until the closing
-	// quote, so the pair scan works on JOINED pairs, not raw tokens.
-	pairs := joinQuoted(rest[:kvEnd])
-	for _, f := range pairs {
+	for _, f := range pairs[:kvEnd] {
 		k, v, ok := cut(f, "=")
 		if !ok {
 			continue // stray token: skip, not fatal
@@ -173,10 +172,10 @@ func parseLine(queue, line string) (Event, bool) {
 		}
 	}
 	if cmdIdx >= 0 {
-		// Reconstruct the command: everything from the cmd= token to EOL,
-		// joined with single spaces (the writer's own quoting preserved).
-		e.Cmd = strings.Join(rest[cmdIdx+1:], " ")
-		if k, v, ok := cut(rest[cmdIdx], "="); ok && k == "cmd" && v != "" {
+		// Reconstruct the command: everything after the cmd= pair, joined
+		// with single spaces (the writer's own quoting preserved).
+		e.Cmd = strings.Join(pairs[cmdIdx+1:], " ")
+		if k, v, ok := cut(pairs[cmdIdx], "="); ok && k == "cmd" && v != "" {
 			// cmd=value glued (no space): prepend the glued value.
 			e.Cmd = v + " " + e.Cmd
 		}
@@ -238,16 +237,15 @@ func unquote(v string) string {
 // event (max enqueue/acquire/release time), whether a terminator closed
 // it, and the new-format fields when present.
 type Record struct {
-	Dir       string     `json:"dir"`
-	LastEvent time.Time  `json:"lastEvent"`
-	LastType  string     `json:"lastType"`
-	Open      bool       `json:"open"` // enqueue/acquire without a terminator
-	Weak      bool       `json:"weak"` // old-format: attribution by cmd substring
-	Cmd       string     `json:"cmd,omitempty"`
-	Reason    string     `json:"reason,omitempty"`
-	Owner     string     `json:"owner,omitempty"`
+	Dir       string       `json:"dir"`
+	LastEvent time.Time    `json:"lastEvent"`
+	LastType  string       `json:"lastType"`
+	Open      bool         `json:"open"` // enqueue/acquire without a terminator
+	Cmd       string       `json:"cmd,omitempty"`
+	Reason    string       `json:"reason,omitempty"`
+	Owner     string       `json:"owner,omitempty"`
 	Dur       time.Duration `json:"dur,omitempty"`
-	Queues    []string   `json:"queues"`
+	Queues    []string     `json:"queues"`
 }
 
 // Digest joins events per dir: max(enqueue, acquire, release) wins (spec);
@@ -268,11 +266,11 @@ func Digest(events []Event) (records map[string]*Record, weakCount int) {
 		if r == nil {
 			r = &Record{Dir: ev.Dir}
 			records[ev.Dir] = r
-			if ev.Weak {
-				r.Weak = true
-			}
 		}
-		if ev.Time.After(r.LastEvent) {
+		// !Before, not After: lane.log timestamps are 1-second resolution, and
+		// an enqueue+release in the same second left LastType=enqueue and the
+		// record reading OPEN forever (append-only order = the later line wins).
+		if !ev.Time.Before(r.LastEvent) {
 			r.LastEvent = ev.Time
 			r.LastType = ev.Type
 			r.Cmd, r.Reason, r.Owner, r.Dur = ev.Cmd, ev.Reason, ev.Owner, ev.Dur
@@ -339,9 +337,5 @@ func (r *Record) String() string {
 	if r.Open {
 		state = "OPEN"
 	}
-	w := ""
-	if r.Weak {
-		w = " (weak)"
-	}
-	return fmt.Sprintf("%s  %-7s  %s%s  %s", r.LastEvent.Format("2006-01-02 15:04"), state, strings.Join(r.Queues, ","), w, r.Dir)
+	return fmt.Sprintf("%s  %-7s  %s  %s", r.LastEvent.Format("2006-01-02 15:04"), state, strings.Join(r.Queues, ","), r.Dir)
 }

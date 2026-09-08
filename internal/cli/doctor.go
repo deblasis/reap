@@ -113,17 +113,35 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "jj: not on PATH (jj facts degrade to facts-unavailable)\n")
 	}
 
-	// incoda state (M4): the dir= coverage share (the attribution PR's
-	// before/after readout) and the live-ticket scan's reachability.
+	// incoda state (M4): the CANDIDATE-DIR attribution share (spec L194:
+	// 'the share of candidate dirs with real dir= attribution' - root
+	// children joined against the digest, not the raw event share) and the
+	// state dir's reachability.
 	incEvents := incodalog.ReadAll()
 	if len(incEvents) == 0 {
 		fmt.Fprintf(stdout, "incoda: no lane.log found (attribution off; %s)\n", incodalog.StateDir())
 	} else {
-		a, tot := incodalog.CoverageShare(incEvents)
-		if tot > 0 {
-			fmt.Fprintf(stdout, "incoda: %d event(s), dir= attribution %d/%d (%.0f%%; until the dir= PR ships, attribution is weak cmd-substring matching)\n",
-				len(incEvents), a, tot, float64(a)/float64(tot)*100)
+		records, _ := incodalog.Digest(incEvents)
+		candidates := map[string]bool{}
+		for _, r := range config.ExpandRoots(cfg.Roots) {
+			entries, derr := os.ReadDir(r)
+			if derr != nil {
+				continue
+			}
+			for _, e := range entries {
+				if e.IsDir() {
+					candidates[config.Canonical(filepath.Join(r, e.Name()))] = true
+				}
+			}
 		}
+		attributed := 0
+		for c := range candidates {
+			if _, ok := records[c]; ok {
+				attributed++
+			}
+		}
+		fmt.Fprintf(stdout, "incoda: state dir found; dir= attribution %d/%d candidate dir(s); old-format events are COUNTED, not attributed, until the dir= PR ships\n",
+			attributed, len(candidates))
 	}
 
 	// Stray healing UNDER apply.lock, HELD ACROSS the heal loop (round-3

@@ -76,15 +76,11 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	useGit := gitx.Available()
 
 	// incoda attribution (M4): the lane.log digest + live-ticket probe,
-	// computed ONCE per scan. Open records backed by a held ticket at/under
-	// a candidate dir drive the ACTIVE incoda-live rail; attribution is
-	// enrichment, so a missing incoda state dir weakens nothing.
-	incodaLive := map[string]bool{}
-	for _, r := range incodaDigestAll() {
-		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
-			incodaLive[config.Canonical(r.Dir)] = true
-		}
-	}
+	// computed ONCE per scan. The live set carries BOTH triggers (spec
+	// L320-322/L342): a held ticket backing an open record (incl pure
+	// tickets the best-effort log never recorded) AND open events within
+	// the active-hours window.
+	incodaLive := incodaLiveSet(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
 
 	// Unreadable roots are named, not silently skipped: a configured root
 	// that cannot be listed yields a marker DirInfo, and hiding it would let
@@ -257,20 +253,49 @@ func stateDirOfScan() string {
 	return d
 }
 
-// anyIncodaUnder reports whether any live-incoda dir sits at or under path
-// (component-boundary match, mirroring anyHoldUnder).
+// anyIncodaUnder reports whether any live-incoda dir sits AT or UNDER
+// path (spec L342: 'live incoda ticket at/under dir' - the descendant
+// half is the deletion-relevant one: a parent containing a live session's
+// workdir must not verdict SAFE). The map is small; iterate its keys with
+// a component-boundary prefix check. (anyHoldUnder's ancestor walk is the
+// RIGHT direction for holds and the WRONG one here - holds pin from
+// above, work happens below.)
 func anyIncodaUnder(live map[string]bool, path string) bool {
 	if len(live) == 0 {
 		return false
 	}
 	pc := config.Canonical(path)
-	parts := strings.Split(pc, string(os.PathSeparator))
-	for i := len(parts); i >= 1; i-- {
-		if live[strings.Join(parts[:i], string(os.PathSeparator))] {
+	for k := range live {
+		if k == pc || strings.HasPrefix(k, pc+string(os.PathSeparator)) {
 			return true
 		}
 	}
 	return false
+}
+
+// incodaLiveSet builds the canonical live-dir set: dirs whose OPEN lane.log
+// record is within the active-hours window (spec L320-322's second trigger;
+// live-backed open events), PLUS the pure-ticket half (a held ticket with
+// no log record at all - Queue.Logf swallows write failures, so the ticket
+// is the authoritative signal; L521-522). The pure-ticket scan is the
+// expensive half: it runs once per run, not per candidate.
+func incodaLiveSet(activeHours time.Duration) map[string]bool {
+	live := map[string]bool{}
+	records, _ := incodalog.Digest(incodalog.ReadAll())
+	cutoff := time.Now().Add(-activeHours)
+	for _, r := range records {
+		if r.Open && incodalog.LiveTicketsUnder(r.Dir) {
+			live[config.Canonical(r.Dir)] = true
+		}
+		if r.Open && !r.LastEvent.Before(cutoff) {
+			live[config.Canonical(r.Dir)] = true
+		}
+	}
+	// Pure tickets: held tickets whose dir never reached the log.
+	for _, d := range incodalog.LiveTicketDirs() {
+		live[config.Canonical(d)] = true
+	}
+	return live
 }
 
 // incodaDigestAll reads and digests incoda's lane.log (one pass per scan).

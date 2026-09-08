@@ -23,6 +23,10 @@ func cmdActivity(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "reap activity: unexpected argument %q (activity takes no paths)\n", fs.Arg(0))
+		return ExitUsage
+	}
 
 	events := incodalog.ReadAll()
 	if len(events) == 0 {

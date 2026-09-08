@@ -8,5 +8,8 @@ package incodalog
 // as inactive).
 func TicketLive(path string) bool { return true }
 
+// LiveTicketDirs mirrors the conservative default (no dirs enumerable).
+func LiveTicketDirs() []string { return nil }
+
 // LiveTicketsUnder mirrors TicketLive's conservative default.
 func LiveTicketsUnder(root string) bool { return false }

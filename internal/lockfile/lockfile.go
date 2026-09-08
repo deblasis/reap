@@ -29,6 +29,13 @@ func Open(path string) (*File, error) {
 	return &File{f: f}, nil
 }
 
+// NewFile wraps an already-open raw handle (used by read-only probes that
+// need LockFileEx's write-access requirement without going through Open's
+// OPEN_ALWAYS creation semantics).
+func NewFile(handle uintptr, name string) *File {
+	return &File{f: os.NewFile(handle, name)}
+}
+
 // TryLock attempts a non-blocking exclusive lock. A false return with a nil
 // error means somebody else holds it.
 func (l *File) TryLock() (bool, error) {
@@ -82,10 +89,9 @@ func (l *File) Close() error {
 // Held reports whether this File currently holds the lock.
 func (l *File) Held() bool { return l != nil && l.locked }
 
-// IsFree reports whether path can be exclusively locked right now. This is
-// reap's liveness probe for incoda ticket files: a ticket whose lock is free
-// has no living owner, and a ticket that cannot be opened or probed is treated
-// as live (fail toward marking activity, never toward idleness).
+// IsFree reports whether path can be exclusively locked right now (the
+// raw probe: errors propagate; callers wanting the cannot-open=live
+// policy implement it themselves).
 func IsFree(path string) (bool, error) {
 	l, err := Open(path)
 	if err != nil {
