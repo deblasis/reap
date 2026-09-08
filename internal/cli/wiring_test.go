@@ -17,6 +17,7 @@ import (
 	"github.com/deblasis/reap/internal/auditlog"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/incodalog"
 	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
@@ -1597,8 +1598,16 @@ func TestWiringApplyGateAbortTraced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The pin names the EVENT: a reverted result ok=false line (which reap
+	// log renders 'FAILED') would satisfy every other assertion here.
+	if !strings.Contains(string(raw), `"event":"abort"`) {
+		t.Fatalf("ledger missing the explicit abort line:\n%s", raw)
+	}
+	if strings.Contains(string(raw), `"event":"result"`) {
+		t.Fatalf("an aborted run must record no deletion result lines:\n%s", raw)
+	}
 	if !strings.Contains(string(raw), "run aborted, nothing deleted") {
-		t.Fatalf("ledger missing the abort result line:\n%s", raw)
+		t.Fatalf("ledger abort line missing the cause:\n%s", raw)
 	}
 	var envelope map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
@@ -1789,6 +1798,15 @@ func TestWiringDoctorIncodaLines(t *testing.T) {
 	if code := cmdDoctor(nil, &out, os.Stderr); code != ExitOK {
 		t.Fatalf("doctor: %d (%s)", code, out.String())
 	}
+	// scan NAMES the rail in its own output when the sentinel empties the
+	// verdicts (round 7; not only in doctor).
+	var e bytes.Buffer
+	if code := cmdScan([]string{"--no-gh"}, &bytes.Buffer{}, &e); code != ExitOK {
+		t.Fatalf("scan under the sentinel: %d", code)
+	}
+	if !strings.Contains(e.String(), "incoda rail UNKNOWN-LIVE") {
+		t.Fatalf("scan must name the unknown rail: %q", e.String())
+	}
 	if !strings.Contains(out.String(), "dir= attribution 1/2 candidate dir(s)") {
 		t.Fatalf("attribution share line wrong:\n%s", out.String())
 	}
@@ -1941,7 +1959,9 @@ func TestWiringUnknownRailCopy(t *testing.T) {
 }
 
 // reap never writes to incoda state (spec L540), pinned as a property: a
-// full scan+discard cycle leaves the state dir byte-identical.
+// scan+activity+doctor pass leaves the state dir byte-identical (the
+// read-only surface; the destructive commands take apply.lock and touch
+// no incoda path either - covered by the survival pins' fixtures).
 func TestWiringIncodaStateUntouched(t *testing.T) {
 	d := t.TempDir()
 	root := filepath.Join(d, "root")
@@ -2048,6 +2068,190 @@ func TestWiringDescendantTicketFlipsRow(t *testing.T) {
 	}
 	if !strings.Contains(js.String(), "incoda-live") {
 		t.Fatalf("a live ticket under a subdir did not flip the parent row:\n%s", js.String())
+	}
+}
+
+// The BOTH-CLEAN FAMILY UNLOCK, pinned for the GIT family via the flag no
+// test had ever used (round 7; the R6 eng seat verified it live but zero
+// pins existed): a clean-pushed parent with a live worktree child rows
+// parent-of-live-children; --include parent-of-live-children deletes the
+// child (SAFE) and unlocks the parent IN THE SAME RUN - the parent's
+// re-verify must not trip on its own listing bump or the deregistration
+// writes under .git.
+func TestWiringBothCleanFamilyUnlockGit(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	bare := filepath.Join(base, "up.git")
+	for _, p := range []string{root, stateDir, bare} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	parent := filepath.Join(root, "p")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, parent, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, parent, "add", "-A")
+	wireGit(t, parent, "commit", "-q", "-m", "one")
+	wireGit(t, parent, "remote", "add", "origin", bare)
+	wireGit(t, parent, "push", "-q", "origin", "main")
+	// Fetch BEFORE aging (fetch refreshes refs too - a post-aging fetch
+	// leaves fresh refs that row the parent ACTIVE), then age, then
+	// backdate ONLY FETCH_HEAD: past the 48h activity floor, inside the
+	// 72h remote window (a fully-aged tree rows remote-stale and the
+	// child never plans).
+	wireGit(t, parent, "fetch", "-q", "origin")
+	wt := filepath.Join(root, "wt")
+	if out, err := exec.Command("git", "-C", parent, "worktree", "add", "-q", wt).CombinedOutput(); err != nil {
+		t.Skipf("worktree add: %v %s", err, out)
+	}
+	ageTree(t, parent, 30*24*time.Hour)
+	ageTree(t, wt, 30*24*time.Hour)
+	fresh := time.Now().Add(-60 * time.Hour)
+	os.Chtimes(filepath.Join(parent, ".git", "FETCH_HEAD"), fresh, fresh)
+
+	// The child worktree is a GIT row: reaching SAFE needs an AVAILABLE
+	// PRHeads set (nil rows gh-unavailable). gh:true in the config, with
+	// the fetchPRHeads seam injecting an empty available set - the same
+	// shape a healthy join yields for repos with no GitHub remotes,
+	// without the network flake.
+	ghCfg := `{
+  "roots": ["` + filepath.ToSlash(root) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 2, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": true,
+  "jj": true
+}`
+	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(ghCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restorePR := fetchPRHeads
+	fetchPRHeads = func(budget time.Duration) ghx.PRHeads { return ghx.PRHeads{} }
+	t.Cleanup(func() { fetchPRHeads = restorePR })
+	var out bytes.Buffer
+	if code := cmdApply([]string{"--yes", "--include", "parent-of-live-children"}, &out, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("both-clean git family unlock: %d (%s)", code, out.String())
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatal("the worktree child survived")
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+		t.Fatalf("the parent did not unlock after its child deleted in-run\nOUT: %s\nLEDGER:\n%s", out.String(), raw)
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if strings.Contains(string(raw), `"event":"skip"`) {
+		t.Fatalf("the one-run unlock must leave no skips:\n%s", raw)
+	}
+}
+
+// The BOTH-CLEAN FAMILY UNLOCK for the JJ family (round 7; the R6 eng
+// seat live-proved it DEAD: jj workspace forget writes fresh files into
+// the parent's .jj, tripping the parent's own re-verify and stranding it
+// ACTIVE for two days). With the deregistration-write exemption the
+// parent unlocks in the same run.
+func TestWiringBothCleanFamilyUnlockJJ(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jjunlock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, p := range []string{root, stateDir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	parent := filepath.Join(root, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "commit", "-m", "one").CombinedOutput(); err != nil {
+		t.Skipf("jj commit: %v\n%s", err, out)
+	}
+	// Push the parent (a colocated repo exports to git): the family must
+	// be clean+pushed for the unlock shape.
+	bare := filepath.Join(base, "up.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	if out, err := exec.Command("jj", "-R", parent, "git", "remote", "add", "origin", bare).CombinedOutput(); err != nil {
+		t.Skipf("jj git remote add: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "git", "push").CombinedOutput(); err != nil {
+		t.Skipf("jj git push: %v\n%s", err, out)
+	}
+	ws := filepath.Join(root, "ws")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	// The workspace's own working-copy commit is a change of its own:
+	// describe + push it too, or ws rows BLOCKED jj-unpushed and the
+	// parent carries a shadowed unpushed fact (the family must be ALL
+	// clean+pushed).
+	if out, err := exec.Command("jj", "-R", ws, "describe", "-m", "ws head").CombinedOutput(); err != nil {
+		t.Skipf("jj describe ws: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("jj", "-R", ws, "git", "push", "--change", "@").CombinedOutput(); err != nil {
+		t.Skipf("jj push ws change: %v\n%s", err, out)
+	}
+	ageTree(t, parent, 30*24*time.Hour)
+	ageTree(t, ws, 30*24*time.Hour)
+	// Fresh-enough remote marker, cold-enough tree (see the git family).
+	if out, err := exec.Command("git", "-C", parent, "fetch", "-q", "origin").CombinedOutput(); err != nil {
+		t.Skipf("git fetch: %v\n%s", err, out)
+	}
+	fresh := time.Now().Add(-60 * time.Hour)
+	os.Chtimes(filepath.Join(parent, ".git", "FETCH_HEAD"), fresh, fresh)
+
+	// gh:true + the fetchPRHeads seam (an empty AVAILABLE set): once the
+	// child is gone the parent's fresh verdict falls through to the gh
+	// join, and a nil PRHeads would row it gh-unavailable - the unlock
+	// must land on clean-pushed (see the git family's note).
+	ghCfg := `{
+  "roots": ["` + filepath.ToSlash(root) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 2, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": true,
+  "jj": true
+}`
+	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(ghCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restorePR := fetchPRHeads
+	fetchPRHeads = func(budget time.Duration) ghx.PRHeads { return ghx.PRHeads{} }
+	t.Cleanup(func() { fetchPRHeads = restorePR })
+
+	var out, eBuf bytes.Buffer
+	if code := cmdApply([]string{"--yes", "--include", "parent-of-live-children"}, &out, &eBuf, os.Stdin); code != ExitOK {
+		raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+		t.Fatalf("both-clean jj family unlock: %d (%s / %s)\nLEDGER:\n%s", code, out.String(), eBuf.String(), raw)
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatal("the workspace child survived")
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatal("the parent did not unlock: the deregistration writes under .jj still trip its re-verify")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if strings.Contains(string(raw), `"event":"skip"`) {
+		t.Fatalf("the one-run unlock must leave no skips:\n%s", raw)
 	}
 }
 

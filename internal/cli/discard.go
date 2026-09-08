@@ -566,13 +566,13 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// sibling path still standing at/under it skips the parent as
 		// parent-of-live-children (children-first ordering over the batch
 		// makes that a backstop: siblings deleted earlier no longer exist).
-		if heldDir, held := applycmd.HoldUnderPath(holdsBool, path); held {
-			note := fmt.Sprintf("held dir at/under it (%s; reap hold beats every rule); remove the hold or reap the inner dir explicitly", heldDir)
+		if _, held := applycmd.HoldUnderPath(holdsBool, path); held {
+			note := "held dir at/under it (reap holds lists it; holds beat every rule); remove the hold or reap the inner dir explicitly"
 			fmt.Fprintf(stderr, "reap discard: %s: %s\n", path, note)
 			ok := false
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipParentLive, Note: note})
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipParentLive,
-				Verdict: rv.Verdict.Verdict, ReasonCode: "held-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: "held-by-user", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue
@@ -591,7 +591,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			ok := false
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipParentLive, Note: note})
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipParentLive,
-				Verdict: rv.Verdict.Verdict, ReasonCode: "row-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: "parent-of-live-children", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue
@@ -828,6 +828,7 @@ func cmdLog(args []string, stdout, stderr io.Writer) int {
 				Path    string `json:"path"`
 				OK      *bool  `json:"ok"`
 				SkipWhy string `json:"skipWhy"`
+				Residue string `json:"residue"`
 				Deleted int    `json:"deleted"`
 				Skipped int    `json:"skipped"`
 			}
@@ -851,6 +852,14 @@ func cmdLog(args []string, stdout, stderr io.Writer) int {
 				status = "skip:" + row.SkipWhy
 			case "intent":
 				status = "begin"
+			case "abort":
+				// The gate-abort line's CAUSE rides residue; the human view
+				// must carry what the JSONL does (round 7: it rendered an
+				// empty status and dropped the cause entirely).
+				status = "aborted"
+				if row.Residue != "" {
+					status = "aborted: " + row.Residue
+				}
 			case "envelope":
 				status = fmt.Sprintf("run end: deleted=%d skipped=%d", row.Deleted, row.Skipped)
 			}

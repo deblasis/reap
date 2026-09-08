@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/lockfile"
 )
 
@@ -17,14 +18,16 @@ import (
 // using lockfile's port of incoda's own protocol (an exclusive byte at
 // offset 2^62): TryLock succeeding means no holder (free); ERROR_LOCK_
 // VIOLATION means a live incoda holds it. A ticket that cannot be opened
-// or probed is treated as LIVE (absent evidence must never read as
-// inactive). The open is EXISTING-ONLY: OPEN_ALWAYS would re-create a
+// or probed for a reason OTHER than having vanished is treated as LIVE
+// (absent evidence must never read as inactive); a VANISHED ticket is a
+// released one - the sweep's read layer distinguishes it (IsNotExist).
+// The open is EXISTING-ONLY: OPEN_ALWAYS would re-create a
 // ticket deleted between the ReadDir and here, writing into incoda state
 // reap promises never to touch.
 func TicketLive(path string) bool {
 	f, err := openTicketExisting(path)
 	if err != nil {
-		return true // cannot open (incl. vanished): treat as live
+		return true // cannot open: treat as live (the read layer catches vanished)
 	}
 	defer f.Close()
 	held, err := f.TryLock()
@@ -119,6 +122,13 @@ func ProbeRail() RailHealth {
 		}
 		tickets, terr := os.ReadDir(filepath.Join(qd, q.Name()))
 		if terr != nil {
+			if os.IsNotExist(terr) {
+				// The queue vanished between the queues listing and here:
+				// a REMOVED queue (a transition), not an enumeration
+				// failure - the queue-level twin of the vanished-ticket
+				// rule (round 7).
+				continue
+			}
 			// The queue just listed but its tickets cannot be enumerated:
 			// that queue's liveness is unknown (the sentinel one level down).
 			h.Unknown = true
@@ -196,15 +206,20 @@ func LiveTicketDirs() []string {
 // means the rail could not enumerate (the caller must refuse the SAFE
 // direction AND say why - 'enumeration incomplete', not 'a ticket sits
 // here': the remedies differ, fix-the-rail vs wait-for-the-job). A hit
-// without unknown means a held ticket names a dir at or under root.
+// without unknown means a held ticket names a dir at or under root. Both
+// sides canonicalize (config.Canonical): incoda writes ticket cwds in
+// whatever form the enroller's cwd carried, and an 8.3-spelled cwd
+// (C:\Users\ALESSA~1\...) against a long-form root missed with plain
+// Clean+ToLower - the R6 reliability seat live-proved the dir DELETED
+// under exactly that spelling (the invariant-1 channel).
 func LiveTicketHit(root string) (hit, unknown bool) {
 	h := ProbeRail()
 	if h.Unknown {
 		return true, true
 	}
-	rootNorm := strings.ToLower(filepath.Clean(root))
+	rootNorm := config.Canonical(root)
 	for _, d := range h.Dirs {
-		dn := strings.ToLower(filepath.Clean(d))
+		dn := config.Canonical(d)
 		if dn == rootNorm || strings.HasPrefix(dn, rootNorm+string(os.PathSeparator)) {
 			return true, false
 		}

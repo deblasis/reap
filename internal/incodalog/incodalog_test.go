@@ -104,6 +104,19 @@ func TestParseOwnerSpansTokens(t *testing.T) {
 	}
 }
 
+// The duplicate-dir= guard (round 7; the R5 reliability nit): an unquoted
+// owner free tail containing a 'dir=...' token must not mint a spurious
+// pair whose last-wins override misattributes the event - the line is
+// malformed and dropped.
+func TestParseDuplicateDirMalformed(t *testing.T) {
+	d := t.TempDir()
+	writeLog(t, d, "q", `2026-09-07 22:00:00 queue=q event=enqueue pid=1 dir=C:\real owner=issue-1 dir=C:\evil badge`)
+	t.Setenv("INCODA_DIR", d)
+	if events := ReadAll(); len(events) != 0 {
+		t.Fatalf("duplicate dir= with a different value must drop the line: %+v", events)
+	}
+}
+
 func TestDigestSameSecondTie(t *testing.T) {
 	ts := time.Now().Truncate(time.Second)
 	records, _ := Digest([]Event{

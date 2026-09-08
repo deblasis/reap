@@ -87,23 +87,31 @@ func CappedManifest(path string) []byte {
 func longPathLocal(p string) string { return p }
 
 // ChildrenMaxMtime returns the max mtime over path's REMAINING children
-// (zero time when none). The caller has established that path's OWN stamp
-// is its own doing (a child it deleted bumped the listing) and needs the
-// user's activity instead (round 6: children-first ordering made
-// parent-after-child deletion a first-class shape).
-func ChildrenMaxMtime(path string, now time.Time) time.Time {
+// (zero time when none) and whether the enumeration succeeded. The caller
+// has established that path's OWN stamp is its own doing (a child it
+// deleted bumped the listing) and needs the user's activity instead
+// (round 6: children-first ordering made parent-after-child deletion a
+// first-class shape). skipVCS drops the .git/.jj internals at path's top
+// level: this run's own deregistration (worktree remove / jj workspace
+// forget) writes fresh files there, and a genuine concurrent commit still
+// trips the run through the verdict-match gate, not the tripwire (round 7).
+// A FAILED read returns ok=false: the caller must fail toward the
+// tripwire, never treat an unreadable activity set as quiet.
+func ChildrenMaxMtime(path string, now time.Time, skipVCS bool) (max time.Time, ok bool) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, false
 	}
-	var max time.Time
 	for _, e := range entries {
+		if skipVCS && (e.Name() == ".git" || e.Name() == ".jj") {
+			continue
+		}
 		ci := Entry(path, filepath.Join(path, e.Name()), now)
 		if ci.MaxMtime.After(max) {
 			max = ci.MaxMtime
 		}
 	}
-	return max
+	return max, true
 }
 
 // Entry sizes one directory tree. It never crosses reparse points (junctions,

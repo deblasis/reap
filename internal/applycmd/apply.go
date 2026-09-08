@@ -245,15 +245,19 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 	// plan with NO ParentRepo lineage between them; the parent deleting
 	// first destroyed the children (live-proven by the R5 reliability
 	// seat - including a user hold under the parent, 'holds beat every
-	// rule' broken by ordering alone).
+	// rule' broken by ordering alone). Canonical forms are computed ONCE
+	// (round 7: the O(n^2) pass re-canonicalized every path per pair).
+	canon := make([]string, len(plan))
 	for i, p := range plan {
-		pn := config.Canonical(p.Path)
-		for j, q := range plan {
-			if i == j || config.Canonical(q.Path) == pn {
+		canon[i] = config.Canonical(p.Path)
+	}
+	for i := range plan {
+		for j := range plan {
+			if i == j || canon[i] == canon[j] {
 				continue
 			}
-			if NestedUnder(pn, config.Canonical(q.Path)) {
-				depth[i]++ // p sits under q: q is a plan-set ancestor
+			if NestedUnder(canon[i], canon[j]) {
+				depth[i]++ // i sits under j: j is a plan-set ancestor
 			}
 		}
 	}
@@ -285,6 +289,17 @@ func hasDeletedChild(deletedInRun map[string]bool, path string) bool {
 	pc := config.Canonical(path)
 	for d := range deletedInRun {
 		if NestedUnder(config.Canonical(d), pc) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyChildDeleted reports whether any of the plan's recorded children (already
+// canonical, captured at plan time) went in this run.
+func anyChildDeleted(planChildren []string, deletedInRun map[string]bool) bool {
+	for _, ch := range planChildren {
+		if deletedInRun[ch] {
 			return true
 		}
 	}
@@ -361,13 +376,22 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 	// A dir whose child THIS RUN deleted shows its own stamp bumped (the
 	// directory listing changed): that is this run's doing, not user
 	// activity, and the children-first ordering (lineage + path nesting,
-	// round 6) made parent-after-child deletion a first-class shape. When
-	// that is the case the tripwire re-reads over the REMAINING children:
-	// their stamps are the user's. (No equality dance between two stats of
-	// the parent - NTFS propagates the listing update lazily, and the two
-	// reads can disagree by milliseconds; the re-read is race-free.)
-	if now.Sub(info.MaxMtime) < 2*time.Hour && hasDeletedChild(deletedInRun, path) {
-		info.MaxMtime = walk.ChildrenMaxMtime(path, now)
+	// round 6) made parent-after-child deletion a first-class shape. The
+	// child may be a PATH child (overlapping roots) OR a LINEAGE child
+	// (worktree/workspace: a path SIBLING - jj workspace forget writes
+	// fresh files into the parent's .jj, the R6 eng seat's live finding).
+	// When this run deleted either kind the tripwire re-reads over the
+	// REMAINING children: their stamps are the user's - and this run's OWN
+	// deregistration writes into .git/.jj are skipped (a genuine
+	// concurrent commit still trips the run through the verdict match, not
+	// the tripwire). A FAILED re-read fails toward the tripwire: an
+	// unreadable activity set is never a quiet one (the R6 reliability
+	// minor).
+	childDeleted := hasDeletedChild(deletedInRun, path) || anyChildDeleted(planChildren, deletedInRun)
+	if now.Sub(info.MaxMtime) < 2*time.Hour && childDeleted {
+		if childMax, ok := walk.ChildrenMaxMtime(path, now, true); ok {
+			info.MaxMtime = childMax
+		}
 	}
 	if !info.MaxMtime.IsZero() && now.Sub(info.MaxMtime) < 2*time.Hour {
 		return ReverifyResult{SkipWhy: SkipActiveTripwire, Verdict: verdict.Verdict{Verdict: verdict.Active, Code: "active"}}
@@ -459,8 +483,16 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 			// run. The fresh enumeration is empty post-deregistration, so the
 			// comparison is against what the plan saw (round 3's proof that
 			// the fresh-set variant was structurally false).
-			if plannedCode == "parent-of-live-children" && v.Verdict == verdict.Safe &&
-				allPlanChildrenDeleted(planChildren, deletedInRun) {
+			//
+			// The jj-active arm (round 7; the R6 eng seat's live-dead jj
+			// unlock): this run's own forget/deregistration ops are fresh in
+			// the SHARED op store, so the parent re-verdicts jj-active even
+			// though the walk is quiet (the tripwire re-read above already
+			// passed with the deregistration exemption). Accepting it is
+			// gated on the same all-children-deleted condition.
+			if plannedCode == "parent-of-live-children" &&
+				allPlanChildrenDeleted(planChildren, deletedInRun) &&
+				(v.Verdict == verdict.Safe || (v.Verdict == verdict.Active && v.Code == "jj-active")) {
 				break
 			}
 			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}
@@ -562,8 +594,11 @@ func allPlanChildrenDeleted(planChildren []string, deletedInRun map[string]bool)
 	if len(planChildren) == 0 {
 		return false
 	}
+	// planChildren arrive ALREADY canonical (captured at plan time while
+	// the children existed - round 7: re-canonicalizing here would fail to
+	// expand 8.3 components of children this run has since deleted).
 	for _, ch := range planChildren {
-		if !deletedInRun[config.Canonical(ch)] {
+		if !deletedInRun[ch] {
 			return false
 		}
 	}

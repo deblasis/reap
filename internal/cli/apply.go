@@ -69,7 +69,7 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 		return nil, ExitUsage
 	}
 	if !core.noGH && cfg.GH {
-		h := ghx.Client{Budget: core.ghBudget}.OpenPRHeads()
+		h := fetchPRHeads(core.ghBudget)
 		core.prHeads = &h
 	}
 	core.useJJ = !core.noJJ && cfg.JJ && jjx.Available()
@@ -91,6 +91,13 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 	// table's 'last:' enrichment source; the plan pipeline does not render
 	// it (its own layout), so it is dropped here.
 	core.incodaLive, _ = incodaSnapshot(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	// An unknown rail empties every plan (all rows ACTIVE/incoda-live); the
+	// tool KNOWS why the plan is empty and must say so in its own output,
+	// not only in doctor (round 7; the R6 eng seat: 'will permanently
+	// delete 0 directories' with no mention of the rail).
+	if core.incodaLive[""] {
+		fmt.Fprintf(stderr, "reap: %s; every dir reads live-or-unknown for this run\n", unknownRailNote)
+	}
 	core.expiredHolds = expired
 	core.remoteStale = time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 	return core, ExitOK
@@ -344,7 +351,13 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		}
 		if c.vd.Code == "parent-of-live-children" {
 			for _, ch := range c.planChildren {
-				pe.PlanChildren = append(pe.PlanChildren, ch)
+				// Canonical WHILE THE CHILDREN EXIST (plan time): config.Canonical
+				// cannot expand 8.3 components of a deleted path, and the
+				// children are gone by the time allPlanChildrenDeleted consults
+				// this list mid-run (round 7; jjx children are built by Join
+				// with no long-form expansion, so the unlock lookup missed on
+				// short-form roots).
+				pe.PlanChildren = append(pe.PlanChildren, config.Canonical(ch))
 			}
 		}
 		plan = append(plan, pe)
@@ -751,6 +764,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 
 	ordered := applycmd.OrderChildrenFirst(plan)
+	// Canonical forms captured ONCE, while every planned dir still exists
+	// (config.Canonical cannot expand 8.3 components of a deleted path -
+	// round 7: re-canonicalizing a mid-run-vanished path silently broke
+	// prefix matching on %TEMP%-spelled fixtures).
+	canonOf := make(map[string]string, len(ordered))
+	for _, p := range ordered {
+		canonOf[p.Path] = config.Canonical(p.Path)
+	}
 	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan),
 		Widened: widenedPaths(plan), ExcludedBelow: below, ExcludedCodes: byCode}
 	// The envelope is written on EVERY exit path from here (deferred):
@@ -789,8 +810,9 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			// children recorded as ignorance-unreadable).
 			note := ""
 			if !dirExists(p.Path) {
+				pc := canonOf[p.Path]
 				for _, del := range summary.Deleted {
-					if applycmd.NestedUnder(config.Canonical(p.Path), config.Canonical(del)) {
+					if applycmd.NestedUnder(pc, canonOf[del]) {
 						note = "vanished under a parent this run deleted"
 						break
 					}
@@ -813,14 +835,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// parent as parent-of-live-children (children-first ordering makes
 		// that a backstop: rows deleted earlier in this run no longer exist
 		// on disk and do not trip it).
-		if heldDir, held := applycmd.HoldUnderPath(core.holds, p.Path); held {
-			note := fmt.Sprintf("held dir at/under it (%s; reap hold beats every rule); remove the hold or reap the inner dir explicitly", heldDir)
+		if _, held := applycmd.HoldUnderPath(core.holds, p.Path); held {
+			note := "held dir at/under it (reap holds lists it; holds beat every rule); remove the hold or reap the inner dir explicitly"
 			fmt.Fprintf(stderr, "reap apply: %s: %s\n", p.Path, note)
 			ok := false
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipParentLive, Note: note})
 			summary.SkippedBytes += p.SizeBytes
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipParentLive,
-				Verdict: rv.Verdict.Verdict, ReasonCode: "held-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: "held-by-user", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue
@@ -841,7 +863,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: p.Path, Why: applycmd.SkipParentLive, Note: note})
 			summary.SkippedBytes += p.SizeBytes
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path, SkipWhy: applycmd.SkipParentLive,
-				Verdict: rv.Verdict.Verdict, ReasonCode: "row-under", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: "parent-of-live-children", OK: &ok, Quarantine: nil, Residue: note}); rc >= 0 {
 				return rc
 			}
 			continue

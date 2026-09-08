@@ -69,7 +69,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	// gh-unavailable, never to "no open PRs".
 	var prHeads *ghx.PRHeads
 	if !*noGH && cfg.GH {
-		h := ghx.Client{Budget: ghBudget}.OpenPRHeads()
+		h := fetchPRHeads(ghBudget)
 		prHeads = &h
 	}
 	useJJ := !*noJJ && cfg.JJ && jjx.Available()
@@ -82,6 +82,11 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	// the active-hours window. The digest records ride alongside for the
 	// 'last:' row enrichment.
 	incodaLive, incodaRecords := incodaSnapshot(time.Duration(cfg.Thresholds.ActiveHours) * time.Hour)
+	if incodaLive[""] {
+		// The table will row everything ACTIVE/incoda-live for a reason the
+		// tool knows: say it here too, not only in doctor (round 7).
+		fmt.Fprintf(stderr, "reap: %s; every dir reads live-or-unknown for this run\n", unknownRailNote)
+	}
 
 	// Unreadable roots are named, not silently skipped: a configured root
 	// that cannot be listed yields a marker DirInfo, and hiding it would let
@@ -298,6 +303,14 @@ var confirmReprobeLive = defaultConfirmReprobeLive
 // along: an unknown-rail trip must not be worded as 'a ticket sits here'
 // (the remedies differ - fix-the-rail vs wait-for-the-job).
 var perPathTicketHit = incodalog.LiveTicketHit
+
+// fetchPRHeads is the gh join seam (round 7): the real call is a network
+// round-trip whose flake would red deterministic family-unlock fixtures;
+// tests inject an empty AVAILABLE set (no open PRs) - the same shape a
+// healthy join yields for fixture repos with no GitHub remotes.
+var fetchPRHeads = func(budget time.Duration) ghx.PRHeads {
+	return ghx.Client{Budget: budget}.OpenPRHeads()
+}
 
 // unknownRailNote is the honest copy for an unknown-rail trip (the R5
 // reliability finding: the refusal named a mechanism that did not happen).

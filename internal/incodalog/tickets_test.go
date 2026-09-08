@@ -190,6 +190,40 @@ func TestPerQueueUnreadableSentinel(t *testing.T) {
 	}
 }
 
+// The 8.3-spelling join (round 7; the R6 reliability seat's live-proven
+// invariant-1 channel: a ticket whose cwd is ALESSA~1-spelled was MISSED
+// by the per-path sweep against long-form roots, and the dir was
+// DELETED). Both sides canonicalize; on machines whose temp root is not
+// short-formed the mismatch dimension is absent and the pin stays true,
+// just weaker.
+func TestTicketHit8Dot3Cwd(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "q")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir() // short-formed on ALESSA~1 machines
+	long := config.Canonical(work)
+	ticket := filepath.Join(qd, "8-8.ticket")
+	body := fmt.Sprintf(`{"pid":8,"queue":"q","cwd":%q}`, work)
+	if err := os.WriteFile(ticket, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTest(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+	if hit, unknown := LiveTicketHit(long); !hit || unknown {
+		t.Fatalf("8.3-spelled cwd missed against the long-form root (hit=%v unknown=%v root=%q cwd=%q)", hit, unknown, long, work)
+	}
+}
+
 // The unknown-live sentinel at the QUEUES level (round 6 pin of the
 // amendment's first-named level): the queues dir existing but unlistable
 // reads wholly unknown - and doctor's readout NAMES it (the path is
