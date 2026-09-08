@@ -1036,10 +1036,6 @@ func TestWiringScanPlanAgreement(t *testing.T) {
 	// And nothing in the plan is outside the SAFE set (the default plan
 	// widens nothing).
 	for _, line := range strings.Split(planOut.String(), "\n") {
-		for p := range safeSet {
-			_ = p
-			break
-		}
 		if strings.Contains(line, "GB  ") && !strings.Contains(line, "dry-run") {
 			found := false
 			for p := range safeSet {
@@ -1120,6 +1116,54 @@ func TestWiringCarveOutFloorStop(t *testing.T) {
 	sessions, _ := os.ReadDir(filepath.Join(stateDir, "quarantine"))
 	if len(sessions) != 1 {
 		t.Fatalf("kept session: %d", len(sessions))
+	}
+}
+
+// The round-13 pins: the held-deregistered row keeps a NON-BLANK reason
+// carrying the shadowed fact (keep() now carries BlockedClassFact), and
+// the counts compose identically at the prompt and the intent line.
+func TestWiringHeldDeregisteredReason(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, d := range []string{root, stateDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	parent := filepath.Join(root, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj git init --colocate: %v\n%s", err, out)
+	}
+	ws := filepath.Join(root, "w")
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput(); err != nil {
+		t.Skipf("jj workspace add: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "workspace", "forget", "w").CombinedOutput(); err != nil {
+		t.Skipf("jj workspace forget: %v\n%s", err, out)
+	}
+	ageTree(t, ws, 30*24*time.Hour)
+	if code := cmdHold([]string{"--for", "168h", ws}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+	// The held row: KEEP with the rail's reason AND the shadowed fact.
+	var scanOut bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &scanOut, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(scanOut.String(), `"verdict": "KEEP"`) {
+		t.Fatalf("held deregistered ws not KEEP:\n%s", scanOut.String())
+	}
+	if strings.Contains(scanOut.String(), `"reason": ""`) {
+		t.Fatalf("blank reason regression on a held deregistered row:\n%s", scanOut.String())
 	}
 }
 

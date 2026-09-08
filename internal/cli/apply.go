@@ -273,7 +273,7 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 		case c.vd.OrphanedCarveOut && (inc[c.vd.Code] || ovr[config.Canonical(c.entry.Path)]):
 			counts := countsFor(c.vd.Flavor)
 			if c.vd.BlockedClassFact != "" {
-				counts = c.vd.BlockedClassFact
+				counts = c.vd.BlockedClassFact + countsSuffixFor(c.vd.Flavor)
 			}
 			// The carve-out is --override-manual ONLY, always (spec: '--include
 			// can never reach carve-out dirs'): --include is a code-level blast
@@ -419,7 +419,7 @@ func renderPlanText(w io.Writer, plan []applycmd.PlanEntry, below []applycmd.Exc
 		for _, p := range orphaned {
 			counts := countsFor(p.Flavor)
 			if p.OrphanCounts != "" {
-				counts = p.OrphanCounts
+				counts = p.OrphanCounts + countsSuffixFor(p.Flavor)
 			}
 			fmt.Fprintf(w, "%8.1f GB  %s  [%s]  (%s)\n", float64(p.SizeBytes)/(1<<30), p.Path, p.Code, counts)
 		}
@@ -878,11 +878,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			}
 		}
 		// The orphaned intent (plain-copy success shape): the consent and
-		// the taken-snapshot record land BEFORE the deletion.
+		// the taken-snapshot record land BEFORE the deletion. The counts
+		// COMPOSE exactly as the prompt showed them (round 13: the ledger
+		// recorded a different counts text than the confirm on this main
+		// path - the prompt-vs-truth drift this sweep exists to kill).
 		if p.Orphaned && carveMode == "plain-copy" {
-			counts := p.OrphanCounts
-			if counts == "" {
-				counts = countsFor(p.Flavor)
+			counts := countsFor(p.Flavor)
+			if p.OrphanCounts != "" {
+				counts = p.OrphanCounts + countsSuffixFor(p.Flavor)
 			}
 			if rc := writeIntent("hardened confirm shown (counts: "+counts+"); plain copy taken", rv.Manifest); rc >= 0 {
 				return rc
