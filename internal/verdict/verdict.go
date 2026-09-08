@@ -154,23 +154,14 @@ func decide(in Input) Verdict {
 
 	switch {
 	case in.Held:
-		keepFact = v.BlockedClassFact
-		k := keep("held-by-user", "held by user", "reap unhold to release")
-		keepFact = ""
-		return k
+		return keep("held-by-user", "held by user", "reap unhold to release", v.BlockedClassFact)
 	case in.Protected:
-		keepFact = v.BlockedClassFact
-		k := keep("protected", "protected path", "config.json protect list")
-		keepFact = ""
-		return k
+		return keep("protected", "protected path", "config.json protect list", v.BlockedClassFact)
 	case in.IsReparse:
 		// A junction/symlink candidate is the link, not the target: facts
 		// harvested through it are evidence about a DIFFERENT path, and the
 		// walk never ran, so activity and size are zero-value sentinels.
-		keepFact = v.BlockedClassFact
-		k := keep("protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable")
-		keepFact = ""
-		return k
+		return keep("protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable", v.BlockedClassFact)
 	case in.IncodaLive:
 		return v.set(Active, "incoda-live", "live incoda ticket", "")
 	}
@@ -381,17 +372,14 @@ func (v *Verdict) set(verdict, code, reason, hint string) Verdict {
 	return *v
 }
 
-func keep(code, reason, hint string) Verdict {
+func keep(code, reason, hint, fact string) Verdict {
 	// KEEP rails return fresh verdicts, but the shadowed BLOCKED-class fact
-	// rides along (round 13): 'held by user (also: N dirty/untracked
-	// files)' - the spec's (also:) detail for EVERY shadowed row, rails
-	// included, and the round-12 half-fix could never fire here.
-	return Verdict{Verdict: Keep, Code: code, Reason: reason, Hint: hint, BlockedClassFact: keepFact}
+	// rides along as a PARAMETER (round 14: the round-13 package var raced
+	// under scan's 4 workers - a KEEP row could carry ANOTHER dir's fact or
+	// lose its own): 'held by user (also: N dirty/untracked files)' per the
+	// spec's unqualified (also:) detail, rails included.
+	return Verdict{Verdict: Keep, Code: code, Reason: reason, Hint: hint, BlockedClassFact: fact}
 }
-
-// keepFact is the shadowed BLOCKED-class fact for the rail currently being
-// returned (set by decide() before each keep() call; empty when none).
-var keepFact string
 
 // blockedClassFact scans the FULL fact set for anything BLOCKED-class,
 // independent of which row will display.

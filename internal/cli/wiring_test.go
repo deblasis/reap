@@ -1167,6 +1167,121 @@ func TestWiringHeldDeregisteredReason(t *testing.T) {
 	}
 }
 
+// The prompt-vs-ledger COUNTS EQUALITY (round 14 pin; the round-13 fix
+// was live-proven by the panel but unshipped as a test): a broken-branch
+// orphan driven through the TTY carve-out must record the SAME counts
+// text at the hardened confirm and on the intent line.
+func TestWiringCarveOutCountsEquality(t *testing.T) {
+	restore := applycmd.ForceTerminal(true)
+	defer restore()
+	base, err := os.MkdirTemp("", "jj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, d := range []string{root, stateDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWireConfig(t, stateDir, root)
+	ph := filepath.Join(base, "ph")
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", ph).CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	wt := filepath.Join(root, "orph")
+	if out, err := exec.Command("git", "-C", ph, "worktree", "add", "-q", wt).CombinedOutput(); err != nil {
+		t.Skipf("worktree add: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", wt, "add", "-A").CombinedOutput(); err != nil {
+		t.Skipf("git add: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "u.txt"), []byte("u"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(ph)
+	ageTree(t, wt, 30*24*time.Hour)
+
+	// Capture the confirm prompt: stdout to a file (the TTY check requires
+	// an *os.File).
+	promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+	pf, err := os.Create(promptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdApply([]string{"--no-gh", "--override-manual", wt}, pf, os.Stderr, answerStdin(t, "y\ny\n")); code != ExitOK {
+		t.Fatalf("TTY carve-out: %d", code)
+	}
+	pf.Close()
+	prompt, _ := os.ReadFile(promptPath)
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+
+	// The counts text at the prompt equals the counts text on the intent
+	// line (the one-voice invariant).
+	line := ""
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.Contains(l, `"event":"intent"`) && strings.Contains(l, "hardened confirm shown") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("intent line with counts missing:\n%s", raw)
+	}
+	start := strings.Index(line, "counts: ")
+	j := strings.Index(line[start+8:], ");")
+	if start < 0 || j < 0 {
+		t.Fatalf("cannot extract counts from intent line:\n%s", line)
+	}
+	intentCounts := line[start+8 : start+8+j]
+	if !strings.Contains(string(prompt), intentCounts) {
+		t.Fatalf("prompt/ledger counts divergence: prompt lacks %q\nprompt:\n%s", intentCounts, prompt)
+	}
+}
+
+// The (also:) suffix on an ORDINARY held KEEP row (round 14: the gate was
+// carve-out-only, leaving held/protected rows bare against the spec's
+// unqualified L467-468). A held DIRTY repo must render 'held by user
+// (also: N dirty/untracked files)'.
+func TestWiringHeldDirtyRepoCarriesAlso(t *testing.T) {
+	root, _ := wireFixture(t)
+	repo := filepath.Join(root, "held-dirty")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wireGit(t, repo, "add", "-A")
+	wireGit(t, repo, "commit", "-q", "-m", "one")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, repo, 30*24*time.Hour)
+	if code := cmdHold([]string{"--for", "168h", repo}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+	var scanOut bytes.Buffer
+	if code := cmdScan([]string{"--no-gh", "--json"}, &scanOut, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(scanOut.String(), "held by user (also: ") {
+		t.Fatalf("(also:) suffix missing on the held KEEP row:\n%s", scanOut.String())
+	}
+	if !strings.Contains(scanOut.String(), "dirty/untracked files") {
+		t.Fatalf("the shadowed fact text missing:\n%s", scanOut.String())
+	}
+}
+
 // The TTY carve-out choreography end to end through the ForceTerminal
 // seam (round-6: ~80 lines of the tool's most dangerous surface had zero
 // automated coverage because the terminal probe was untestable under

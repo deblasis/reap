@@ -231,7 +231,10 @@ func (c *scanCore) build(info walk.DirInfo, now time.Time) (report.Entry, verdic
 	e.BlockedClassFact = v.BlockedClassFact
 	e.OrphanedCarveOut = v.OrphanedCarveOut
 	e.OpenPR = v.OpenPRSlug != ""
-	if v.OrphanedCarveOut && v.BlockedClassFact != "" {
+	// The shadowed detail, verdict-agnostic (round 14, mirroring the scan
+	// pipeline: KEEP/MANUAL rows carrying a shadowed BLOCKED fact suffix it;
+	// a BLOCKED row does not suffix itself).
+	if v.BlockedClassFact != "" && v.Verdict != verdict.Blocked {
 		e.Reason = e.Reason + fmt.Sprintf(" (also: %s)", v.BlockedClassFact)
 	}
 	var planChildren []string
@@ -1058,12 +1061,14 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 
 // countsFor is the carve-out's counts line, flavor-aware: the
 // deregistered workspace's parent is ALIVE one directory up, and the
-// consent gate must not assert otherwise.
+// consent gate must not assert otherwise. The default flavor says
+// "unreachable" rather than "gone": a broken-branch worktree's parent is
+// often ALIVE with only the counts unknowable (the so755 class).
 func countsFor(flavor string) string {
 	if flavor == verdict.FlavorDeregistered {
 		return "deregistered workspace (parent alive, this dir is out of its registry)"
 	}
-	return "counts unknowable, parent gone"
+	return "counts unknowable, parent unreachable"
 }
 
 // countsSuffixFor qualifies KNOWABLE counts per flavor (round 12): the

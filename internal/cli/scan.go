@@ -402,10 +402,11 @@ func buildEntry(info walk.DirInfo, now time.Time, cfg config.Config, holds map[s
 		e.Reason = e.Reason + fmt.Sprintf(" [hold expired %s (%dd ago)]", exp.Format("2006-01-02"), int(now.Sub(exp).Hours()/24))
 	}
 	e.OpenPR = v.OpenPRSlug != ""
-	// The orphaned detail: counts when they are knowable, honestly
-	// "unknowable" when the parent is gone (the M2 hardened confirm needs
-	// exactly this distinction).
-	if v.OrphanedCarveOut && v.BlockedClassFact != "" {
+	// The shadowed detail (round 14: the gate was carve-out-only, leaving
+	// held/protected KEEP rows bare against the spec's UNQUALIFIED 'rows
+	// with shadowed facts carry the (also: ...) detail'). A BLOCKED row
+	// does not suffix itself (its own reason IS the fact).
+	if v.BlockedClassFact != "" && v.Verdict != verdict.Blocked {
 		e.Reason = e.Reason + fmt.Sprintf(" (also: %s)", v.BlockedClassFact)
 	}
 	return e
