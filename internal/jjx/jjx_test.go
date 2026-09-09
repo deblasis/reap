@@ -4,6 +4,7 @@ import (
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
 	"os"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -407,5 +408,30 @@ func TestRepeatReadsStable(t *testing.T) {
 	}
 	if !f2.LastOp.Before(time.Now().Add(-time.Hour)) {
 		t.Fatalf("LastOp advanced across reads: %v", f2.LastOp)
+	}
+}
+
+// The op-head LAYOUT pin (round 10; the R9 guard was vacuous because jj
+// 0.44 stores op ids under op_heads/heads/ while the flat read returns
+// the constant structural pair): names must be non-constant - a genuine
+// op CHANGES the set.
+func TestOpHeadNamesLayout(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	dir := t.TempDir()
+	if out, err := exec.Command("jj", "git", "init", "--colocate", dir).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	before := OpHeadNames(dir)
+	if len(before) == 0 {
+		t.Fatal("no op-head names read (the layout fix regressed)")
+	}
+	if out, err := exec.Command("jj", "-R", dir, "new", "--no-edit").CombinedOutput(); err != nil {
+		t.Skipf("jj new: %v %s", err, out)
+	}
+	after := OpHeadNames(dir)
+	if fmt.Sprint(before) == fmt.Sprint(after) {
+		t.Fatalf("op-head names constant across a genuine op (the vacuous-guard shape is back): %v", before)
 	}
 }

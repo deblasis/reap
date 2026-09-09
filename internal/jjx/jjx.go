@@ -10,13 +10,13 @@
 package jjx
 
 import (
-	"sort"
 	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,13 +56,31 @@ type Facts struct {
 // versions; names do not). A genuine later op (fetch, import, another
 // workspace's commit) adds a name the caller did not capture.
 func OpHeadNames(repoDir string) []string {
+	// jj 0.44 stores the op-id files one level DOWN (op_heads/heads/<id>);
+	// the top level holds only the constant structural pair ('heads' dir +
+	// 'type' file), which made the flat read a constant set and the R9
+	// guard vacuous (live-proven by all three R8/R9 seats). Legacy layouts
+	// kept the ids flat: fall back, minus 'type'.
+	heads := filepath.Join(repoDir, ".jj", "repo", "op_heads", "heads")
+	if entries, err := os.ReadDir(heads); err == nil {
+		var out []string
+		for _, e := range entries {
+			if !e.IsDir() {
+				out = append(out, e.Name())
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
 	entries, err := os.ReadDir(filepath.Join(repoDir, ".jj", "repo", "op_heads"))
 	if err != nil {
 		return nil
 	}
 	var out []string
 	for _, e := range entries {
-		out = append(out, e.Name())
+		if e.Name() != "type" && !e.IsDir() {
+			out = append(out, e.Name())
+		}
 	}
 	sort.Strings(out)
 	return out

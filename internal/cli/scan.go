@@ -193,7 +193,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	for range unreadableRoots {
 		rep.Totals.Errors++
 	}
-	// reclaimableGB: the hardlink pass over the SAFE set (spec L511-514)  - 
+	// reclaimableGB: the hardlink pass over the SAFE set (spec L511-514)  -
 	// hardlinked content shared within the deletable set reclaims once.
 	// Null + caveat stands when the pass skips (file bound or unsupported
 	// filesystem). JSON-only: text never renders the field, and the walk
@@ -303,6 +303,11 @@ var confirmReprobeLive = defaultConfirmReprobeLive
 // along: an unknown-rail trip must not be worded as 'a ticket sits here'
 // (the remedies differ - fix-the-rail vs wait-for-the-job).
 var perPathTicketHit = incodalog.LiveTicketHit
+
+// captureOpHeads is the post-forget op-head capture seam (round 10): the
+// interposed-genuine-op window is not fixture-reachable, so the red-first
+// guard pin injects a divergent set here.
+var captureOpHeads = jjx.OpHeadNames
 
 // fetchPRHeads is the gh join seam (round 7): the real call is a network
 // round-trip whose flake would red deterministic family-unlock fixtures;

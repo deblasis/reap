@@ -635,6 +635,18 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		return ExitUsage
 	}
+	// The empty-plan skip sits AFTER the refusal pass (R10: the round-8
+	// early return swallowed the named 120 for exactly the agent-shaped
+	// invocation) and honors --json (the schema must hold on empties);
+	// dry-run stays byte-identical to plan.
+	if len(plan) == 0 && !*dryRun {
+		if *asJSON {
+			fmt.Fprintln(stdout, `{"runId":"","planned":[],"widened":[],"deleted":[],"skipped":[],"excludedBelowFloor":[],"excludedByCode":[],"deletedBytes":0,"excludedBytes":0,"skippedBytes":0,"freeBytesReclaimed":0}`)
+		} else {
+			fmt.Fprintln(stdout, "nothing to delete (0 planned)")
+		}
+		return ExitOK
+	}
 
 	// The dry-run tie: delegate to the exact plan renderer  -  byte-identical
 	// in text AND json (round-1 blocker).
@@ -1097,7 +1109,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// since (round 9).
 		if rv.Class.Kind == classify.KindJJWorkspace && rv.Class.ParentRepo != "" {
 			pr := rv.Class.ParentRepo
-			deregOpHeads[config.Canonical(pr)] = jjx.OpHeadNames(pr)
+			deregOpHeads[config.Canonical(pr)] = captureOpHeads(pr)
 		}
 		// Full audit enrichment from the fresh facts (round-1: the line
 		// shape's fields were all dead) + capped manifest for non-clean

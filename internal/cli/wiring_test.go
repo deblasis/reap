@@ -19,6 +19,7 @@ import (
 	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/ghx"
 	"github.com/deblasis/reap/internal/incodalog"
+	"github.com/deblasis/reap/internal/jjx"
 	"github.com/deblasis/reap/internal/lockfile"
 	"github.com/deblasis/reap/internal/quarantine"
 )
@@ -2550,5 +2551,80 @@ func TestWiringDoctorSmoke(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "strayed", "keep.txt")); err != nil {
 		t.Fatal("stray .reap-probing dir was not healed back")
+	}
+}
+
+// The op-identity GUARD pin (round 10; the R8/R9 board live-proved a
+// genuine interposed op still deleted the parent): the capture seam
+// injects the post-forget set PLUS a genuine-op name - the current set at
+// reverify must differ and the arm must REFUSE (the parent skips
+// verdict-changed and survives; the child still deletes).
+func TestWiringInterposedOpRefusesGuard(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jjguard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, p := range []string{root, stateDir} {
+		os.MkdirAll(p, 0o755)
+	}
+	writeWireConfig(t, stateDir, root)
+	parent := filepath.Join(root, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644)
+	exec.Command("jj", "-R", parent, "commit", "-m", "one").CombinedOutput()
+	bare := filepath.Join(base, "up.git")
+	os.MkdirAll(bare, 0o755)
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	exec.Command("jj", "-R", parent, "git", "remote", "add", "origin", bare).CombinedOutput()
+	exec.Command("jj", "-R", parent, "git", "push").CombinedOutput()
+	ws := filepath.Join(root, "ws")
+	exec.Command("jj", "-R", parent, "workspace", "add", ws).CombinedOutput()
+	exec.Command("jj", "-R", ws, "describe", "-m", "ws head").CombinedOutput()
+	exec.Command("jj", "-R", ws, "git", "push", "--change", "@").CombinedOutput()
+	ageTree(t, parent, 30*24*time.Hour)
+	ageTree(t, ws, 30*24*time.Hour)
+	exec.Command("git", "-C", parent, "fetch", "-q", "origin").CombinedOutput()
+	fresh := time.Now().Add(-60 * time.Hour)
+	os.Chtimes(filepath.Join(parent, ".git", "FETCH_HEAD"), fresh, fresh)
+	ghCfg := `{
+  "roots": ["` + filepath.ToSlash(root) + `"],
+  "protect": [],
+  "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 2, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"},
+  "gh": true,
+  "jj": true
+}`
+	os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(ghCfg), 0o644)
+	restorePR := fetchPRHeads
+	fetchPRHeads = func(budget time.Duration) ghx.PRHeads { return ghx.PRHeads{} }
+	t.Cleanup(func() { fetchPRHeads = restorePR })
+	// The seam: the captured set carries ONE name the current set will not
+	// have (a genuine op landed after the capture).
+	restoreCap := captureOpHeads
+	captureOpHeads = func(repo string) []string {
+		return append(jjx.OpHeadNames(repo), "genuine-interposed-op")
+	}
+	t.Cleanup(func() { captureOpHeads = restoreCap })
+
+	var out bytes.Buffer
+	if code := cmdApply([]string{"--yes", "--include", "parent-of-live-children"}, &out, os.Stderr, os.Stdin); code != applycmd.ExitWithSkips {
+		t.Fatalf("interposed-op run: %d (want 2; the guard must refuse the parent): %s", code, out.String())
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatal("the workspace child survived (the child must still delete)")
+	}
+	if _, err := os.Stat(parent); err != nil {
+		t.Fatal("the parent was DELETED under a genuine interposed op (the vacuous guard is back)")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if !strings.Contains(string(raw), `"skipWhy":"verdict-changed"`) {
+		t.Fatalf("the guard refusal must be a verdict-changed skip: %s", raw)
 	}
 }

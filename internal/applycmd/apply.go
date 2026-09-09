@@ -2,7 +2,7 @@
 // pipeline. The spec's choreography, in order: print the plan (naming
 // widened codes and counts), preflight free space (refusing below the
 // floor), require TTY-confirm or --yes (never infer from EOF; 121 when
-// non-interactive without --yes), take apply.lock, then per path  - 
+// non-interactive without --yes), take apply.lock, then per path  -
 // re-verify the verdict seconds before deletion at FULL scan strength
 // (same facts, same gh join, fresh walk tripwire, fetch --prune, rename
 // in-use probe), require the fresh verdict to MATCH the planned one, skip
@@ -49,12 +49,12 @@ const (
 // skipWhy values: the spec's CLOSED seven-value enum (Data model). No
 // other string may appear in a skip line's skipWhy field.
 const (
-	SkipGitBusy        = "git-busy"        // index.lock at capture time
-	SkipActiveTripwire = "active-tripwire"
-	SkipInUseProbe     = "in-use-probe"
-	SkipVerdictChanged = "verdict-changed"
-	SkipParentLive     = "parent-of-live-children"
-	SkipIgnorance      = "ignorance-unreadable"
+	SkipGitBusy         = "git-busy" // index.lock at capture time
+	SkipActiveTripwire  = "active-tripwire"
+	SkipInUseProbe      = "in-use-probe"
+	SkipVerdictChanged  = "verdict-changed"
+	SkipParentLive      = "parent-of-live-children"
+	SkipIgnorance       = "ignorance-unreadable"
 	SkipSnapshotOvercap = "snapshot-overcap"
 )
 
@@ -68,10 +68,10 @@ type PlanEntry struct {
 	Kind         string   `json:"kind"`
 	ParentRepo   string   `json:"parentRepoPath,omitempty"`
 	Orphaned     bool     `json:"orphanedCarveOut,omitempty"`
-	OrphanCounts string   `json:"-"` // knowable counts for the hardened confirm
-	Flavor       string   `json:"-"` // verdict.Flavor (deregistered vs default orphan copy)
+	OrphanCounts string   `json:"-"`                 // knowable counts for the hardened confirm
+	Flavor       string   `json:"-"`                 // verdict.Flavor (deregistered vs default orphan copy)
 	Residue      string   `json:"residue,omitempty"` // nested/reflog overlap note
-	PlanChildren []string `json:"-"` // scan-time live children; unlock-only
+	PlanChildren []string `json:"-"`                 // scan-time live children; unlock-only
 }
 
 // Summary is the run's end state (apply --json body and summary source).
@@ -123,14 +123,14 @@ type Deleter struct {
 // probe-strand failures: skipWhy is the spec's closed enum and a stranded
 // probe is a hard error, not a skip cause.
 type ReverifyResult struct {
-	SkipWhy  string
+	SkipWhy   string
 	HardAbort string
-	Verdict  verdict.Verdict
-	Git      *gitx.Facts
-	Class    classify.Info
-	Nested   []string // nested repo paths (walk evidence; discard names them)
-	Manifest []byte
-	Residue  string
+	Verdict   verdict.Verdict
+	Git       *gitx.Facts
+	Class     classify.Info
+	Nested    []string // nested repo paths (walk evidence; discard names them)
+	Manifest  []byte
+	Residue   string
 }
 
 // IsTerminal reports whether BOTH stdin and stdout are interactive: a
@@ -286,8 +286,16 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 // gates carry the decision).
 func opHeadsUnchanged(captured []string, repoDir string) bool {
 	if captured == nil {
-		return true
+		// FAIL-CLOSED (R10; the eng seat's second live-proven hole): no
+		// capture exists only when this run's own deregistration never ran
+		// (a git-worktree child of a colocated parent) or the capture read
+		// failed - in both, a fresh op can only be GENUINE (or unknown):
+		// refuse.
+		return false
 	}
+	// Reference point: the capture taken immediately AFTER this run's own
+	// deregistration (the sub-window between forget and capture is accepted
+	// by design; a genuine op after the capture changes the set).
 	cur := jjx.OpHeadNames(repoDir)
 	if len(cur) != len(captured) {
 		return false
