@@ -594,13 +594,6 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB, false)
 	carveOutActive := false
-	if len(plan) == 0 && err == nil && !*dryRun { // dry-run stays byte-identical to plan
-		// An empty plan has nothing to confirm (round 8; under an unknown
-		// rail the run would otherwise print the rail note AND a pointless
-		// 'will permanently delete 0 directories' prompt).
-		fmt.Fprintln(stdout, "nothing to delete (0 planned)")
-		return ExitOK
-	}
 	if err != nil {
 		var co *carveOutRefusal
 		if errors.As(err, &co) {

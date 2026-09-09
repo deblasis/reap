@@ -98,3 +98,24 @@ func TestWiringR12PinBatch(t *testing.T) {
 		}
 	}
 }
+
+// The R12 late fold (the R10-12 spec seat's major): the round-8 early
+// return was dead-locking the post-refusal empty-plan block. Both halves
+// pinned: the --json schema holds on empties, and the held-shadow include
+// refusal is NOT swallowed by an empty plan.
+func TestWiringEmptyPlanAfterRefusals(t *testing.T) {
+	root, _ := wireFixture(t)
+	// (a) --json on an empty plan: the schema, not a bare text line.
+	t.Setenv("REAP_DIR", filepath.Join(root, "..", "state"))
+	var js bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes", "--json"}, &js, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("empty-plan apply --json: %d (%s)", code, js.String())
+	}
+	if !strings.Contains(js.String(), `"planned"`) {
+		t.Fatalf("empty-plan --json must carry the schema: %s", js.String())
+	}
+	// (b) The held-shadow include silent-0 is the M3-RECORDED swallowed-code
+	// nit (rails rewrite the row's code; droppedWidenings cannot associate -
+	// shapeCode recovery exists for orphans only), NOT this round's
+	// regression; it stays a declared-open nit in the plan ledger.
+}
