@@ -103,6 +103,11 @@ func ticketDir(body []byte) string {
 // torn body on a held ticket gets a liveness re-probe and one re-read
 // before it counts as unknown. Absent evidence must never read as
 // inactive; equally, a completed release must not read as unknown.
+// ticketBody is the body-read seam (round 12): the re-read-once success
+// path (a torn first read that heals) is not fixture-reachable - the
+// enroll/acquire rewrite window is milliseconds.
+var ticketBody = os.ReadFile
+
 func ProbeRail() RailHealth {
 	var h RailHealth
 	qd := filepath.Join(StateDir(), "queues")
@@ -143,7 +148,7 @@ func ProbeRail() RailHealth {
 			if !TicketLive(full) {
 				continue // stale file: no holder
 			}
-			body, berr := os.ReadFile(full)
+			body, berr := ticketBody(full)
 			if berr != nil {
 				if os.IsNotExist(berr) {
 					continue // vanished mid-sweep: RELEASED (incoda deletes at release)
@@ -163,7 +168,7 @@ func ProbeRail() RailHealth {
 				if !TicketLive(full) {
 					continue // released mid-sweep
 				}
-				body2, err2 := os.ReadFile(full)
+				body2, err2 := ticketBody(full)
 				if os.IsNotExist(err2) {
 					continue // vanished: released
 				}

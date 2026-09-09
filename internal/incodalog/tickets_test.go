@@ -287,3 +287,55 @@ func TestVanishedTicketIsReleased(t *testing.T) {
 		t.Fatal("a released ticket must not read live")
 	}
 }
+
+// The re-read-once SUCCESS path (round 12; unpinned since R5): a held
+// ticket whose first body read is torn but whose re-read yields a dir is
+// ATTRIBUTED, no sentinel (the enroll/acquire rewrite window, through the
+// ticketBody seam).
+func TestReReadOnceHeals(t *testing.T) {
+	d := t.TempDir()
+	t.Setenv("INCODA_DIR", d)
+	qd := filepath.Join(d, "queues", "q")
+	if err := os.MkdirAll(qd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	ticket := filepath.Join(qd, "3-3.ticket")
+	good := fmt.Sprintf(`{"pid":3,"queue":"q","cwd":%q}`, work)
+	if err := os.WriteFile(ticket, []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := lockfileOpenForTest(ticket)
+	if err != nil {
+		t.Skipf("open ticket: %v", err)
+	}
+	held, terr := f.TryLock()
+	if err != nil || !held {
+		t.Fatalf("hold: %v", terr)
+	}
+	defer f.Close()
+	// First read torn (the rewrite window), re-read good.
+	calls := 0
+	restore := ticketBody
+	ticketBody = func(p string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte("torn{"), nil
+		}
+		return os.ReadFile(p)
+	}
+	t.Cleanup(func() { ticketBody = restore })
+	h := ProbeRail()
+	if h.Unknown {
+		t.Fatalf("a healed re-read must not trip the sentinel: %+v", h)
+	}
+	found := false
+	for _, dir := range h.Dirs {
+		if config.Canonical(dir) == config.Canonical(work) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the healed body was not attributed: %+v", h)
+	}
+}

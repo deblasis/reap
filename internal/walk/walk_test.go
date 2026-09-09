@@ -320,3 +320,12 @@ func TestEntrySkipsJunctions(t *testing.T) {
 		t.Fatalf("bytes=%d, want 7 (junction target must not be counted)", info.Bytes)
 	}
 }
+
+// ChildrenMaxMtime's error path fails toward the tripwire (round 12; the
+// R7 reliability minor): an unreadable activity set must never read as
+// quiet - ok=false so the caller keeps the fresh stamp and skips.
+func TestChildrenMaxMtimeFailsTowardTripwire(t *testing.T) {
+	if _, ok := ChildrenMaxMtime(filepath.Join(t.TempDir(), "nowhere"), time.Now(), false); ok {
+		t.Fatal("a failed read must report ok=false (fail-toward), not quiet")
+	}
+}
