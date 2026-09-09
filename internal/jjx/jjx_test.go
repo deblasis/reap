@@ -1,10 +1,10 @@
 package jjx
 
 import (
+	"fmt"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
 	"os"
-	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"

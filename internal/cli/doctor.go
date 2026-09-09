@@ -201,13 +201,28 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	// Per-candidate residue: stranded refs/reap/* pins (a crashed discard
 	// leaves them; they hold objects alive and pollute unpushed counts),
 	// .reap-backup index pairs (an interrupted capture), and aged
-	// index.lock files (the git-busy skip's remedy).
+	// index.lock files (the git-busy skip's remedy). BOUNDED (round 11;
+	// three rounds of panel findings: a serial for-each-ref over every
+	// root child ran 500s+ unfinishable on the real 470-dir layout): an
+	// overall deadline, a progress line, and an honest incomplete line
+	// when the deadline trips.
+	deadline := time.Now().Add(90 * time.Second)
+	checked, total := 0, 0
+	for _, r := range config.ExpandRoots(cfg.Roots) {
+		if entries, derr := os.ReadDir(r); derr == nil {
+			total += len(entries)
+		}
+	}
+sweep:
 	for _, r := range config.ExpandRoots(cfg.Roots) {
 		entries, derr := os.ReadDir(r)
 		if derr != nil {
 			continue
 		}
 		for _, e := range entries {
+			if time.Now().After(deadline) {
+				break sweep
+			}
 			cand := filepath.Join(r, e.Name())
 			if out, gerr := gr.ForEachReapRef(cand); gerr == nil && len(out) > 0 {
 				// Reclaimable bytes: the loose-object store's size (the
@@ -231,7 +246,14 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 			if _, gerr := os.Stat(filepath.Join(r, e.Name(), ".git", "index.reap-backup")); gerr == nil {
 				fmt.Fprintf(stdout, "interrupted capture in %s: .git/index.reap-backup present; if everything is staged, unstage with: git -C %s reset\n", cand, cand)
 			}
+			checked++
+			if checked%32 == 0 {
+				fmt.Fprintf(stdout, "residue sweep: %d/%d candidates\n", checked, total)
+			}
 		}
+	}
+	if checked < total {
+		fmt.Fprintf(stdout, "residue sweep INCOMPLETE: %d of %d candidates checked (90s deadline); rerun doctor for the rest\n", checked, total)
 	}
 	return ExitOK
 }

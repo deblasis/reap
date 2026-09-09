@@ -339,7 +339,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{Path: path, Why: applycmd.SkipVerdictChanged, Note: msg})
 			ok := false
 			if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: path, SkipWhy: applycmd.SkipVerdictChanged,
-				Verdict: rv.Verdict.Verdict, ReasonCode: code, OK: &ok, Quarantine: nil}); rc >= 0 {
+				Verdict: rv.Verdict.Verdict, ReasonCode: code, OK: &ok, Quarantine: nil, Residue: msg}); rc >= 0 {
 				return
 			}
 		}

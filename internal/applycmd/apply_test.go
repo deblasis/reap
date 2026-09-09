@@ -345,3 +345,62 @@ func TestConfirmFloorsAndRefusals(t *testing.T) {
 
 // The noop runner refuses (zero budget) rather than hitting a real repo.
 func newNoopGitRunner() gitx.Runner { return gitx.Runner{} }
+
+// The mixed-family interposed-op refusal (round 11; the R8/R9 eng seat's
+// second hole, live-proven): a colocated jj parent whose git-WORKTREE
+// child deleted in-run has NO op-head capture (worktree-remove writes no
+// jj op), so a fresh jj-active re-verdict can only be GENUINE - the arm
+// must refuse on nil capture. Two-sided: a CORRECT capture accepts.
+func TestReverifyNilCaptureRefusesJJActive(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "commit", "-m", "one").CombinedOutput(); err != nil {
+		t.Skipf("jj commit: %v %s", err, out)
+	}
+	ageTreeHelper(t, parent, 30*24*time.Hour)
+	// A GENUINE op that leaves nothing unpushed (the interposed-session
+	// shape: fresh op-heads, quiet tree, no new work): new + abandon writes
+	// two ops and restores @ to its parent.
+	if out, err := exec.Command("jj", "-R", parent, "new", "--no-edit").CombinedOutput(); err != nil {
+		t.Skipf("jj new: %v %s", err, out)
+	}
+	if out, err := exec.Command("jj", "-R", parent, "abandon", "@").CombinedOutput(); err != nil {
+		t.Skipf("jj abandon: %v %s", err, out)
+	}
+	cfg := config.Default()
+	d := Deleter{Git: gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 120 * time.Second}, JJ: jjx.Runner{Budget: 30 * time.Second}}
+	child := filepath.Join(dir, "wt")
+	dels := map[string]bool{config.Canonical(child): true}
+	kids := []string{config.Canonical(child)}
+
+	// No capture (the git-worktree family): refuse.
+	rv := Reverify(parent, "parent-of-live-children", true, cfg, d, config.ExpandRoots(cfg.Protect), nil, dels, kids, nil)
+	if rv.SkipWhy != SkipVerdictChanged {
+		t.Fatalf("nil capture must refuse the jj-active arm: %+v", rv.SkipWhy)
+	}
+	// The accept half (a correct capture) is pinned at the WIRING level
+	// (TestWiringBothCleanFamilyUnlockJJ deletes parent+child end to end
+	// with the real post-forget capture); a unit fixture for it fights the
+	// colocated export's git-side residue, so it is not duplicated here.
+	_ = cfg
+}
+
+func ageTreeHelper(t *testing.T, root string, ago time.Duration) {
+	t.Helper()
+	past := time.Now().Add(-ago)
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, past, past)
+		}
+		return nil
+	})
+}

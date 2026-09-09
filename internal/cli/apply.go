@@ -1005,7 +1005,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					ok := false
 					if rc := appendOrAbort(auditlog.Line{Event: "skip", Path: p.Path,
 						SkipWhy: applycmd.SkipSnapshotOvercap, OK: &ok,
-						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil}); rc >= 0 {
+						Verdict: rv.Verdict.Verdict, ReasonCode: rv.Verdict.Code, Quarantine: nil,
+						Residue: "declined at the over-cap confirm"}); rc >= 0 {
 						return rc
 					}
 					summary.Skipped = append(summary.Skipped, applycmd.SkippedPath{
