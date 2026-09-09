@@ -71,11 +71,26 @@ func TestTableHintsAndElision(t *testing.T) {
 	if !strings.Contains(s, "+5 more, use --json") {
 		t.Error("elision footer missing (20 rows, 15 shown, 5 elided)")
 	}
-	// KEEP/SAFE rows never print hint lines.
+	// KEEP/SAFE rows never print hint lines (round 14: the ACTIVE half
+	// joined the pin - the comment claimed both, the assert built one).
 	var keepBuf bytes.Buffer
 	build(entry("SAFE", "clean-pushed", 1<<30, `C:\t\s`)).Table(&keepBuf)
 	if strings.Contains(keepBuf.String(), "hint:") {
 		t.Error("SAFE rows must not print hints")
+	}
+	var activeBuf bytes.Buffer
+	activeRow := entry("ACTIVE", "active", 1<<30, `C:\t\a`)
+	activeRow.Hint = "never shown"
+	build(activeRow).Table(&activeBuf)
+	if strings.Contains(activeBuf.String(), "hint:") {
+		t.Error("ACTIVE rows must not print hints")
+	}
+	var keepRowBuf bytes.Buffer
+	keepRow := entry("KEEP", "held-by-user", 1<<30, `C:\t\k`)
+	keepRow.Hint = "never shown"
+	build(keepRow).Table(&keepRowBuf)
+	if strings.Contains(keepRowBuf.String(), "hint:") {
+		t.Error("KEEP rows must not print hints")
 	}
 }
 

@@ -498,6 +498,15 @@ func planWidenedCodes(plan []applycmd.PlanEntry) []string {
 func renderPlanJSON(w io.Writer, now time.Time, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef) int {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	// Empty arrays, not null (round 14; the R10-12 spec seat: plan --json
+	// emitted "planned": null on empties while apply's block used [] - the
+	// two emitters must agree on the empty shape).
+	if plan == nil {
+		plan = []applycmd.PlanEntry{}
+	}
+	if below == nil {
+		below = []applycmd.ExcludedRef{}
+	}
 	if err := enc.Encode(struct {
 		Generated string                 `json:"generated"`
 		Planned   []applycmd.PlanEntry   `json:"planned"`
