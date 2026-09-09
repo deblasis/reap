@@ -435,3 +435,52 @@ func TestOpHeadNamesLayout(t *testing.T) {
 		t.Fatalf("op-head names constant across a genuine op (the vacuous-guard shape is back): %v", before)
 	}
 }
+
+// The DIR-mtime restore pin (round 13's fix, pinned round 14; the R13-14
+// eng seat: the wiring fixture could not be armed deterministically, so
+// pin the restore CONTRACT directly - each 'jj st' rotates the op-head
+// name and freshens op_heads/heads; the restore must put the DIRECTORY
+// mtime back or reap's own snapshot freshens opRecency and the honest
+// mixed family over-refuses).
+func TestCaptureRestoresOpHeadsDirMtime(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	dir := t.TempDir()
+	if out, err := exec.Command("jj", "git", "init", "--colocate", dir).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	heads := filepath.Join(dir, ".jj", "repo", "op_heads", "heads")
+	if _, err := os.Stat(heads); err != nil {
+		t.Skipf("op_heads/heads layout: %v", err)
+	}
+	if out, err := exec.Command("jj", "-R", dir, "st").CombinedOutput(); err != nil {
+		t.Skipf("jj st: %v %s", err, out)
+	}
+	before, err := os.Stat(heads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := captureOpHeads(dir)
+	// A tree CHANGE forces the second st to write an op (a clean-tree st
+	// writes none; the names rotate only when something changed).
+	if err := os.WriteFile(filepath.Join(dir, "g.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond) // cross the fs mtime granularity window
+	if out, err := exec.Command("jj", "-R", dir, "st").CombinedOutput(); err != nil {
+		t.Skipf("jj st 2: %v %s", err, out)
+	}
+	mid, _ := os.Stat(heads)
+	if mid.ModTime() == before.ModTime() {
+		t.Skip("op_heads/heads dir mtime did not change across the op (fs granularity)")
+	}
+	restore()
+	after, err := os.Stat(heads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ModTime() != before.ModTime() {
+		t.Fatalf("op_heads/heads DIR mtime not restored: before=%v after=%v (the mixed-family over-refusal channel is open)", before.ModTime(), after.ModTime())
+	}
+}
