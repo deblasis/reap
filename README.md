@@ -38,7 +38,7 @@ reap doctor
 The gate is the full local suite:
 
 ```
-go test -p 1 ./... -count=1 -timeout 40m
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File gate.ps1   (gofmt + vet + the serialized suite; any failure fails)
 ```
 
 Serialized (`-p 1`) deliberately: the git-heavy packages run long, and the

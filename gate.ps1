@@ -5,6 +5,14 @@ $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 $failed = $false
 
+# Tool-presence probe (the R10-12 rel seat: if a tool cannot launch,
+# $LASTEXITCODE keeps a stale value and every step "passes" vacuously).
+foreach ($tool in @("go", "gofmt")) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        Write-Host "GATE: FAILED ($tool not on PATH; nothing ran)"; exit 1
+    }
+}
+
 Write-Host "== gofmt (must be clean) =="
 $dirty = & gofmt -l .
 if ($dirty) { $dirty | ForEach-Object { Write-Host "UNFORMATTED: $_" }; $failed = $true }

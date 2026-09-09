@@ -96,6 +96,11 @@ func TestWiringR12PinBatch(t *testing.T) {
 		if code := cmdDiscard([]string{"--yes", small, fat}, &bytes.Buffer{}, os.Stderr, os.Stdin); code != applycmd.ExitQuarantine {
 			t.Fatalf("mixed over-cap run: %d (want 125 - the higher band wins)", code)
 		}
+		// The COMPLETED-DELETION half of the pin (the R10-12 eng seat: the
+		// code alone would stay green if small also routed to 125).
+		if _, err := os.Stat(small); !os.IsNotExist(err) {
+			t.Fatal("the under-cap sibling must have DELETED in the mixed run")
+		}
 	}
 }
 

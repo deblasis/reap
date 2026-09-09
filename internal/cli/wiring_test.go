@@ -2628,3 +2628,75 @@ func TestWiringInterposedOpRefusesGuard(t *testing.T) {
 		t.Fatalf("the guard refusal must be a verdict-changed skip: %s", raw)
 	}
 }
+
+// The MIXED-family both-clean unlock (round 13; the R10-12 eng seat's
+// live-proven over-refusal: a colocated jj parent + git WORKTREE child,
+// both clean+pushed, was refused for ~48h after any git-side activity
+// because opRecency reads the op_heads/heads DIR mtime that reap's own
+// scan-time auto-import freshened). With the dir-mtime restore the
+// family unlocks in one run.
+func TestWiringBothCleanFamilyUnlockMixed(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	base, err := os.MkdirTemp("", "jjmixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root := filepath.Join(base, "root")
+	stateDir := filepath.Join(base, "state")
+	for _, p := range []string{root, stateDir} {
+		os.MkdirAll(p, 0o755)
+	}
+	writeWireConfig(t, stateDir, root)
+	parent := filepath.Join(root, "p")
+	if out, err := exec.Command("jj", "git", "init", "--colocate", parent).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	os.WriteFile(filepath.Join(parent, "f.txt"), []byte("one"), 0o644)
+	exec.Command("jj", "-R", parent, "commit", "-m", "one").CombinedOutput()
+	bare := filepath.Join(base, "up.git")
+	os.MkdirAll(bare, 0o755)
+	wireGit(t, bare, "init", "-q", "--bare", "-b", "main")
+	exec.Command("jj", "-R", parent, "git", "remote", "add", "origin", bare).CombinedOutput()
+	// A bare 'jj git push' pushes NO bookmarks; --change all() catches the
+	// empty undescribed working copy and refuses. Bookmark the described
+	// commit, then push bookmarks.
+	exec.Command("jj", "-R", parent, "git", "push", "--change", "@-").CombinedOutput()
+	// DETACHED worktree (the R10-12 eng seat's shape): a branched worktree
+	// mints an unpushed tip that shadows a BLOCKED fact over the parent row.
+	wt := filepath.Join(root, "wt")
+	if out, err := exec.Command("git", "-C", parent, "worktree", "add", "--detach", "-q", wt).CombinedOutput(); err != nil {
+		t.Skipf("worktree add: %v %s", err, out)
+	}
+	ageTree(t, parent, 30*24*time.Hour)
+	ageTree(t, wt, 30*24*time.Hour)
+	exec.Command("git", "-C", parent, "fetch", "-q", "origin").CombinedOutput()
+	fresh := time.Now().Add(-60 * time.Hour)
+	os.Chtimes(filepath.Join(parent, ".git", "FETCH_HEAD"), fresh, fresh)
+	// The gh join (an empty available set via the seam; see the git family).
+	ghCfg := `{"roots": ["` + filepath.ToSlash(root) + `"], "protect": [], "thresholds": {"active-hours": 48, "scratch-manual-days": 7, "scratch-safe-days": 21, "remote-stale-hours": 72, "quarantine-cap-gb": 2, "quarantine-retention-days": 30, "quarantine-margin": 2.5, "min-free-mb": 256, "git-budget": "30s", "jj-budget": "30s", "gh-budget": "15s", "fetch-budget": "120s"}, "gh": true, "jj": true}`
+	os.WriteFile(filepath.Join(stateDir, "config.json"), []byte(ghCfg), 0o644)
+	restorePR := fetchPRHeads
+	fetchPRHeads = func(budget time.Duration) ghx.PRHeads { return ghx.PRHeads{} }
+	t.Cleanup(func() { fetchPRHeads = restorePR })
+
+	var out, eBuf bytes.Buffer
+	if code := cmdApply([]string{"--yes", "--include", "parent-of-live-children"}, &out, &eBuf, os.Stdin); code != ExitOK {
+		raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+		var js bytes.Buffer
+		cmdScan([]string{"--json"}, &js, os.Stderr)
+		t.Fatalf("mixed-family unlock: %d (%s / %s) ROWS: %s LEDGER: %s", code, out.String(), eBuf.String(), js.String(), raw)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatal("the worktree child survived")
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatal("the colocated parent did not unlock (the dir-mtime self-poisoning is back)")
+	}
+	raw, _ := os.ReadFile(filepath.Join(stateDir, "reap.log"))
+	if strings.Contains(string(raw), `"event":"skip"`) {
+		t.Fatalf("the one-run mixed unlock must leave no skips: %s", raw)
+	}
+}

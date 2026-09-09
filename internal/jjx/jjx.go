@@ -196,7 +196,18 @@ func captureOpHeads(dir string) func() {
 	var stamps []stamp
 	for _, root := range roots {
 		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				// DIRECTORY mtimes too (round 13; the R10-12 eng seat: opRecency
+				// reads the op_heads/heads DIR mtime, and reap's own auto-import
+				// freshens it - restoring FILE mtimes only left the honest
+				// mixed family refused by its own scan). Restore-only: dirs do
+				// not feed preScanNewest.
+				if fi, ierr := d.Info(); ierr == nil {
+					stamps = append(stamps, stamp{p, fi.ModTime()})
+				}
 				return nil
 			}
 			if fi, err := d.Info(); err == nil {

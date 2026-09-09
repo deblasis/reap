@@ -224,6 +224,14 @@ sweep:
 				break sweep
 			}
 			cand := filepath.Join(r, e.Name())
+			// Cheap VCS pre-filter (the R10-12 rel seat): spawning git on
+			// every root child burns the budget on guaranteed failures.
+			if _, gerr := os.Stat(filepath.Join(cand, ".git")); gerr != nil {
+				if _, jerr := os.Stat(filepath.Join(cand, ".jj")); jerr != nil {
+					checked++
+					continue
+				}
+			}
 			if out, gerr := gr.ForEachReapRef(cand); gerr == nil && len(out) > 0 {
 				// Reclaimable bytes: the loose-object store's size (the
 				// scoped gc's upper bound for what the stranded pins hold).
@@ -253,7 +261,7 @@ sweep:
 		}
 	}
 	if checked < total {
-		fmt.Fprintf(stdout, "residue sweep INCOMPLETE: %d of %d candidates checked (90s deadline); rerun doctor for the rest\n", checked, total)
+		fmt.Fprintf(stdout, "residue sweep INCOMPLETE: %d of %d candidates checked (90s deadline; the sweep is not resumable yet - the tail needs a longer deadline or pruning)\n", checked, total)
 	}
 	return ExitOK
 }

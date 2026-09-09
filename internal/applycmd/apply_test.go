@@ -388,10 +388,9 @@ func TestReverifyNilCaptureRefusesJJActive(t *testing.T) {
 		t.Fatalf("nil capture must refuse the jj-active arm: %+v", rv.SkipWhy)
 	}
 	// The accept half (a correct capture) is pinned at the WIRING level
-	// (TestWiringBothCleanFamilyUnlockJJ deletes parent+child end to end
-	// with the real post-forget capture); a unit fixture for it fights the
-	// colocated export's git-side residue, so it is not duplicated here.
-	_ = cfg
+	// (TestWiringBothCleanFamilyUnlockJJ for the jj family,
+	// TestWiringBothCleanFamilyUnlockMixed for the mixed family this arm
+	// governs; unit fixtures fight the colocate export's git-side residue).
 }
 
 func ageTreeHelper(t *testing.T, root string, ago time.Duration) {

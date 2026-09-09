@@ -282,8 +282,9 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 }
 
 // opHeadsUnchanged reports whether the repo's current op-head names are
-// exactly the captured set (no entry = nothing captured: the arm's other
-// gates carry the decision).
+// exactly the captured set. NO entry means no capture ever ran (the
+// git-worktree family) or the capture read failed - both REFUSE (the
+// R10 fail-closed fold).
 func opHeadsUnchanged(captured []string, repoDir string) bool {
 	if captured == nil {
 		// FAIL-CLOSED (R10; the eng seat's second live-proven hole): no
