@@ -288,15 +288,15 @@ func unquote(v string) string {
 // event (max enqueue/acquire/release time), whether a terminator closed
 // it, and the new-format fields when present.
 type Record struct {
-	Dir       string       `json:"dir"`
-	LastEvent time.Time    `json:"lastEvent"`
-	LastType  string       `json:"lastType"`
-	Open      bool         `json:"open"` // enqueue/acquire without a terminator
-	Cmd       string       `json:"cmd,omitempty"`
-	Reason    string       `json:"reason,omitempty"`
-	Owner     string       `json:"owner,omitempty"`
+	Dir       string        `json:"dir"`
+	LastEvent time.Time     `json:"lastEvent"`
+	LastType  string        `json:"lastType"`
+	Open      bool          `json:"open"` // enqueue/acquire without a terminator
+	Cmd       string        `json:"cmd,omitempty"`
+	Reason    string        `json:"reason,omitempty"`
+	Owner     string        `json:"owner,omitempty"`
 	Dur       time.Duration `json:"dur,omitempty"`
-	Queues    []string     `json:"queues"`
+	Queues    []string      `json:"queues"`
 }
 
 // Digest joins events per dir: max(enqueue, acquire, release) wins (spec);

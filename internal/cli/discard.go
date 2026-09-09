@@ -900,19 +900,19 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 	gr := gitx.Runner{GitBudget: 15 * time.Second, FetchBudget: 15 * time.Second}
 	cfg, cfgErr := config.Load(stateDir)
 	type row struct {
-		Session     string             `json:"session"`
-		Bytes       int64              `json:"bytes"`
-		AgeDays     int                `json:"ageDays"`
-		Mode        string             `json:"mode,omitempty"`
-		Source      string             `json:"source,omitempty"`
-		SelfContained *bool            `json:"selfContained,omitempty"`
-		BaseRef     string             `json:"baseRef,omitempty"`
-		BaseSHA     string             `json:"baseSha,omitempty"`
-		Origin      string             `json:"origin,omitempty"`
-		State       string             `json:"state,omitempty"` // verified-ok | at-risk | unverified
-		RunID       string             `json:"runId,omitempty"`
-		PastRetention bool             `json:"pastRetention"`
-		ManifestOK  bool               `json:"manifestOk"`
+		Session       string `json:"session"`
+		Bytes         int64  `json:"bytes"`
+		AgeDays       int    `json:"ageDays"`
+		Mode          string `json:"mode,omitempty"`
+		Source        string `json:"source,omitempty"`
+		SelfContained *bool  `json:"selfContained,omitempty"`
+		BaseRef       string `json:"baseRef,omitempty"`
+		BaseSHA       string `json:"baseSha,omitempty"`
+		Origin        string `json:"origin,omitempty"`
+		State         string `json:"state,omitempty"` // verified-ok | at-risk | unverified
+		RunID         string `json:"runId,omitempty"`
+		PastRetention bool   `json:"pastRetention"`
+		ManifestOK    bool   `json:"manifestOk"`
 	}
 	var rows []row
 	for _, s := range quarantine.List(stateDir) {
@@ -1128,7 +1128,7 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 // apply.lock: a confirmed prune racing this fetch would delete the
 // session mid-restore.
 func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer) int {
-	// Manual scan (flags may appear before or after the session id  - 
+	// Manual scan (flags may appear before or after the session id  -
 	// flag.Parse stops at the first positional).
 	var id, to string
 	asJSON := false

@@ -74,7 +74,7 @@ func (r Runner) Facts(dir string, now time.Time, remoteStaleAfter time.Duration)
 	// Status: repo-level failure if it cannot run. A live index.lock is
 	// detected STRUCTURALLY, before any exec: with optional locks disabled
 	// (below) git never takes or waits on that lock, so the only honest way
-	// to see "a concurrent git holds the index" is to look for the file  - 
+	// to see "a concurrent git holds the index" is to look for the file  -
 	// in the worktree's OWN gitdir (linked worktrees keep their index there)
 	// and in the common dir.
 	if gi, ok := gitDirFor(dir); ok {
@@ -494,7 +494,7 @@ func fileChildren(dir string) []string {
 			continue
 		}
 		// LIVE registered children only: a registration whose worktree dir
-		// is gone (rm without prune) is stale metadata, not a child  - 
+		// is gone (rm without prune) is stale metadata, not a child  -
 		// counting it would pin the parent MANUAL parent-of-live-children
 		// forever over a path nothing can act on. And the candidate itself
 		// is never its own child (an only-child worktree listed itself and
@@ -784,7 +784,7 @@ func (r Runner) UnpushedCommits(dir string) map[string]bool {
 // tag or remote (post-reset / pre-rebase generations): the unpushed-reflog
 // BLOCKED class. Entry tips, not the full rev-list enumeration: every commit
 // reachable from an entry rides into the bundle under that entry's pin
-// (<base>..<tip>), which bounds both the pin count and the command line  - 
+// (<base>..<tip>), which bounds both the pin count and the command line  -
 // a rev-list of a stale reflog-heavy repo mints thousands of refs and blows
 // the Windows command-line bound (the round-2 reliability finding). Errors
 // PROPAGATE: pinning nothing on unreadable evidence is the completeness lie

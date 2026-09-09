@@ -164,8 +164,8 @@ func TestDigestJoin(t *testing.T) {
 func TestSince(t *testing.T) {
 	now := time.Now()
 	records := map[string]*Record{
-		`C:\old`:  {LastEvent: now.Add(-48 * time.Hour)},
-		`C:\new`:  {LastEvent: now.Add(-1 * time.Hour)},
+		`C:\old`: {LastEvent: now.Add(-48 * time.Hour)},
+		`C:\new`: {LastEvent: now.Add(-1 * time.Hour)},
 	}
 	out := Since(records, now.Add(-24*time.Hour))
 	if _, ok := out[`C:\old`]; ok {
@@ -181,10 +181,10 @@ func TestCoverageShare(t *testing.T) {
 	events := []Event{
 		{Type: "enqueue", Dir: "x"},
 		{Type: "acquire", Dir: "x"},
-		{Type: "release"},               // old
-		{Type: "config"},                // not counted
-		{Type: "reenter"},               // not counted
-		{Type: "release", Dir: "y"},     // new
+		{Type: "release"},           // old
+		{Type: "config"},            // not counted
+		{Type: "reenter"},           // not counted
+		{Type: "release", Dir: "y"}, // new
 	}
 	a, tot := CoverageShare(events)
 	if a != 3 || tot != 4 {

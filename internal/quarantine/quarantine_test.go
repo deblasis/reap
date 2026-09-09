@@ -432,7 +432,7 @@ func TestSnapshotColocatedJJ(t *testing.T) {
 
 // The round-2 live data-loss probe as a fixture: a repo whose ONLY ref to
 // unpushed work is an ANNOTATED tag. The tag-object SHA never appears in
-// the unpushed commit set, so membership must test the peeled target  - 
+// the unpushed commit set, so membership must test the peeled target  -
 // the tagged commit must be recoverable from the bundle by name.
 func TestSnapshotAnnotatedTagOnly(t *testing.T) {
 	base := t.TempDir()

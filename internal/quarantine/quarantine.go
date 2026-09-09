@@ -46,19 +46,19 @@ type Manifest struct {
 	Created       time.Time  `json:"created"`
 	RunID         string     `json:"runId,omitempty"` // reverse lookup from reap.log
 	Source        string     `json:"source"`
-	Mode          string     `json:"mode"` // bundle | plain-copy
+	Mode          string     `json:"mode"`             // bundle | plain-copy
 	Origin        string     `json:"origin,omitempty"` // remote URL a delta bundle depends on
 	BaseRef       string     `json:"baseRef,omitempty"`
 	BaseSHA       string     `json:"baseSha,omitempty"`
 	BaseBases     []BaseInfo `json:"baseBases,omitempty"` // per-branch-union bases (branch -> base)
 	SelfContained bool       `json:"selfContained"`
 	BundleBytes   int64      `json:"bundleBytes,omitempty"`
-	Note          string     `json:"note,omitempty"` // e.g. the plain-copy honesty label
-	Revset        string     `json:"revset,omitempty"` // jj push-state revset (jj captures)
+	Note          string     `json:"note,omitempty"`       // e.g. the plain-copy honesty label
+	Revset        string     `json:"revset,omitempty"`     // jj push-state revset (jj captures)
 	CaptureRef    string     `json:"captureRef,omitempty"` // refs/reap/capture-*
 	Classes       Classes    `json:"classes"`
-	Entries       []Entry    `json:"entries,omitempty"` // plain-copy file list
-	EmptyDirs     []string  `json:"emptyDirs,omitempty"` // RELATIVE to the source root
+	Entries       []Entry    `json:"entries,omitempty"`   // plain-copy file list
+	EmptyDirs     []string   `json:"emptyDirs,omitempty"` // RELATIVE to the source root
 	Interleaved   bool       `json:"indexInterleaved,omitempty"`
 }
 
@@ -71,18 +71,18 @@ type BaseInfo struct {
 
 // Classes records what the snapshot provably contains, per category.
 type Classes struct {
-	Refs             int   `json:"refs"`             // branch tips pinned
-	Tags             int   `json:"tags"`             // tag tips pinned
-	ReflogTips       int   `json:"reflogTips"`
-	ReflogExpireD    int   `json:"reflogExpireDays,omitempty"`
-	StashGens        int   `json:"stashGenerations"`
-	JJChanges        int   `json:"jjChanges"`
-	DirtyFiles       int   `json:"dirtyFiles"`
-	DirtyBytes       int64 `json:"dirtyBytes"`
-	UntrackedFiles   int   `json:"untrackedFiles"`
-	UntrackedBytes   int64 `json:"untrackedBytes"`
-	IgnoredFiles     int   `json:"ignoredFiles"`
-	IgnoredBytes     int64 `json:"ignoredBytes"`
+	Refs           int   `json:"refs"` // branch tips pinned
+	Tags           int   `json:"tags"` // tag tips pinned
+	ReflogTips     int   `json:"reflogTips"`
+	ReflogExpireD  int   `json:"reflogExpireDays,omitempty"`
+	StashGens      int   `json:"stashGenerations"`
+	JJChanges      int   `json:"jjChanges"`
+	DirtyFiles     int   `json:"dirtyFiles"`
+	DirtyBytes     int64 `json:"dirtyBytes"`
+	UntrackedFiles int   `json:"untrackedFiles"`
+	UntrackedBytes int64 `json:"untrackedBytes"`
+	IgnoredFiles   int   `json:"ignoredFiles"`
+	IgnoredBytes   int64 `json:"ignoredBytes"`
 }
 
 // Entry is one plain-copy file (name + size), capped in count.
@@ -130,11 +130,11 @@ func (e *ErrSessionExists) Is(target error) bool { return target == os.ErrExist 
 
 // Options carries the caller's budgets and context.
 type Options struct {
-	CapBytes int64 // 0 = no cap
-	Mode     string
-	RunID    string
-	JJ       jjx.Runner // zero budget = jj capture skipped
-	Colocated bool      // .jj + .git at the root (jj pinning applies)
+	CapBytes  int64 // 0 = no cap
+	Mode      string
+	RunID     string
+	JJ        jjx.Runner // zero budget = jj capture skipped
+	Colocated bool       // .jj + .git at the root (jj pinning applies)
 }
 
 // Dir is %LOCALAPPDATA%\reap\quarantine (or REAP_DIR\quarantine).
@@ -171,7 +171,7 @@ func Snapshot(sessionDir, source string, gitRunner gitx.Runner, opts Options) (*
 
 	// The session dir must exist up front: `git bundle create` writes
 	// <bundle>.lock BESIDE its destination. Created EXCLUSIVELY (Mkdir, not
-	// MkdirAll): an existing dir of the same name is ANOTHER SESSION  - 
+	// MkdirAll): an existing dir of the same name is ANOTHER SESSION  -
 	// proceeding would overwrite that dir's only recovery copy. A typed
 	// collision error (round 4): string-matching the prose burned the retry
 	// on unrelated mkdir failures. The PARENT is ours to create (round 5):
@@ -457,7 +457,7 @@ func captureRef(r gitx.Runner, dir string, m *Manifest) error {
 	if rerr := restore(); rerr != nil {
 		return rerr
 	}
-	// w2: after the restore, the index on disk must equal the saved bytes  - 
+	// w2: after the restore, the index on disk must equal the saved bytes  -
 	// anything else is a concurrent git that wrote past the restore.
 	// (The window DURING staging  -  while git add/plumbing hold the index
 	// lock between our steps  -  is honestly unobservable without holding
@@ -676,7 +676,7 @@ func bundleRanges(r gitx.Runner, dir string, m *Manifest, refs []string) ([]stri
 		if lsOut == nil {
 			out, err := r.LSRemote(m.Origin)
 			if err != nil {
-				// Offline at capture time: the base cannot be confirmed  - 
+				// Offline at capture time: the base cannot be confirmed  -
 				// self-contained, never an unverifiable delta.
 				empty := ""
 				lsOut = &empty

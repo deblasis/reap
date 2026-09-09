@@ -1,5 +1,5 @@
 // Package jjpaths is the ONE resolver of jj's .jj/repo pointer semantics.
-// classify and jjx both need it and had drifted apart re-implementing it  - 
+// classify and jjx both need it and had drifted apart re-implementing it  -
 // the drift is exactly how a round-7 fold shipped as a live no-op (the
 // pointer names the parent's REPO DIR; `jj workspace list` prints the
 // parent ROOT; an exclusion comparing the two never matches).

@@ -7,7 +7,7 @@
 //  1. one `gh search prs --author @me --state open --json repository` call
 //     finds the base repos with open authored PRs (usually a handful);
 //  2. one `gh pr list -R <base> --author @me --state open --json
-//     headRefName,headRepository` per HIT repo only  -  not per candidate  - 
+//     headRefName,headRepository` per HIT repo only  -  not per candidate  -
 //     recovers the head branches.
 //
 // The head slug: pr list's headRepository.nameWithOwner comes back EMPTY in

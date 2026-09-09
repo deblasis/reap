@@ -34,7 +34,7 @@ func cmdActivity(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "[]")
 			return ExitOK
 		}
-		fmt.Fprintln(stdout, "no incoda lane.log activity found (state dir: " + incodalog.StateDir() + ")")
+		fmt.Fprintln(stdout, "no incoda lane.log activity found (state dir: "+incodalog.StateDir()+")")
 		return ExitOK
 	}
 
