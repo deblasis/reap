@@ -321,7 +321,7 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// Re-verify seconds before deletion, at full strength, WITH the
 		// hold/protect rails joined (round-2 fold: a held dirty dir must
 		// verdict KEEP here, not BLOCKED).
-		rv := applycmd.Reverify(path, "dirty-files", false, cfg, applycmd.Deleter{Git: gr, JJ: jr}, protectExpanded, holdsBool, nil, nil)
+		rv := applycmd.Reverify(path, "dirty-files", false, cfg, applycmd.Deleter{Git: gr, JJ: jr}, protectExpanded, holdsBool, nil, nil, nil)
 		if rv.HardAbort != "" {
 			fmt.Fprintf(stderr, "reap discard: HARD ABORT: %s\n", rv.HardAbort)
 			return ExitState

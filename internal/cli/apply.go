@@ -809,10 +809,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		PRHeads: core.prHeads,
 	}
 	deletedInRun := map[string]bool{}
+	// Op-head sets captured right after THIS RUN's own jj deregistrations
+	// (round 9: the unlock arm's op-identity - a genuine later op adds a
+	// name this map does not hold and the arm refuses).
+	deregOpHeads := map[string][]string{}
 	carveOutFailed := false // any 125-class carve-out quarantine failure
 	applyReclaim := dedupe.NewCounter(50000)
 	for _, p := range ordered {
-		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun, p.PlanChildren)
+		rv := applycmd.Reverify(p.Path, p.Code, p.Widened, core.cfg, d, core.protectExpanded, core.holds, deletedInRun, p.PlanChildren, deregOpHeads)
 		if rv.HardAbort != "" {
 			fmt.Fprintf(stderr, "reap apply: HARD ABORT: %s\n", rv.HardAbort)
 			return ExitState
@@ -1087,6 +1091,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		// The in-run deletion set feeds the both-clean unlock (round-3: the
 		// map existed but was never written  -  dead wiring).
 		deletedInRun[pathCanonical] = true
+		// A jj workspace's deregistration (jj workspace forget) writes its op
+		// into the PARENT's op store: capture the parent's post-forget op-head
+		// names so the parent's unlock arm can prove no GENUINE op landed
+		// since (round 9).
+		if rv.Class.Kind == classify.KindJJWorkspace && rv.Class.ParentRepo != "" {
+			pr := rv.Class.ParentRepo
+			deregOpHeads[config.Canonical(pr)] = jjx.OpHeadNames(pr)
+		}
 		// Full audit enrichment from the fresh facts (round-1: the line
 		// shape's fields were all dead) + capped manifest for non-clean
 		// deletions (spec: gone is never contents unknown).

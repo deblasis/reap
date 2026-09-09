@@ -281,6 +281,25 @@ func OrderChildrenFirst(plan []PlanEntry) []PlanEntry {
 	return out
 }
 
+// opHeadsUnchanged reports whether the repo's current op-head names are
+// exactly the captured set (no entry = nothing captured: the arm's other
+// gates carry the decision).
+func opHeadsUnchanged(captured []string, repoDir string) bool {
+	if captured == nil {
+		return true
+	}
+	cur := jjx.OpHeadNames(repoDir)
+	if len(cur) != len(captured) {
+		return false
+	}
+	for i := range cur {
+		if cur[i] != captured[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // hasDeletedChild reports whether this run deleted a path under parent.
 func hasDeletedChild(deletedInRun map[string]bool, path string) bool {
 	if len(deletedInRun) == 0 {
@@ -338,7 +357,7 @@ func HoldUnderPath(holds map[string]bool, path string) (string, bool) {
 // parent-of-live-children row whose children all went in this run is the
 // SPEC'S EXPECTED UNLOCK when it re-verdicts SAFE  -  not drift (round 2:
 // the match gate alone made the both-clean family structurally undeletable).
-func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool, planChildren []string) ReverifyResult {
+func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Deleter, protectExpanded []string, holds map[string]bool, deletedInRun map[string]bool, planChildren []string, deregOpHeads map[string][]string) ReverifyResult {
 	now := time.Now()
 	remoteStale := time.Duration(cfg.Thresholds.RemoteStaleHours) * time.Hour
 
@@ -492,7 +511,13 @@ func Reverify(path, plannedCode string, widened bool, cfg config.Config, d Delet
 			// gated on the same all-children-deleted condition.
 			if plannedCode == "parent-of-live-children" &&
 				allPlanChildrenDeleted(planChildren, deletedInRun) &&
-				(v.Verdict == verdict.Safe || (v.Verdict == verdict.Active && v.Code == "jj-active")) {
+				(v.Verdict == verdict.Safe || (v.Verdict == verdict.Active && v.Code == "jj-active" &&
+					// Op identity (round 9; the R7 reliability seat live-proved a
+					// GENUINE interposed 'jj git fetch' rode the arm): the arm is
+					// accepted only when the op-head set is EXACTLY the one this
+					// run's own deregistration left behind. A new op-head name =
+					// a genuine later op - refuse.
+					opHeadsUnchanged(deregOpHeads[config.Canonical(path)], path))) {
 				break
 			}
 			return ReverifyResult{SkipWhy: SkipVerdictChanged, Verdict: v, Git: in.Git, Class: classInfo}

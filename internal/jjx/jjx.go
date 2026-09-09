@@ -10,6 +10,7 @@
 package jjx
 
 import (
+	"sort"
 	"bytes"
 	"context"
 	"fmt"
@@ -48,6 +49,23 @@ type Facts struct {
 	LastOp time.Time
 	// Children lists workspace working-copy paths registered at this repo.
 	Children []string
+}
+
+// OpHeadNames lists the op-head file names under a repo's op_heads dir -
+// the FILE-BASED op identity (template exec for op ids churns across jj
+// versions; names do not). A genuine later op (fetch, import, another
+// workspace's commit) adds a name the caller did not capture.
+func OpHeadNames(repoDir string) []string {
+	entries, err := os.ReadDir(filepath.Join(repoDir, ".jj", "repo", "op_heads"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		out = append(out, e.Name())
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Facts collects the jj fact set for dir (a repo with a .jj dir).
