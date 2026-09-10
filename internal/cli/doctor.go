@@ -73,8 +73,13 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		}
 		stV, stCause := quarantine.RevalidateWithCause(gr, s.Manifest, s.Dir)
 		st := string(stV)
-		if stV == quarantine.Unverified && stCause == quarantine.CauseBundle {
-			st = "unverified (bundle corrupt/unreadable)"
+		if stV == quarantine.Unverified {
+			switch stCause {
+			case quarantine.CauseBundle:
+				st = "unverified (bundle corrupt/unreadable)"
+			case quarantine.CauseRemote:
+				st = "unverified (could not reach the remote)"
+			}
 		}
 		states[string(stV)]++
 		fmt.Fprintf(stdout, "  bundle %s: %s\n", filepath.Base(s.Dir), st)

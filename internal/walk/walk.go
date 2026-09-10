@@ -7,10 +7,10 @@
 //     children are added or removed, so deep writes (a build dropping files in
 //     bin/, an agent editing nested files, every git commit) leave it stale,
 //     and stale activity is how a live dir verdicts SAFE.
-//   - The size cache is sizes-only by construction: MaxMtime is simply not
-//     stored, so no code path can serve a cached activity into a verdict. The
-//     spec's cardinal rule (SAFE only on fresh evidence) is enforced by the
-//     type, not by discipline.
+//   - There is no size cache: sizes and MaxMtime come from ONE fused walk
+//     (a sizes-only cache could never skip the walk that computes the
+//     uncachable activity fact; the sizecache.json of earlier drafts was
+//     dropped). SAFE only on fresh evidence is enforced by the walk itself.
 package walk
 
 import (

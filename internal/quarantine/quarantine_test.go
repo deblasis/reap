@@ -971,4 +971,13 @@ func TestRevalidateDeltaStates(t *testing.T) {
 	if v, c := RevalidateWithCause(gr, mgone, sess); v != AtRisk || c != "" {
 		t.Fatalf("gone base with the bundle PRESENT: %v/%q, want at-risk (the loud warning's only trigger)", v, c)
 	}
+	// The unverified CAUSES (the final board's spec seat): unreachable
+	// remote = remote; nil manifest = none (never a network problem).
+	moff := &Manifest{BaseSHA: baseSHA, Origin: filepath.Join(base, "gone.git"), Mode: "bundle"}
+	if v, c := RevalidateWithCause(gr, moff, sess); v != Unverified || c != CauseRemote {
+		t.Fatalf("unreachable remote: %v/%q, want unverified/remote", v, c)
+	}
+	if v, c := RevalidateWithCause(gr, nil, sess); v != Unverified || c != CauseNone {
+		t.Fatalf("nil manifest: %v/%q, want unverified/none", v, c)
+	}
 }

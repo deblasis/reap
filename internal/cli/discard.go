@@ -921,8 +921,8 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 		BaseRef       string `json:"baseRef,omitempty"`
 		BaseSHA       string `json:"baseSha,omitempty"`
 		Origin        string `json:"origin,omitempty"`
-		State         string `json:"state,omitempty"` // verified-ok | at-risk | unverified
-		StateCause    string `json:"-"`               // unverified cause (bundle|remote); render-only
+		State         string `json:"state,omitempty"`      // verified-ok | at-risk | unverified
+		StateCause    string `json:"stateCause,omitempty"` // unverified cause (bundle|remote|none)
 		RunID         string `json:"runId,omitempty"`
 		PastRetention bool   `json:"pastRetention"`
 		ManifestOK    bool   `json:"manifestOk"`
@@ -1003,8 +1003,11 @@ func stateLabel(s, cause string) string {
 	case "unverified":
 		// Cause-split (the verification rel seat): a corrupt bundle is NOT a
 		// network problem; the remedy differs (restore-to-check vs retry).
-		if cause == quarantine.CauseBundle {
+		switch cause {
+		case quarantine.CauseBundle:
 			return "unverified (bundle corrupt/unreadable)"
+		case quarantine.CauseNone:
+			return "unverified (no manifest; contents unknown)"
 		}
 		return "unverified (could not reach the remote)"
 	}
@@ -1091,7 +1094,7 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		fmt.Fprintln(pruneOut, "nothing to prune")
 		return ExitOK
 	}
-	atRisk, unverifiedRemote, unverifiedBundle := false, false, false
+	atRisk, unverifiedRemote, unverifiedBundle, noManifest := false, false, false, false
 	for _, v := range victims {
 		switch v.state {
 		case quarantine.AtRisk:
@@ -1099,9 +1102,12 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		case quarantine.Unverified:
 			// Cause-split (the verification rel seat): corrupt vs offline
 			// name different remedies; never conflate them.
-			if v.cause == quarantine.CauseBundle {
+			switch v.cause {
+			case quarantine.CauseBundle:
 				unverifiedBundle = true
-			} else {
+			case quarantine.CauseNone:
+				noManifest = true
+			default:
 				unverifiedRemote = true
 			}
 		}
@@ -1121,10 +1127,20 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 	if unverifiedBundle {
 		warning += "; at least one bundle is corrupt/unreadable (recovery from it is not possible)"
 	}
+	if noManifest {
+		warning += "; at least one session has no manifest (contents unknown)"
+	}
 	// The R15 stdout-purity rule, extended to prune (the full-implementation
 	// spec seat): under --json the plan line and prompt route to stderr.
-	fmt.Fprintf(pruneOut, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s. Proceed? [y/N] ",
-		len(victims), float64(totalBytes)/(1<<30), oldest, warning)
+	if *yes {
+		// The plan line stays; the interactive prompt fragment does not (the
+		// final board's rel nit, matching discard).
+		fmt.Fprintf(pruneOut, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s\n",
+			len(victims), float64(totalBytes)/(1<<30), oldest, warning)
+	} else {
+		fmt.Fprintf(pruneOut, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s. Proceed? [y/N] ",
+			len(victims), float64(totalBytes)/(1<<30), oldest, warning)
+	}
 	if !*yes {
 		// Non-interactive prune must REFUSE (121), never EOF-decline to 0:
 		// "declined" in an agent context would read as nothing-to-do.
@@ -1204,6 +1220,12 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		fmt.Fprintln(stderr, "usage: reap quarantine restore <session> [--to PATH] [--json]")
 		return ExitUsage
 	}
+	// The R15 purity rule, extended to restore (the final board's eng seat):
+	// under --json the human 'restored' lines go to stderr.
+	humanOut := io.Writer(stdout)
+	if asJSON {
+		humanOut = stderr
+	}
 	lock, lerr := applycmd.Lock(stateDir, "restore")
 	if lerr != nil {
 		fmt.Fprintf(stderr, "reap quarantine restore: %v\n", lerr)
@@ -1259,12 +1281,27 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "reap quarantine restore: %s exists and is non-empty (recovery never deletes or overwrites; contains: %s)\n", dest, strings.Join(names, ", "))
 		return ExitUsage
 	}
+	// The self-created destination is cleaned on EVERY failure path (the
+	// final board's eng/spec seats: only the corrupt branch cleaned before,
+	// leaving an init-ed husk that made retries hit the non-empty refusal).
+	// GUARDS: only an EXPLICIT --to dest this run created (a defaulted
+	// m.Source may still hold user content), and only after the non-empty
+	// refusal has already returned above.
+	materialized := false
+	if to != "" {
+		defer func() {
+			if !materialized {
+				os.RemoveAll(dest)
+			}
+		}()
+	}
 	if m.Mode == "plain-copy" {
 		if err := restorePlainCopy(session.Dir, dest, m); err != nil {
 			fmt.Fprintf(stderr, "reap quarantine restore: %v\n", err)
 			return ExitState
 		}
-		fmt.Fprintf(stdout, "restored %s -> %s (plain copy)\n", id, dest)
+		materialized = true
+		fmt.Fprintf(humanOut, "restored %s -> %s (plain copy)\n", id, dest)
 		emit(map[string]any{"session": id, "to": dest, "mode": "plain-copy"})
 		if emitFailed {
 			return ExitState
@@ -1310,8 +1347,13 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		// NAME the shape, band it with the quarantine-failure code, and clean
 		// the init-ed destination husk (the verification board's rel seat).
 		msg := err.Error()
-		if strings.Contains(msg, "early EOF") || strings.Contains(msg, "index-pack") || strings.Contains(msg, "Repository lacks these prerequisite") {
-			os.RemoveAll(dest)
+		if strings.Contains(msg, "Repository lacks these prerequisite") {
+			// An INTACT delta whose prerequisites are absent (the final
+			// board's eng nit: 'corrupt' would misname it).
+			fmt.Fprintf(stderr, "reap quarantine restore: the base this delta needs is unavailable (no origin recorded or unreachable); recovery from this session alone is not possible\n")
+			return applycmd.ExitQuarantine
+		}
+		if strings.Contains(msg, "early EOF") || strings.Contains(msg, "index-pack") {
 			fmt.Fprintf(stderr, "reap quarantine restore: the bundle is corrupt or truncated: %s; recovery from this session is not possible\n", bundle)
 			return applycmd.ExitQuarantine
 		}
@@ -1329,7 +1371,8 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 			fmt.Fprintf(stderr, "reap quarantine restore: recreating empty dir %s: %v\n", d, err)
 		}
 	}
-	fmt.Fprintf(stdout, "restored %s -> %s (capture ref %s materialized; pinned refs under refs/reap/*)\n", id, dest, m.CaptureRef)
+	materialized = true
+	fmt.Fprintf(humanOut, "restored %s -> %s (capture ref %s materialized; pinned refs under refs/reap/*)\n", id, dest, m.CaptureRef)
 	emit(map[string]any{"session": id, "to": dest, "mode": "bundle", "captureRef": m.CaptureRef})
 	if emitFailed {
 		return ExitState

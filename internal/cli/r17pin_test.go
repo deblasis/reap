@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/deblasis/reap/internal/applycmd"
 	"github.com/deblasis/reap/internal/config"
+	"github.com/deblasis/reap/internal/quarantine"
 )
 
 // The R17 pin batch: the full-implementation board's fold. The headline is
@@ -174,17 +177,90 @@ func TestWiringR17DiscardJSONShape(t *testing.T) {
 }
 
 // The -- terminator is a hard positional boundary (the verification board's
-// spec nit): dash-leading paths must stay holdable via `hold -- <path>`.
+// spec nit; the final board's eng seat found the R18 pin VACUOUS - an
+// absolute path never dash-prefixed as a token - so this pin asserts the
+// REORDER OUTPUT and the composite parse, red on the hoisting shape).
 func TestWiringR18FlagsFirstTerminator(t *testing.T) {
-	root, _ := wireFixture(t)
-	weird := filepath.Join(root, "-weirdpath")
-	os.MkdirAll(weird, 0o755)
-	if code := cmdHold([]string{"--for", "48h", "--", weird}, os.Stdout, os.Stderr); code != ExitOK {
-		t.Fatalf("hold -- -weirdpath: %d (the terminator must protect dash-leading paths)", code)
+	// (a) Tokens past -- are never hoisted (the pre-R19 code returned
+	// ["-weirdpath", "PATH", "--", "other"] here).
+	got := strings.Join(flagsFirst([]string{"PATH", "--", "-weirdpath", "other"}), "|")
+	if got != "--|PATH|-weirdpath|other" {
+		t.Fatalf("terminator boundary broken: %s", got)
 	}
-	var hb bytes.Buffer
-	if code := cmdHolds(nil, &hb, os.Stderr); code != ExitOK || !strings.Contains(hb.String(), "-weirdpath") {
-		t.Fatalf("the dash-leading hold must be recorded: %d %q", code, hb.String())
+	// (b) Flags still hoist ahead of positionals when NO terminator exists,
+	// value flags carrying their operand.
+	got = strings.Join(flagsFirst([]string{"P", "--for", "48h", "Q"}), "|")
+	if got != "--for|48h|P|Q" {
+		t.Fatalf("flag hoisting broken: %s", got)
+	}
+	// (c) The grammar end to end: the reordered args parse, and the
+	// dash-leading token survives as a positional.
+	fs := flag.NewFlagSet("hold", flag.ContinueOnError)
+	var forStr string
+	fs.StringVar(&forStr, "for", "", "")
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(flagsFirst([]string{"PATH", "--", "-weirdpath"})); err != nil {
+		t.Fatalf("the terminator shape must parse (the hoisting shape failed here): %v", err)
+	}
+	if fs.NArg() != 2 || fs.Arg(0) != "PATH" || fs.Arg(1) != "-weirdpath" {
+		t.Fatalf("positionals after -- must survive verbatim: %v", fs.Args())
+	}
+}
+
+// The R19 coverage pins (the final board's spec seat: four R18 surfaces
+// shipped live-proven but unpinned).
+func TestWiringR19UnverifiedCauseCopy(t *testing.T) {
+	if got := stateLabel("unverified", quarantine.CauseBundle); got != "unverified (bundle corrupt/unreadable)" {
+		t.Fatalf("bundle cause: %q", got)
+	}
+	if got := stateLabel("unverified", quarantine.CauseRemote); got != "unverified (could not reach the remote)" {
+		t.Fatalf("remote cause: %q", got)
+	}
+	if got := stateLabel("unverified", quarantine.CauseNone); got != "unverified (no manifest; contents unknown)" {
+		t.Fatalf("no-manifest cause: %q", got)
+	}
+	if got := stateLabel("verified-ok", ""); got != "verified-ok" {
+		t.Fatalf("verified: %q", got)
+	}
+}
+
+// Corrupt-bundle restore end to end: 125, the named corrupt copy, and the
+// self-created destination cleaned (the R18/R19 fold, pinned).
+func TestWiringR19CorruptRestore125(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "d1")
+	os.MkdirAll(repo, 0o755)
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("wip"), 0o644)
+	ageTree(t, repo, 30*24*time.Hour)
+	writeWireConfig(t, stateDir, root)
+	var js bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", repo}, &js, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("discard: %d (%s)", code, js.String())
+	}
+	sessions := quarantine.List(stateDir)
+	if len(sessions) != 1 {
+		t.Fatalf("sessions: %d", len(sessions))
+	}
+	sess := sessions[0].Dir
+	bundle := filepath.Join(sess, "bundle.git")
+	raw, err := os.ReadFile(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle, raw[:len(raw)/3], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(root, "restore-dest")
+	var e bytes.Buffer
+	if code := cmdQuarantine([]string{"restore", filepath.Base(sess), "--to", dest, "--json"}, os.Stdout, &e, os.Stdin); code != applycmd.ExitQuarantine {
+		t.Fatalf("corrupt restore: %d (want 125): %s", code, e.String())
+	}
+	if !strings.Contains(e.String(), "corrupt or truncated") {
+		t.Fatalf("the refusal must name the shape:\n%s", e.String())
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("the self-created destination must be cleaned on failure")
 	}
 }
 

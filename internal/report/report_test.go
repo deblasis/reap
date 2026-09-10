@@ -181,3 +181,23 @@ func TestJSONShape(t *testing.T) {
 		t.Fatalf("excluded entry must still count in totals: %+v", back.Totals.ByReason)
 	}
 }
+
+// The expiry detail renders 0d for an expires-today hold and vanishes only
+// when no active hold exists (the final board's spec seat: the R17 >0 guard
+// made the detail disappear exactly when it mattered most).
+func TestKeepSubtitleZeroDays(t *testing.T) {
+	kept := []Entry{entry("KEEP", "held-by-user", 1<<30, `C:\t\k`)}
+	r := Build(time.Now(), nil, kept, 0)
+	r.HoldsExpireInDays = 0
+	var buf bytes.Buffer
+	r.Table(&buf)
+	if !strings.Contains(buf.String(), "holds expire in 0d") {
+		t.Fatalf("an expires-today hold must render 0d:\n%s", buf.String())
+	}
+	r2 := Build(time.Now(), nil, kept, 0) // -1 default: no active holds
+	var buf2 bytes.Buffer
+	r2.Table(&buf2)
+	if strings.Contains(buf2.String(), "holds expire") {
+		t.Fatalf("no holds must not render the detail:\n%s", buf2.String())
+	}
+}

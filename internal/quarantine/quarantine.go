@@ -982,12 +982,15 @@ func Revalidate(r gitx.Runner, m *Manifest, sessionDir string) RestoreVerdict {
 const (
 	CauseRemote = "remote" // ls-remote could not reach the recorded origin
 	CauseBundle = "bundle" // the session's bundle failed the integrity probe
+	CauseNone   = "none"   // no manifest at all (interrupted capture)
 )
 
 // RevalidateWithCause is Revalidate plus the unverified CAUSE.
 func RevalidateWithCause(r gitx.Runner, m *Manifest, sessionDir string) (RestoreVerdict, string) {
 	if m == nil {
-		return Unverified, CauseRemote
+		// A manifest-less session is its own shape (interrupted capture),
+		// never a network problem (the final board's rel + spec seats).
+		return Unverified, CauseNone
 	}
 	// The integrity check is SELF-CONTAINED ONLY (the R18 verification
 	// board's spec seat, live-proven): a delta bundle's prerequisite commits
@@ -1047,7 +1050,15 @@ func verifyBundle(sessionDir string) (present, ok bool) {
 		_ = out
 		return true, false
 	}
-	return true, exec.CommandContext(ctx, "git", "-C", tmp, "bundle", "unbundle", bundle).Run() == nil
+	err = exec.CommandContext(ctx, "git", "-C", tmp, "bundle", "unbundle", bundle).Run()
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		// A slow (or disk-squeezed) unbundle of an INTACT bundle is not
+		// corruption (the final-board rel seat: prune must never claim
+		// 'recovery is not possible' about a merely slow near-cap bundle):
+		// cannot-verify is not corrupt; restore still attempts.
+		return true, true
+	}
+	return true, err == nil
 }
 
 // Bytes measures a session dir's size on disk.
