@@ -25,11 +25,13 @@ package quarantine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -969,9 +971,21 @@ const (
 // approximation the spec's budget allows (restore itself fetch-then-
 // verifies and never refuses on advancement); self-contained bundles are
 // verified-ok by construction.
-func Revalidate(r gitx.Runner, m *Manifest) RestoreVerdict {
+func Revalidate(r gitx.Runner, m *Manifest, sessionDir string) RestoreVerdict {
 	if m == nil {
 		return Unverified
+	}
+	// The bundle IS the recovery (the full-implementation reliability seat:
+	// a bundle truncated to a third still listed verified-ok, then restore
+	// died on a raw index-pack error). When a bundle file is PRESENT it must
+	// verify; a corrupt one maps to Unverified - the state for "could not
+	// verify", never conflated with at-risk. An absent bundle (bare unit
+	// manifests, manifest-less sessions already flagged separately) keeps
+	// the base checks below, exactly as before.
+	if m.Mode != "plain-copy" {
+		if present, ok := verifyBundle(sessionDir); present && !ok {
+			return Unverified
+		}
 	}
 	if m.SelfContained || (m.BaseSHA == "" && len(m.BaseBases) == 0) {
 		return VerifiedOK
@@ -993,6 +1007,32 @@ func Revalidate(r gitx.Runner, m *Manifest) RestoreVerdict {
 		}
 	}
 	return VerifiedOK
+}
+
+// verifyBundle runs a budgeted `git bundle verify` on the session's bundle:
+// present+ok, present+failed (truncated or corrupt), or absent.
+func verifyBundle(sessionDir string) (present, ok bool) {
+	bundle := filepath.Join(sessionDir, "bundle.git")
+	if _, err := os.Stat(bundle); err != nil {
+		return false, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// `git bundle verify` needs a repository context ("need a repository to
+	// verify a bundle") and, worse, passes on a header-intact truncated pack
+	// (probe-verified); `git bundle unbundle` INDEXES the pack, so a
+	// truncated bundle dies with "early EOF / index-pack died" - the honest
+	// check. A throwaway repo provides the context and absorbs the objects.
+	tmp, err := os.MkdirTemp("", "reap-bundle-verify")
+	if err != nil {
+		return true, false
+	}
+	defer os.RemoveAll(tmp)
+	if out, ierr := exec.CommandContext(ctx, "git", "init", "-q", "-b", "main", tmp).CombinedOutput(); ierr != nil {
+		_ = out
+		return true, false
+	}
+	return true, exec.CommandContext(ctx, "git", "-C", tmp, "bundle", "unbundle", bundle).Run() == nil
 }
 
 // Bytes measures a session dir's size on disk.

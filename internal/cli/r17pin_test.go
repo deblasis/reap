@@ -1,0 +1,174 @@
+package cli
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/deblasis/reap/internal/applycmd"
+	"github.com/deblasis/reap/internal/config"
+)
+
+// The R17 pin batch: the full-implementation board's fold. The headline is
+// the reliability major - the first-ever hold landing in the confirm window
+// panicked the under-lock merge (nil holds map) instead of running the
+// sanctioned 122 abort.
+func TestWiringR17FirstHoldMidRunNoPanic(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	// (a) The source: a missing holds.json loads as INITIALIZED maps. Red on
+	// the pre-fix code (nil, nil, nil).
+	h, exp, err := loadHoldsWithExpired(stateDir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if h == nil || exp == nil {
+		t.Fatalf("a fresh state dir must load holds as EMPTY maps, never nil (the nil-map merge panicked the first-ever mid-run hold): %v %v", h == nil, exp == nil)
+	}
+	// (b) The merge site: core.holds must be writable and the merge of a
+	// hold that lands between scan and the under-lock re-read must not
+	// panic. Red on the pre-fix code (assignment to nil map).
+	core, code := newScanCore(nil, os.Stderr, []string{root}, true, false)
+	if core == nil {
+		t.Fatalf("newScanCore: %d", code)
+	}
+	if core.holds == nil {
+		t.Fatal("core.holds must never be nil, even with no holds.json")
+	}
+	if code := cmdHold([]string{"--for", "720h", filepath.Join(root, "scratch-old")}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold: %d", code)
+	}
+	for h2 := range applycmd.ReadHoldsSnapshot(stateDir) {
+		core.holds[h2] = true // the exact line that panicked
+	}
+	if !core.holds[config.Canonical(filepath.Join(root, "scratch-old"))] {
+		t.Fatal("the mid-window hold must be visible to the gate")
+	}
+}
+
+// The tool's own usage lines print PATH-first spellings (`reap hold PATH
+// [--for DUR]`, `reap discard PATH... [--yes]`): they must parse AS PRINTED
+// (Go's flag package stops at the first positional; flagsFirst reorders).
+func TestWiringR17FlagOrderAsPrinted(t *testing.T) {
+	root, _ := wireFixture(t)
+	if code := cmdHold([]string{filepath.Join(root, "scratch-old"), "--for", "48h"}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold PATH --for DUR must parse: %d", code)
+	}
+	var hb, e bytes.Buffer
+	if code := cmdHolds(nil, &hb, &e); code != ExitOK || !strings.Contains(hb.String(), "scratch-old") {
+		t.Fatalf("holds after PATH-first hold: %d (rows %q)", code, hb.String())
+	}
+	// discard PATH --yes --json on an already-held (non-BLOCKED) dir: the
+	// wave-0 hold refusal proves the flags parsed (pre-fix, --yes became a
+	// path operand and the run failed differently).
+	var out bytes.Buffer
+	if code := cmdDiscard([]string{filepath.Join(root, "scratch-old"), "--yes"}, &out, &e, os.Stdin); code != applycmd.ExitUsage {
+		t.Fatalf("discard PATH --yes must parse and hit the wave-0 KEEP refusal: %d (%s %s)", code, out.String(), e.String())
+	}
+}
+
+// reap holds refuses loudly on a corrupt holds.json (the strict read): the
+// human checking why a dir was deleted must never see "no holds".
+func TestWiringR17HoldsStrict(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	if err := os.WriteFile(filepath.Join(stateDir, "holds.json"), []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var e bytes.Buffer
+	if code := cmdHolds(nil, os.Stdout, &e); code != ExitState || !strings.Contains(e.String(), "corrupt") {
+		t.Fatalf("holds on corrupt file: %d: %s", code, e.String())
+	}
+}
+
+// The expiry-at-consequence pin (a spec-named family, live-verified by the
+// board but unpinned): a hold that lapsed within 7 days marks the scan row
+// and renders plan's distinct section.
+func TestWiringR17ExpiredHoldSections(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	p := filepath.Join(root, "scratch-old")
+	lapsed := time.Now().Add(-3 * 24 * time.Hour)
+	body, merr := json.Marshal(map[string]map[string]string{config.Canonical(p): {"expires": lapsed.Format(time.RFC3339)}})
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "holds.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var s bytes.Buffer
+	if code := cmdScan([]string{"--no-gh"}, &s, os.Stderr); code != ExitOK {
+		t.Fatalf("scan: %d", code)
+	}
+	if !strings.Contains(s.String(), "[hold expired ") {
+		t.Fatalf("the scan row must carry the expiry mark:\n%s", s.String())
+	}
+	var plan bytes.Buffer
+	if code := cmdPlan([]string{"--no-gh"}, &plan, os.Stderr); code != ExitOK {
+		t.Fatalf("plan: %d", code)
+	}
+	if !strings.Contains(plan.String(), "expired hold:") {
+		t.Fatalf("plan must render its expired-hold section:\n%s", plan.String())
+	}
+}
+
+// Exit 124 pinned (the spec's deletion-failed band, path named): a
+// deny-delete ACL inside a SAFE dir fails the deletion, preserves the husk
+// contents-first, and names the path.
+func TestWiringR17DeleteFail124(t *testing.T) {
+	root, _ := wireFixture(t)
+	target := filepath.Join(root, "scratch-old")
+	locked := filepath.Join(target, "locked.bin")
+	if err := os.WriteFile(locked, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The fresh file must not trip the activity rail: re-age the whole dir.
+	ageTree(t, target, 40*24*time.Hour)
+	_ = locked // the fresh file only keeps the dir REAL; the fault is the seam below
+	restoreRC := applycmd.RemoveContents
+	applycmd.RemoveContents = func(string) error { return os.ErrPermission }
+	t.Cleanup(func() { applycmd.RemoveContents = restoreRC })
+	var e bytes.Buffer
+	if code := cmdApply([]string{"--no-gh", "--yes"}, os.Stdout, &e, os.Stdin); code != applycmd.ExitDeleteFail {
+		t.Fatalf("deny-delete inside a SAFE dir: %d (want 124): %s", code, e.String())
+	}
+	if !strings.Contains(e.String(), "deletion failed") {
+		t.Fatalf("the failure must name the path:\n%s", e.String())
+	}
+	if _, err := os.Stat(locked); err != nil {
+		t.Fatal("the denied file must survive (contents-first preserves the husk)")
+	}
+}
+
+// discard --json emits the one-shape summary (lists as [], never null) -
+// the fourth emitter, aligned by routing through Summary.EmitJSON.
+func TestWiringR17DiscardJSONShape(t *testing.T) {
+	root, stateDir := wireFixture(t)
+	repo := filepath.Join(root, "d1")
+	os.MkdirAll(repo, 0o755)
+	wireGit(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("wip"), 0o644)
+	ageTree(t, repo, 30*24*time.Hour)
+	writeWireConfig(t, stateDir, root)
+	var js bytes.Buffer
+	if code := cmdDiscard([]string{"--yes", "--json", repo}, &js, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("discard --json: %d (%s)", code, js.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(js.String())), &doc); err != nil {
+		t.Fatalf("discard --json must be a pure JSON doc (no text prefix): %v\n%s", err, js.String())
+	}
+	for _, list := range []string{"planned", "widened", "deleted", "skipped", "excludedBelowFloor", "excludedByCode"} {
+		v, ok := doc[list]
+		if !ok {
+			t.Fatalf("missing %s:\n%s", list, js.String())
+		}
+		if _, isArray := v.([]any); !isArray {
+			t.Fatalf("discard --json %s must be an array, got %T (null?):\n%s", list, v, js.String())
+		}
+	}
+	if got := len(doc["deleted"].([]any)); got != 1 {
+		t.Fatalf("deleted = %d, want the dirty repo:\n%s", got, js.String())
+	}
+}

@@ -89,7 +89,9 @@ func (l *File) Close() error {
 // Held reports whether this File currently holds the lock.
 func (l *File) Held() bool { return l != nil && l.locked }
 
-// IsFree reports whether path can be exclusively locked right now (the
+// IsFree reports whether path can be exclusively locked right now. Kept as
+// part of the ported incoda lock surface (tests exercise it; probing without
+// taking the lock is the pattern the rail reuses).
 // raw probe: errors propagate; callers wanting the cannot-open=live
 // policy implement it themselves).
 func IsFree(path string) (bool, error) {

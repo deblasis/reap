@@ -49,12 +49,20 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	asJSON := fs.Bool("json", false, "emit the machine schema")
 	yes := fs.Bool("yes", false, "confirm non-interactively")
 	noQuarantine := fs.Bool("no-quarantine", false, "skip the snapshot (interactive TTY confirm required; loud logging)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() == 0 {
 		fmt.Fprintln(stderr, "usage: reap discard PATH... [--yes] [--no-quarantine] [--json]")
 		return ExitUsage
+	}
+
+	// The R15 stdout-purity rule, extended to discard (the full-implementation
+	// board): under --json every human line routes to stderr, stdout carries
+	// only the schema document.
+	humanOut := io.Writer(stdout)
+	if *asJSON {
+		humanOut = stderr
 	}
 
 	stateDir, err := config.StateDir()
@@ -152,38 +160,38 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					return applycmd.ExitNotTTY
 				}
 				sample := quarantine.SessionDir(stateDir, work[0].path, time.Now())
-				fmt.Fprintf(stdout, "quarantining to %s (cap %.0f GB on the delta), then permanently deleting %.1f GB\n",
+				fmt.Fprintf(humanOut, "quarantining to %s (cap %.0f GB on the delta), then permanently deleting %.1f GB\n",
 					sample, capGB, float64(totalBytes)/(1<<30))
 				for _, w := range work {
-					fmt.Fprintf(stdout, "  discard %s\n", w.path)
+					fmt.Fprintf(humanOut, "  discard %s\n", w.path)
 				}
-				fmt.Fprint(stdout, "Proceed? [y/N] ")
+				fmt.Fprint(humanOut, "Proceed? [y/N] ")
 				var answer string
 				if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
-					fmt.Fprintln(stdout, "\ndeclined")
+					fmt.Fprintln(humanOut, "\ndeclined")
 					return ExitOK
 				}
 				answer = strings.ToLower(strings.TrimSpace(answer))
 				if answer != "y" && answer != "yes" {
-					fmt.Fprintln(stdout, "declined")
+					fmt.Fprintln(humanOut, "declined")
 					return ExitOK
 				}
 			}
 		} else {
 			// TTY guaranteed by the usage gate above.
-			fmt.Fprintln(stdout, "NO quarantine: dirty files, untracked files, ignored files, stashes, unpushed commits (branch and reflog-only), and jj changes will NOT be captured; deletion is UNRECOVERABLE")
+			fmt.Fprintln(humanOut, "NO quarantine: dirty files, untracked files, ignored files, stashes, unpushed commits (branch and reflog-only), and jj changes will NOT be captured; deletion is UNRECOVERABLE")
 			for _, w := range work {
-				fmt.Fprintf(stdout, "  discard %s (%.1f GB)\n", w.path, float64(w.size)/(1<<30))
+				fmt.Fprintf(humanOut, "  discard %s (%.1f GB)\n", w.path, float64(w.size)/(1<<30))
 			}
-			fmt.Fprint(stdout, "Proceed? [y/N] ")
+			fmt.Fprint(humanOut, "Proceed? [y/N] ")
 			var answer string
 			if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
-				fmt.Fprintln(stdout, "\ndeclined")
+				fmt.Fprintln(humanOut, "\ndeclined")
 				return ExitOK
 			}
 			answer = strings.ToLower(strings.TrimSpace(answer))
 			if answer != "y" && answer != "yes" {
-				fmt.Fprintln(stdout, "declined")
+				fmt.Fprintln(humanOut, "declined")
 				return ExitOK
 			}
 		}
@@ -674,9 +682,13 @@ func cmdDiscard(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		summary.FreeGain = freeAfter - freeBefore
 	}
 	if *asJSON {
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(summary)
+		// The R15 one-shape rule, extended to discard (the full-implementation
+		// board found the fourth emitter still hand-rolling: null lists on
+		// empties while plan/apply/scan emit []).
+		if err := summary.EmitJSON(stdout); err != nil {
+			fmt.Fprintf(stderr, "reap discard: %v\n", err)
+			return ExitState
+		}
 	} else {
 		// The two-number truth, derived from the deletion-set hardlink
 		// pass: hardlinked content shared within the set (zig lane caches)
@@ -925,7 +937,7 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 		if s.Manifest != nil {
 			r.Mode, r.Source, r.BaseRef, r.BaseSHA, r.Origin, r.RunID = s.Manifest.Mode, s.Manifest.Source, s.Manifest.BaseRef, s.Manifest.BaseSHA, s.Manifest.Origin, s.Manifest.RunID
 			r.SelfContained = &s.Manifest.SelfContained
-			r.State = string(quarantine.Revalidate(gr, s.Manifest))
+			r.State = string(quarantine.Revalidate(gr, s.Manifest, s.Dir))
 		}
 		if cfgErr == nil && age >= cfg.Thresholds.QuarantineRetentionD {
 			r.PastRetention = true
@@ -1010,6 +1022,12 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		fmt.Fprintf(stderr, "reap quarantine prune: %v\n", err)
 		return ExitState
 	}
+	// Under --json the plan/prompt lines route to stderr (defined early so the
+	// nothing-to-prune line follows the same rule).
+	pruneOut := io.Writer(stdout)
+	if *asJSON {
+		pruneOut = stderr
+	}
 	// apply.lock is held for the whole of apply, discard AND prune: a prune
 	// racing a discard must not delete the session that run just wrote.
 	lock, lerr := applycmd.Lock(stateDir, "prune")
@@ -1041,7 +1059,7 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		}
 		age := int(time.Since(fi.ModTime()).Hours() / 24)
 		size := quarantine.Bytes(s.Dir)
-		st := quarantine.Revalidate(gr, s.Manifest)
+		st := quarantine.Revalidate(gr, s.Manifest, s.Dir)
 		victims = append(victims, victim{dir: s.Dir, size: size, ageD: age, state: st})
 		totalBytes += size
 		if age > oldest {
@@ -1049,7 +1067,7 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 		}
 	}
 	if len(victims) == 0 {
-		fmt.Fprintln(stdout, "nothing to prune")
+		fmt.Fprintln(pruneOut, "nothing to prune")
 		return ExitOK
 	}
 	atRisk, unverified := false, false
@@ -1073,23 +1091,25 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 	} else if unverified {
 		warning = "recovery for these discards ends here; could not verify the base (offline?); if the base is gone, deleting ends recovery"
 	}
-	fmt.Fprintf(stdout, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s. Proceed? [y/N] ",
+	// The R15 stdout-purity rule, extended to prune (the full-implementation
+	// spec seat): under --json the plan line and prompt route to stderr.
+	fmt.Fprintf(pruneOut, "will delete %d bundle(s) (%.1f GB, oldest %dd): %s. Proceed? [y/N] ",
 		len(victims), float64(totalBytes)/(1<<30), oldest, warning)
 	if !*yes {
 		// Non-interactive prune must REFUSE (121), never EOF-decline to 0:
 		// "declined" in an agent context would read as nothing-to-do.
-		if !applycmd.IsTerminal(stdin, stdout) {
-			fmt.Fprintln(stdout, "")
+		if !applycmd.IsTerminal(stdin, pruneOut) {
+			fmt.Fprintln(pruneOut, "")
 			fmt.Fprintln(stderr, "reap quarantine prune deletes recovery bundles; pass --yes to confirm when not interactive")
 			return applycmd.ExitNotTTY
 		}
 		var answer string
 		if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
-			fmt.Fprintln(stdout, "\ndeclined")
+			fmt.Fprintln(pruneOut, "\ndeclined")
 			return ExitOK
 		}
 		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
-			fmt.Fprintln(stdout, "declined")
+			fmt.Fprintln(pruneOut, "declined")
 			return ExitOK
 		}
 	}
@@ -1112,7 +1132,10 @@ func quarantinePrune(stateDir string, args []string, stdout, stderr io.Writer, s
 	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
-		_ = enc.Encode(map[string]any{"pruned": pruned, "failed": failed, "bytes": totalBytes})
+		if err := enc.Encode(map[string]any{"pruned": pruned, "failed": failed, "bytes": totalBytes}); err != nil {
+			fmt.Fprintf(stderr, "reap quarantine prune: %v\n", err)
+			return ExitState
+		}
 		return exit
 	}
 	fmt.Fprintf(stdout, "pruned %d session(s)\n", pruned)
@@ -1186,9 +1209,18 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 	if dest == "" {
 		dest = m.Source
 	}
-	// Recovery never overwrites: a non-empty destination names what is there.
+	// Recovery never overwrites: a non-empty destination names what is there
+	// (the full-implementation spec nit: entries themselves, up to five).
 	if entries, rerr := os.ReadDir(dest); rerr == nil && len(entries) > 0 {
-		fmt.Fprintf(stderr, "reap quarantine restore: %s exists and is non-empty (recovery never deletes or overwrites; contents: %d entries)\n", dest, len(entries))
+		names := make([]string, 0, len(entries))
+		for i, e := range entries {
+			if i == 5 {
+				names = append(names, fmt.Sprintf("... +%d more", len(entries)-5))
+				break
+			}
+			names = append(names, e.Name())
+		}
+		fmt.Fprintf(stderr, "reap quarantine restore: %s exists and is non-empty (recovery never deletes or overwrites; contains: %s)\n", dest, strings.Join(names, ", "))
 		return ExitUsage
 	}
 	if m.Mode == "plain-copy" {

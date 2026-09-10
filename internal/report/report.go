@@ -103,6 +103,9 @@ type ScanReport struct {
 	Excluded        int           `json:"excludedBelowMinGB"`
 	UnreadableRoots []string      `json:"unreadableRoots"`
 	Totals          Totals        `json:"totals"`
+	// HoldsExpireInDays (presentation-only, json:"-"): days until the
+	// earliest active hold lapses, for the KEEP subtitle's expiry detail.
+	HoldsExpireInDays int `json:"-"`
 }
 
 func gb(b int64) float64 { return float64(b) / (1 << 30) }
@@ -198,6 +201,10 @@ func (r *ScanReport) Table(w io.Writer) {
 	fmt.Fprintf(w, "roots: %-60s %d dirs, %.1f GB logical\n\n",
 		strings.Join(rootPaths(r.Roots), " "), int(totalDirs), totalGB)
 
+	keepSub := "held or protected"
+	if r.HoldsExpireInDays > 0 {
+		keepSub = fmt.Sprintf("held or protected (holds expire in %dd)", r.HoldsExpireInDays)
+	}
 	sections := []struct {
 		name, subtitle string
 		entries        []Entry
@@ -205,7 +212,7 @@ func (r *ScanReport) Table(w io.Writer) {
 		{"ACTIVE", "touched <48h; nothing to decide", r.of("ACTIVE")},
 		{"BLOCKED", "waiting on you: push or discard", r.of("BLOCKED")},
 		{"MANUAL", "judgment calls (run reap plan --include <code> to widen)", r.of("MANUAL")},
-		{"KEEP", "held or protected", r.of("KEEP")},
+		{"KEEP", keepSub, r.of("KEEP")},
 		{"SAFE", "ready to reap: reap plan, then reap apply", r.of("SAFE")},
 	}
 	for _, s := range sections {
@@ -216,7 +223,7 @@ func (r *ScanReport) Table(w io.Writer) {
 		for _, e := range s.entries {
 			sizeGB += gb(e.SizeBytes)
 		}
-		fmt.Fprintf(w, "%-7s %d dirs %6.1f GB   %s\n", s.name, len(s.entries), sizeGB, dim(s.subtitle))
+		fmt.Fprintf(w, "%-7s %d dirs %6.1f GB   %s\n", s.name, len(s.entries), sizeGB, Dim(s.subtitle))
 		shown := s.entries
 		if len(shown) > maxRowsPerSection {
 			shown = shown[:maxRowsPerSection]
@@ -235,20 +242,20 @@ func (r *ScanReport) Table(w io.Writer) {
 				if e.LastIncoda.Reason != "" {
 					last += fmt.Sprintf(", %q", e.LastIncoda.Reason)
 				}
-				fmt.Fprintf(w, "         %s\n", dim("last: "+last))
+				fmt.Fprintf(w, "         %s\n", Dim("last: "+last))
 			} else if s.name == "ACTIVE" || s.name == "BLOCKED" || s.name == "MANUAL" {
-				fmt.Fprintf(w, "         %s\n", dim("last: no incoda record"))
+				fmt.Fprintf(w, "         %s\n", Dim("last: no incoda record"))
 			}
 			if e.Hint != "" && (s.name == "BLOCKED" || s.name == "MANUAL") {
-				fmt.Fprintf(w, "         %s\n", dim("hint: "+e.Hint))
+				fmt.Fprintf(w, "         %s\n", Dim("hint: "+e.Hint))
 			}
 		}
 		if rest := len(s.entries) - len(shown); rest > 0 {
-			fmt.Fprintf(w, "  %s\n", dim(fmt.Sprintf("+%d more, use --json", rest)))
+			fmt.Fprintf(w, "  %s\n", Dim(fmt.Sprintf("+%d more, use --json", rest)))
 		}
 		fmt.Fprintln(w)
 	}
-	fmt.Fprintf(w, "%s\n", dim("sizes are logical; hardlinked content may reclaim less (zig lane cache shares bytes)"))
+	fmt.Fprintf(w, "%s\n", Dim("sizes are logical; hardlinked content may reclaim less (zig lane cache shares bytes)"))
 	// Per-reason breakdown in the printed totals too: bucket inflation (one
 	// row quietly owning half of MANUAL) must be visible to the human at the
 	// screen, not only to agents reading --json.
@@ -256,10 +263,10 @@ func (r *ScanReport) Table(w io.Writer) {
 		fmt.Fprintf(w, "%7.1f GB  %-24s %d dirs\n", bt.SizeGB, bt.Code, bt.Dirs)
 	}
 	if r.Totals.Errors > 0 {
-		fmt.Fprintf(w, "%s\n", dim(fmt.Sprintf("%d dirs had walk errors (see sizePartial entries)", r.Totals.Errors)))
+		fmt.Fprintf(w, "%s\n", Dim(fmt.Sprintf("%d dirs had walk errors (see sizePartial entries)", r.Totals.Errors)))
 	}
 	if r.Excluded > 0 {
-		fmt.Fprintf(w, "%s\n", dim(fmt.Sprintf("%d dirs below --min-gb excluded from this listing (totals count them)", r.Excluded)))
+		fmt.Fprintf(w, "%s\n", Dim(fmt.Sprintf("%d dirs below --min-gb excluded from this listing (totals count them)", r.Excluded)))
 	}
 }
 
@@ -297,6 +304,7 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// dim marks de-emphasized text. Color policy (NO_COLOR etc.) is the CLI's
-// concern; the renderer emits plain markers the CLI can substitute.
-func dim(s string) string { return s }
+// Dim is the de-emphasis styler: identity unless the CLI enables ANSI
+// dimming (stdout is a terminal and NO_COLOR is unset - the spec's color
+// rule; piped and test output stays plain, so byte-pins are stable).
+var Dim = func(s string) string { return s }

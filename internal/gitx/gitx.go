@@ -201,16 +201,6 @@ func (r Runner) FetchPrune(dir string) error {
 	return err
 }
 
-// WorktreeRemove deregisters and deletes a linked worktree (apply path).
-// Run FROM THE PARENT: `git -C <worktree> worktree remove <worktree>` makes
-// the doomed worktree git's own cwd, so git deregisters it and then
-// reliably fails to delete the tree (Windows refuses to remove a process's
-// cwd)  -  the round-1 probe caught the apply path always falling through to
-// rm believing deregistration failed.
-func (r Runner) WorktreeRemove(dir string) error {
-	return r.WorktreeRemoveFrom(dir, dir)
-}
-
 // WorktreeRemoveFrom runs the removal with cwd = the surviving parent.
 func (r Runner) WorktreeRemoveFrom(dir, from string) error {
 	_, err := r.run(from, r.GitBudget, "worktree", "remove", "--force", dir)

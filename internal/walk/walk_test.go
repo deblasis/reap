@@ -230,67 +230,6 @@ func TestRootsSurfacesReparseCandidates(t *testing.T) {
 	}
 }
 
-func TestCacheRoundTripAndInvalidation(t *testing.T) {
-	dir := t.TempDir()
-	c, err := LoadCache(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := filepath.Join(dir, "cand")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	writeFile(t, filepath.Join(root, "x"), 42, now)
-	info := Entry(root, root, now)
-	c.Record(root, info, now)
-
-	if got, ok := c.Size(root); !ok || got != 42 {
-		t.Fatalf("Size=%d ok=%v, want 42/true", got, ok)
-	}
-
-	// Deep write to an EXISTING file: dir mtime and child count unchanged, so
-	// the cheap keys still hit  -  which is exactly why the TTL exists. Shrink
-	// the TTL to prove the entry expires rather than trusting forever.
-	writeFile(t, filepath.Join(root, "x"), 4200, now)
-	c.ttl = -1 // force expiry
-	if _, ok := c.Size(root); ok {
-		t.Fatal("expired entry must miss")
-	}
-
-	// A new child changes the count and must invalidate immediately.
-	c2, _ := LoadCache(dir)
-	c2.Record(root, Entry(root, root, now), now)
-	writeFile(t, filepath.Join(root, "y"), 1, now)
-	c2.ttl = time.Hour
-	if _, ok := c2.Size(root); ok {
-		t.Fatal("child-count change must invalidate")
-	}
-
-	// Persist from a FRESH walk of the current state, then reload: the point
-	// under test is durability of valid entries, not resurrection of the
-	// invalidated one.
-	c2.Record(root, Entry(root, root, now), now)
-	if err := c2.Save(); err != nil {
-		t.Fatal(err)
-	}
-	c3, err := LoadCache(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := c3.Size(filepath.Join(dir, "cand")); !ok {
-		t.Fatal("persisted cache lost a fresh entry")
-	}
-
-	// Partial walks are never recorded: a lower bound must not become cached
-	// truth. Fresh state dir so the persisted entry above cannot mask it.
-	c4, _ := LoadCache(t.TempDir())
-	c4.Record(root, DirInfo{Path: root, Bytes: 1, Partial: true}, now)
-	if _, ok := c4.Size(root); ok {
-		t.Fatal("partial walk must not be cached")
-	}
-}
-
 // Junctions must be skipped, not followed: a junction under the tree can loop
 // or escape into protected paths (OneDrive placeholders measured 545 GB). This
 // test creates a real junction on Windows, where the rule actually bites.

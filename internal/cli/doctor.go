@@ -71,7 +71,7 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  bundle %s: unverified (no manifest; verify with git bundle verify before trusting)\n", filepath.Base(s.Dir))
 			continue
 		}
-		st := string(quarantine.Revalidate(gr, s.Manifest))
+		st := string(quarantine.Revalidate(gr, s.Manifest, s.Dir))
 		states[st]++
 		fmt.Fprintf(stdout, "  bundle %s: %s\n", filepath.Base(s.Dir), st)
 	}

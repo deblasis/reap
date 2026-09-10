@@ -827,16 +827,16 @@ func TestRevalidateStates(t *testing.T) {
 	gr := gitx.Runner{GitBudget: 30 * time.Second, FetchBudget: 30 * time.Second}
 	tip := gitRun(t, bare, "rev-parse", "HEAD")
 
-	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: bare}); v != VerifiedOK {
+	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: bare}, ""); v != VerifiedOK {
 		t.Fatalf("advertised base: %v", v)
 	}
-	if v := Revalidate(gr, &Manifest{BaseSHA: strings.Repeat("0", 40), Origin: bare}); v != AtRisk {
+	if v := Revalidate(gr, &Manifest{BaseSHA: strings.Repeat("0", 40), Origin: bare}, ""); v != AtRisk {
 		t.Fatalf("gone base: %v", v)
 	}
-	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: filepath.Join(base, "no-such-remote.git")}); v != Unverified {
+	if v := Revalidate(gr, &Manifest{BaseSHA: tip, Origin: filepath.Join(base, "no-such-remote.git")}, ""); v != Unverified {
 		t.Fatalf("unreachable remote: %v", v)
 	}
-	if v := Revalidate(gr, &Manifest{SelfContained: true}); v != VerifiedOK {
+	if v := Revalidate(gr, &Manifest{SelfContained: true}, ""); v != VerifiedOK {
 		t.Fatalf("self-contained: %v", v)
 	}
 }
@@ -872,5 +872,46 @@ func TestSnapshotEmptyDirsRelative(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("empty dir not recorded: %v", m.EmptyDirs)
+	}
+}
+
+// A truncated self-contained bundle must revalidate as UNVERIFIED, never
+// verified-ok (the full-implementation reliability seat: recovery IS the
+// bundle; a corrupt one listed verified-ok and restore died on a raw
+// index-pack error).
+func TestRevalidateTruncatedBundleIsUnverified(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "r")
+	if out, err := exec.Command("git", "-C", base, "init", "-q", "-b", "main", "r").CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "one"}} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v %s", args, err, out)
+		}
+	}
+	sess := filepath.Join(base, "sess")
+	os.MkdirAll(sess, 0o755)
+	bundle := filepath.Join(sess, "bundle.git")
+	if out, err := exec.Command("git", "-C", repo, "bundle", "create", bundle, "--all").CombinedOutput(); err != nil {
+		t.Skipf("bundle create: %v %s", err, out)
+	}
+	gr := gitx.Runner{GitBudget: 15 * time.Second, FetchBudget: 15 * time.Second}
+	m := &Manifest{SelfContained: true, Mode: "bundle"}
+	if v := Revalidate(gr, m, sess); v != VerifiedOK {
+		t.Fatalf("intact self-contained bundle: %v, want verified-ok", v)
+	}
+	raw, err := os.ReadFile(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle, raw[:len(raw)/3], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v := Revalidate(gr, m, sess); v != Unverified {
+		t.Fatalf("truncated bundle: %v, want unverified (never verified-ok)", v)
 	}
 }

@@ -759,7 +759,7 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 			return "worktree-remove", nil
 		}
 		// Fall through to rm; prune the stale registration after.
-		if err := removeContentsBeforeVCS(path); err != nil {
+		if err := RemoveContents(path); err != nil {
 			return mode, err
 		}
 		_ = d.Git.WorktreePrune(classInfo.ParentRepo)
@@ -776,7 +776,7 @@ func Delete(path string, classInfo classify.Info, d Deleter) (mode string, err e
 		}
 		mode = "jj-forget+rm"
 	}
-	if err := removeContentsBeforeVCS(path); err != nil {
+	if err := RemoveContents(path); err != nil {
 		return mode, err
 	}
 	return mode, nil
@@ -795,6 +795,12 @@ func workspaceName(parent, path string, jr jjx.Runner) string {
 	}
 	return filepath.Base(path)
 }
+
+// RemoveContents is the exported seam over removeContentsBeforeVCS: tests
+// inject a deletion failure to pin the 124 band deterministically (real
+// fault injection - ACL denies - is token-elevation-dependent; the R17
+// reliability seat live-proved the real path).
+var RemoveContents = removeContentsBeforeVCS
 
 // removeContentsBeforeVCS deletes everything except the VCS metadata first,
 // then the metadata: a partial failure preserves history and reflog  -  the

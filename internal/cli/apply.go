@@ -346,6 +346,12 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			SizeBytes: c.entry.SizeBytes, Widened: widened, Kind: string(c.cls.Kind),
 			ParentRepo: c.cls.ParentRepo, Orphaned: c.vd.OrphanedCarveOut,
 		}
+		// A ROOT repo's classify ParentRepo can be the repo itself (the jj -R
+		// default-workspace shape): a self-referential parentRepoPath is noise
+		// in plan --json (the full-implementation eng nit).
+		if pe.ParentRepo != "" && config.Canonical(pe.ParentRepo) == config.Canonical(c.entry.Path) {
+			pe.ParentRepo = ""
+		}
 		if c.vd.OrphanedCarveOut && c.vd.BlockedClassFact != "" {
 			pe.OrphanCounts = c.vd.BlockedClassFact
 		}
@@ -681,7 +687,10 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	if len(plan) == 0 && !*dryRun {
 		if *asJSON {
 			s := applycmd.Summary{ExcludedBelow: below, ExcludedCodes: byCode, ExcludedBytes: sumExcluded(below)}
-			_ = s.EmitJSON(stdout)
+			if err := s.EmitJSON(stdout); err != nil {
+				fmt.Fprintf(stderr, "reap apply: %v\n", err)
+				return ExitState
+			}
 		} else {
 			fmt.Fprintln(stdout, "nothing to delete (0 planned)")
 		}
@@ -792,6 +801,12 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 
 	freshHolds := applycmd.ReadHoldsSnapshot(stateDir)
+	// Belt for the R17 reliability major: even with the loader fixed to
+	// return initialized maps, the merge itself must never be able to
+	// panic on a nil destination regardless of how core was built.
+	if core.holds == nil {
+		core.holds = map[string]bool{}
+	}
 	for h := range freshHolds {
 		core.holds[h] = true
 	}
@@ -1227,7 +1242,10 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			len(below), float64(sumExcluded(below))/(1<<30),
 			len(summary.Skipped), float64(summary.SkippedBytes)/(1<<30), summarizeSkips(summary.Skipped))
 	} else {
-		_ = summary.EmitJSON(stdout)
+		if err := summary.EmitJSON(stdout); err != nil {
+			fmt.Fprintf(stderr, "reap apply: %v\n", err)
+			return ExitState
+		}
 	}
 	if carveOutFailed {
 		// A confirmed carve-out whose quarantine write failed is a
@@ -1411,7 +1429,7 @@ func cmdHold(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hold", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	forStr := fs.String("for", "720h", "hold duration (Go duration; default 30d)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
@@ -1448,7 +1466,7 @@ func cmdHold(args []string, stdout, stderr io.Writer) int {
 func cmdUnhold(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("unhold", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil {
 		return ExitUsage
 	}
 	if fs.NArg() != 1 {
@@ -1480,7 +1498,14 @@ func cmdUnhold(args []string, stdout, stderr io.Writer) int {
 
 func cmdHolds(args []string, stdout, stderr io.Writer) int {
 	stateDir, _ := config.StateDir()
-	hf := applycmd.ReadHoldsSnapshot(stateDir)
+	// STRICT read (the full-implementation eng seat): a corrupt holds.json
+	// must not render "no holds" - the human checking why a dir was deleted
+	// would see zero pins where scan/apply/hold refuse loudly.
+	hf, err := applycmd.ReadHoldsSnapshotStrict(stateDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap holds: %v\n", err)
+		return ExitState
+	}
 	asJSON := hasFlag(args, "--json")
 	now := time.Now()
 	if asJSON {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/deblasis/reap/internal/applycmd"
 	"github.com/deblasis/reap/internal/classify"
 	"github.com/deblasis/reap/internal/config"
 	"github.com/deblasis/reap/internal/dedupe"
@@ -63,6 +64,17 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	}
 
 	now := time.Now()
+
+	// De-emphasis styling (the spec's color rule): ANSI dim only when stdout
+	// is a character device and NO_COLOR is unset - piped and test output
+	// stays plain, so every byte-pinned render is stable.
+	if os.Getenv("NO_COLOR") == "" {
+		if f, ok := stdout.(*os.File); ok {
+			if fi, err := f.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+				report.Dim = func(s string) string { return "\x1b[2m" + s + "\x1b[0m" }
+			}
+		}
+	}
 
 	// One gh call for the whole run (two-phase inside, bounded), before any
 	// verdict: an unavailable set routes every dependent dir to
@@ -196,6 +208,19 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	}
 	rep := report.Build(now, rootSummaries, entries, *minGB)
 	rep.UnreadableRoots = unreadableRoots
+	// The KEEP subtitle's expiry detail: days until the earliest active hold
+	// lapses (presentation-only; strict read failure already failed the scan).
+	if hf, herr := applycmd.ReadHoldsSnapshotStrict(stateDir); herr == nil {
+		var earliest time.Time
+		for _, exp := range hf {
+			if exp.After(now) && (earliest.IsZero() || exp.Before(earliest)) {
+				earliest = exp
+			}
+		}
+		if !earliest.IsZero() {
+			rep.HoldsExpireInDays = int(time.Until(earliest).Hours() / 24)
+		}
+	}
 	for range unreadableRoots {
 		rep.Totals.Errors++
 	}
@@ -249,7 +274,7 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
-		fmt.Fprintf(stdout, "quarantine holds %d MB, oldest %dd (reap quarantine prune)\n", total>>20, oldest)
+		fmt.Fprintf(stdout, "quarantine holds %.1f GB, oldest %dd (reap quarantine prune)\n", float64(total)/(1<<30), oldest)
 	}
 	return ExitOK
 }
@@ -627,7 +652,12 @@ func loadHolds(stateDir string) (map[string]bool, error) {
 func loadHoldsWithExpired(stateDir string) (map[string]bool, map[string]time.Time, error) {
 	raw, err := os.ReadFile(filepath.Join(stateDir, "holds.json"))
 	if os.IsNotExist(err) {
-		return nil, nil, nil
+		// INITIALIZED maps, never nil (the R17 reliability major): a fresh
+		// state dir has no holds.json, and the under-lock merge in cmdApply
+		// WRITES into the scan-time map (`core.holds[h] = true`) - a nil
+		// map there panicked exactly when the first-ever hold landed in the
+		// confirm window, voiding the sanctioned 122 abort + envelope.
+		return map[string]bool{}, map[string]time.Time{}, nil
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("read holds.json: %w", err)
