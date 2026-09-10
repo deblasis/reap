@@ -457,6 +457,13 @@ func TestCaptureRestoresOpHeadsDirMtime(t *testing.T) {
 	if out, err := exec.Command("jj", "-R", dir, "st").CombinedOutput(); err != nil {
 		t.Skipf("jj st: %v %s", err, out)
 	}
+	// Backdate the dir BEFORE capture (round 16; the R15 board's robustness
+	// nit): the op's freshening then ALWAYS differs from the recorded value,
+	// so the pin cannot self-skip on an mtime-granularity coincidence.
+	backdated := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(heads, backdated, backdated); err != nil {
+		t.Fatal(err)
+	}
 	before, err := os.Stat(heads)
 	if err != nil {
 		t.Fatal(err)
@@ -473,7 +480,7 @@ func TestCaptureRestoresOpHeadsDirMtime(t *testing.T) {
 	}
 	mid, _ := os.Stat(heads)
 	if mid.ModTime() == before.ModTime() {
-		t.Skip("op_heads/heads dir mtime did not change across the op (fs granularity)")
+		t.Fatal("op_heads/heads dir mtime did not change across the op despite the backdate")
 	}
 	restore()
 	after, err := os.Stat(heads)
@@ -482,5 +489,53 @@ func TestCaptureRestoresOpHeadsDirMtime(t *testing.T) {
 	}
 	if after.ModTime() != before.ModTime() {
 		t.Fatalf("op_heads/heads DIR mtime not restored: before=%v after=%v (the mixed-family over-refusal channel is open)", before.ModTime(), after.ModTime())
+	}
+}
+
+// The created-DIRECTORY clamp pin (round 16; the R15 board found the layer
+// shipped unpinned - reverting it left the whole suite green). A directory
+// minted INSIDE the capture window must come out of the restore clamped to
+// the tree's pre-scan freshest mtime: a fresh dir mtime is exactly what
+// opRecency-style readers mistake for jj activity.
+func TestCaptureClampsCreatedDirs(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not on PATH")
+	}
+	dir := t.TempDir()
+	if out, err := exec.Command("jj", "git", "init", "--colocate", dir).CombinedOutput(); err != nil {
+		t.Skipf("jj init: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			os.Chtimes(p, old, old)
+		}
+		return nil
+	})
+	// preScanNewest: one pre-existing file a bit fresher than the rest -
+	// the clamp target the restore pass must use.
+	preScan := old.Add(1 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "f.txt"), preScan, preScan); err != nil {
+		t.Fatal(err)
+	}
+	restore := captureOpHeads(dir)
+	created := filepath.Join(dir, ".jj", "created-by-snapshot")
+	if err := os.MkdirAll(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(created, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // let the fs clock advance past captureAt
+	restore()
+	fi, err := os.Stat(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().After(preScan) {
+		t.Fatalf("created dir not clamped: mtime %v > pre-scan newest %v (a fresh dir mtime reads as phantom jj activity)", fi.ModTime(), preScan)
 	}
 }

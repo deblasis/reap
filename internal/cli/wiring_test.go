@@ -2670,6 +2670,20 @@ func TestWiringBothCleanFamilyUnlockMixed(t *testing.T) {
 	if out, err := exec.Command("git", "-C", parent, "worktree", "add", "--detach", "-q", wt).CombinedOutput(); err != nil {
 		t.Skipf("worktree add: %v %s", err, out)
 	}
+	// ARMED (round 16; the R15 board's eng seat root-caused the R14b
+	// vacuity: the claimed arming never landed in the tree): the worktree
+	// child pushes a NEW branch via plain git BEFORE ageing. The parent's
+	// jj has never seen it (the push bypassed jj entirely), so the
+	// fixture-time fetch materializes a ref that is still UN-IMPORTED at
+	// reap's scan - the scan-time snapshot imports it, writes an op, and
+	// freshens op_heads/heads. Red-first matrix (git-diff-verified reverts
+	// on a clone carrying this tree): BOTH dir layers reverted -> this pin
+	// FAILS (the channel is armed); the R15 dirs-clamp alone reverted ->
+	// this pin stays GREEN (the R13 restore covers the channel alone -
+	// defense in depth, redundancy proven in both directions).
+	if out, err := exec.Command("git", "-C", wt, "push", "-q", "origin", "HEAD:refs/heads/armed-branch").CombinedOutput(); err != nil {
+		t.Skipf("arm worktree push: %v %s", err, out)
+	}
 	ageTree(t, parent, 30*24*time.Hour)
 	ageTree(t, wt, 30*24*time.Hour)
 	exec.Command("git", "-C", parent, "fetch", "-q", "origin").CombinedOutput()

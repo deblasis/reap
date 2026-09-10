@@ -123,6 +123,17 @@ func (s *Summary) CoerceEmptyLists() {
 	}
 }
 
+// EmitJSON is the one Summary serializer (round 16; the R15 board's symmetry
+// nit): it coerces the empty lists itself, so a future emit site cannot
+// forget and reintroduce null lists - the same self-coercing shape
+// report.ScanReport.JSON uses.
+func (s Summary) EmitJSON(w io.Writer) error {
+	s.CoerceEmptyLists()
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(s)
+}
+
 // ExcludedRef is a below-floor path kept out of the plan (never a skip).
 type ExcludedRef struct {
 	Path string `json:"path"`

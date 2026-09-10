@@ -555,8 +555,12 @@ func cmdPlan(args []string, stdout, stderr io.Writer) int {
 	cands, _ := core.run(now)
 	plan, below, byCodeExcl, err := resolvePlan(cands, include, exclude, nil, *minGB, false)
 	if err == nil {
-		if dropped := droppedWidenings(cands, include, nil, plan, below, byCodeExcl); len(dropped) > 0 {
-			for _, d := range dropped {
+		refusals, notes := droppedWidenings(cands, include, nil, plan, below, byCodeExcl)
+		for _, n := range notes {
+			fmt.Fprintf(stderr, "reap plan: %s\n", n)
+		}
+		if len(refusals) > 0 {
+			for _, d := range refusals {
 				fmt.Fprintf(stderr, "reap plan: %s\n", d)
 			}
 			return ExitUsage
@@ -614,12 +618,24 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		}
 		return applycmd.ExitRootMissing
 	}
+	// Under --json, stdout carries ONLY the schema document: every human
+	// line (plan echo, preflight, prompts, declines) routes to stderr
+	// (round 15; the executed branch prefixed two text lines onto the JSON).
+	// On a live TTY stderr is the same screen, so the interactive flow is
+	// unchanged; IsTerminal's both-streams check keeps its meaning because
+	// stderr is as much a real terminal as stdout there. Defined BEFORE the
+	// carve-out gate so every TTY decision and prompt keys on the SAME
+	// stream (round 16; the R15 board's stream-consistency nit).
+	humanOut := io.Writer(stdout)
+	if *asJSON {
+		humanOut = stderr
+	}
 	plan, below, byCode, err := resolvePlan(cands, include, exclude, overrideManual, *minGB, false)
 	carveOutActive := false
 	if err != nil {
 		var co *carveOutRefusal
 		if errors.As(err, &co) {
-			if !applycmd.IsTerminal(stdin, stdout) {
+			if !applycmd.IsTerminal(stdin, humanOut) {
 				// Agents are barred from the carve-out: the hardened
 				// confirm is TTY-only, --yes does not unlock it, and the
 				// non-TTY band is 121 regardless of --yes (spec: 'non-TTY
@@ -643,9 +659,14 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// The refusal pass: a --override-manual path (or --include code) that
 	// matched a candidate but was not taken is a NAMED error carrying the
 	// shadowed fact  -  never a silent drop that prints "0 directories" and
-	// exits 0 (the round-6 spec finding).
-	if dropped := droppedWidenings(cands, include, overrideManual, plan, below, byCode); len(dropped) > 0 {
-		for _, d := range dropped {
+	// exits 0 (the round-6 spec finding). Railed siblings of an include that
+	// DID plan rows are notes (round 16), not refusals.
+	dwRefusals, dwNotes := droppedWidenings(cands, include, overrideManual, plan, below, byCode)
+	for _, n := range dwNotes {
+		fmt.Fprintf(stderr, "reap apply: %s\n", n)
+	}
+	if len(dwRefusals) > 0 {
+		for _, d := range dwRefusals {
 			fmt.Fprintf(stderr, "reap apply: %s\n", d)
 		}
 		return ExitUsage
@@ -660,10 +681,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	if len(plan) == 0 && !*dryRun {
 		if *asJSON {
 			s := applycmd.Summary{ExcludedBelow: below, ExcludedCodes: byCode, ExcludedBytes: sumExcluded(below)}
-			s.CoerceEmptyLists()
-			enc := json.NewEncoder(stdout)
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(s)
+			_ = s.EmitJSON(stdout)
 		} else {
 			fmt.Fprintln(stdout, "nothing to delete (0 planned)")
 		}
@@ -680,16 +698,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitOK
 	}
 
-	// Under --json, stdout carries ONLY the schema document: every human
-	// line (plan echo, preflight, prompts, declines) routes to stderr
-	// (round 15; the executed branch prefixed two text lines onto the JSON).
-	// On a live TTY stderr is the same screen, so the interactive flow is
-	// unchanged; IsTerminal's both-streams check keeps its meaning because
-	// stderr is as much a real terminal as stdout there.
-	humanOut := io.Writer(stdout)
-	if *asJSON {
-		humanOut = stderr
-	}
+	// Under --json, stdout carries ONLY the schema document (humanOut, defined
+	// at the carve-out gate above, holds this rule for the whole run).
 
 	// Preflight floor: a refusal, not a print. Carve-out runs raise the
 	// floor to cap x margin (the spec: a confirmed snapshot is never
@@ -832,7 +842,8 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		candCanon[c.entry.Path] = config.Canonical(c.entry.Path)
 	}
 	summary := applycmd.Summary{RunID: runID, Planned: pathsOf(plan),
-		Widened: widenedPaths(plan), ExcludedBelow: below, ExcludedCodes: byCode}
+		Widened: widenedPaths(plan), ExcludedBelow: below, ExcludedCodes: byCode,
+		ExcludedBytes: sumExcluded(below)}
 	// The envelope is written on EVERY exit path from here (deferred):
 	// aborts mid-run leave an auditable session record.
 	defer func() {
@@ -1216,10 +1227,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			len(below), float64(sumExcluded(below))/(1<<30),
 			len(summary.Skipped), float64(summary.SkippedBytes)/(1<<30), summarizeSkips(summary.Skipped))
 	} else {
-		summary.CoerceEmptyLists()
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(summary)
+		_ = summary.EmitJSON(stdout)
 	}
 	if carveOutFailed {
 		// A confirmed carve-out whose quarantine write failed is a
@@ -1241,10 +1249,26 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 // --exclude) are NOT refusals (they are the excluded buckets), and neither
 // are SAFE rows given as override paths (already deletable, nothing widened
 // was needed).
-func droppedWidenings(cands []candidate, include, overrideManual []string, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string) []string {
+//
+// Round 16 scoping (the R15 board's reliability seat, live A/B): the usage
+// error fires only when the include code matched ONLY non-deletable rows
+// (the spec's own wording). When the code ALSO planned deletable rows, a
+// railed sibling carrying it is a NOTE (the run proceeds; the sibling is
+// named so the operator sees it was skipped) - the round-15 association
+// briefly over-refused sanctioned mixed runs. The match keys on the
+// PRE-RAIL code when a rail rewrote the row, and on the ACTIVE FAMILY by
+// verdict class so `--include active` reaches incoda-live/jj-active
+// carriers (the sibling-code gap).
+func droppedWidenings(cands []candidate, include, overrideManual []string, plan []applycmd.PlanEntry, below []applycmd.ExcludedRef, excludedByCode []string) (refusals, notes []string) {
 	planned := map[string]bool{}
 	for _, p := range plan {
 		planned[config.Canonical(p.Path)] = true
+	}
+	// usedCodes: the include codes that actually planned rows (the same
+	// used-flag resolvePlan computes for its own end-pass).
+	usedCodes := map[string]bool{}
+	for _, p := range plan {
+		usedCodes[p.Code] = true
 	}
 	excluded := map[string]bool{}
 	for _, b := range below {
@@ -1261,7 +1285,6 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 	for _, p := range overrideManual {
 		ovr[config.Canonical(p)] = true
 	}
-	var out []string
 	for _, c := range cands {
 		cp := config.Canonical(c.entry.Path)
 		if excluded[cp] {
@@ -1272,25 +1295,52 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 			fact += " (shadowed fact: " + c.vd.BlockedClassFact + ")"
 		}
 		if ovr[cp] && !planned[cp] && c.vd.Verdict != verdict.Safe {
-			out = append(out, fmt.Sprintf("%s: not override-eligible: %s", c.entry.Path, fact))
+			refusals = append(refusals, fmt.Sprintf("%s: not override-eligible: %s", c.entry.Path, fact))
 		}
-		// --include of a code that matched this candidate but produced no
-		// planned row: refuse naming the row  -  INCLUDING the shadowed case
-		// (the displayed code differs from the include code; the BLOCKED
-		// fact still rides this candidate). The match keys on the PRE-RAIL
-		// code when a rail rewrote the row (round 15 closed the M3-recorded
-		// swallowed-code silent zero; the old shapeCode recovery covered
-		// orphan kinds only): a held/active/incoda-live row still matches
-		// --include of the judgment code it would carry without the rail.
+		// The match: the PRE-RAIL code when a rail rewrote the row (round 15
+		// closed the M3-recorded swallowed-code silent zero; the old
+		// shapeCode recovery covered orphan kinds only), the displayed code,
+		// or - for ACTIVE-family include codes - the verdict class:
+		// active/incoda-live/jj-active/scratch-fresh are four spellings of
+		// "not deletable now", and a sibling spelling must not dodge the
+		// named refusal. (ACTIVE rows can never plan, so the family arm is
+		// always a refusal, never a note.)
 		matchCode := c.vd.Code
 		if c.vd.PreRailCode != "" {
 			matchCode = c.vd.PreRailCode
 		}
-		if inc[matchCode] && !planned[cp] {
-			out = append(out, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, matchCode, fact))
+		displayed := c.vd.Code
+		matched := inc[matchCode] || inc[displayed] ||
+			(isActiveFamilyCode(displayed) && c.vd.Verdict == verdict.Active && inc[activeFamilyCode(displayed)])
+		if !matched || planned[cp] {
+			continue
 		}
+		if usedCodes[matchCode] || usedCodes[displayed] {
+			notes = append(notes, fmt.Sprintf("note: %s: also carries code %s but is not deletable this run: %s", c.entry.Path, matchCode, fact))
+			continue
+		}
+		refusals = append(refusals, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, matchCode, fact))
 	}
-	return out
+	return refusals, notes
+}
+
+// isActiveFamilyCode reports whether the code is one of the ACTIVE verdict's
+// spellings (rail rows that display a sibling code).
+func isActiveFamilyCode(code string) bool {
+	switch code {
+	case "active", "incoda-live", "jj-active", "scratch-fresh":
+		return true
+	}
+	return false
+}
+
+// activeFamilyCode maps a family spelling to the canonical include spelling
+// ("active"); "" for non-family codes.
+func activeFamilyCode(code string) string {
+	if isActiveFamilyCode(code) {
+		return "active"
+	}
+	return ""
 }
 
 // countsFor is the carve-out's counts line, flavor-aware: the
