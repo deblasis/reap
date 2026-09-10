@@ -71,8 +71,12 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  bundle %s: unverified (no manifest; verify with git bundle verify before trusting)\n", filepath.Base(s.Dir))
 			continue
 		}
-		st := string(quarantine.Revalidate(gr, s.Manifest, s.Dir))
-		states[st]++
+		stV, stCause := quarantine.RevalidateWithCause(gr, s.Manifest, s.Dir)
+		st := string(stV)
+		if stV == quarantine.Unverified && stCause == quarantine.CauseBundle {
+			st = "unverified (bundle corrupt/unreadable)"
+		}
+		states[string(stV)]++
 		fmt.Fprintf(stdout, "  bundle %s: %s\n", filepath.Base(s.Dir), st)
 	}
 	fmt.Fprintf(stdout, "quarantine revalidation: %d verified-ok, %d at-risk, %d unverified\n",

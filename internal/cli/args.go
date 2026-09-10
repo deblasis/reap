@@ -17,7 +17,15 @@ func flagsFirst(args []string) []string {
 	var flags, positional []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if strings.HasPrefix(a, "-") && a != "-" && a != "--" {
+		if a == "--" {
+			// The terminator is a HARD positional boundary (the verification
+			// spec seat: hoisting tokens past it made dash-leading paths
+			// unholdable): everything after -- stays positional, in order.
+			positional = append(positional, args[i+1:]...)
+			out := append(flags, "--")
+			return append(out, positional...)
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
 			flags = append(flags, a)
 			if valueFlags[a] && i+1 < len(args) {
 				i++

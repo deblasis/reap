@@ -218,7 +218,11 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 		if !earliest.IsZero() {
-			rep.HoldsExpireInDays = int(time.Until(earliest).Hours() / 24)
+			days := int(time.Until(earliest).Hours() / 24)
+			if days < 0 {
+				days = 0 // expires today: render 0d, never vanish
+			}
+			rep.HoldsExpireInDays = days
 		}
 	}
 	for range unreadableRoots {

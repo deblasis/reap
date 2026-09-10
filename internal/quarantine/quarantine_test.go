@@ -915,3 +915,60 @@ func TestRevalidateTruncatedBundleIsUnverified(t *testing.T) {
 		t.Fatalf("truncated bundle: %v, want unverified (never verified-ok)", v)
 	}
 }
+
+// Delta bundles must keep the three-state contract (the R18 verification
+// board's spec seat, live-proven): the integrity probe is SELF-CONTAINED
+// ONLY - a delta bundle's prerequisites are legitimately absent from any
+// empty verification repo, so probing it there collapsed verified-ok and
+// at-risk into unverified.
+func TestRevalidateDeltaStates(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "r")
+	if out, err := exec.Command("git", "-C", base, "init", "-q", "-b", "main", "r").CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run2 := func(args ...string) {
+		t.Helper()
+		full := append([]string{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)
+		if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v %s", args, err, out)
+		}
+	}
+	run2("add", "-A")
+	run2("commit", "-q", "-m", "one")
+	bare := filepath.Join(base, "up.git")
+	os.MkdirAll(bare, 0o755)
+	if out, err := exec.Command("git", "-C", bare, "init", "-q", "--bare", "-b", "main").CombinedOutput(); err != nil {
+		t.Skipf("bare init: %v %s", err, out)
+	}
+	run2("remote", "add", "origin", bare)
+	run2("push", "-q", "origin", "main")
+	tip := func() string {
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").CombinedOutput()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}()
+	baseSHA := tip
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("two"), 0o644)
+	run2("commit", "-q", "-a", "-m", "two")
+	// A real DELTA bundle in a session dir (tip only, base as prerequisite).
+	sess := filepath.Join(base, "sess")
+	os.MkdirAll(sess, 0o755)
+	if out, err := exec.Command("git", "-C", repo, "bundle", "create", filepath.Join(sess, "bundle.git"), baseSHA+"..main").CombinedOutput(); err != nil {
+		t.Skipf("bundle create: %v %s", err, out)
+	}
+	gr := gitx.Runner{GitBudget: 15 * time.Second, FetchBudget: 15 * time.Second}
+	m := &Manifest{BaseSHA: baseSHA, Origin: bare, Mode: "bundle"}
+	if v, c := RevalidateWithCause(gr, m, sess); v != VerifiedOK || c != "" {
+		t.Fatalf("intact delta + reachable base: %v/%q, want verified-ok (the collapsed-state regression)", v, c)
+	}
+	mgone := &Manifest{BaseSHA: strings.Repeat("0", 40), Origin: bare, Mode: "bundle"}
+	if v, c := RevalidateWithCause(gr, mgone, sess); v != AtRisk || c != "" {
+		t.Fatalf("gone base with the bundle PRESENT: %v/%q, want at-risk (the loud warning's only trigger)", v, c)
+	}
+}

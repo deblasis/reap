@@ -3,7 +3,7 @@
 // rather than a pid file is that the kernel drops it when the owner dies for
 // any reason at all (exit, panic, SIGKILL, TerminateProcess, power loss), so
 // there is no staleness to detect and no takeover logic to get wrong. reap
-// uses it for apply.lock, for sizecache writes, and to probe incoda live
+// uses it for apply.lock and to probe incoda live
 // tickets without disturbing them.
 package lockfile
 

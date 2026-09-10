@@ -105,6 +105,8 @@ type ScanReport struct {
 	Totals          Totals        `json:"totals"`
 	// HoldsExpireInDays (presentation-only, json:"-"): days until the
 	// earliest active hold lapses, for the KEEP subtitle's expiry detail.
+	// -1 = no active holds; >= 0 renders (0 = expires today - the detail
+	// matters MOST then and must not vanish).
 	HoldsExpireInDays int `json:"-"`
 }
 
@@ -115,7 +117,7 @@ func gb(b int64) float64 { return float64(b) / (1 << 30) }
 // scan, so an agent reading --json cannot mistake a display floor for the
 // truth (the spec's --min-gb contract).
 func Build(now time.Time, roots []RootSummary, entries []Entry, minGB float64) *ScanReport {
-	r := &ScanReport{Generated: now.Format(time.RFC3339), generatedAt: now, Roots: roots, Totals: Totals{Sizes: "logical"}}
+	r := &ScanReport{Generated: now.Format(time.RFC3339), generatedAt: now, Roots: roots, Totals: Totals{Sizes: "logical"}, HoldsExpireInDays: -1}
 	byCode := map[string]*ReasonTotal{}
 	for _, e := range entries {
 		if e.SizePartial {
@@ -202,7 +204,7 @@ func (r *ScanReport) Table(w io.Writer) {
 		strings.Join(rootPaths(r.Roots), " "), int(totalDirs), totalGB)
 
 	keepSub := "held or protected"
-	if r.HoldsExpireInDays > 0 {
+	if r.HoldsExpireInDays >= 0 {
 		keepSub = fmt.Sprintf("held or protected (holds expire in %dd)", r.HoldsExpireInDays)
 	}
 	sections := []struct {

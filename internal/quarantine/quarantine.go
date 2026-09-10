@@ -972,27 +972,42 @@ const (
 // verifies and never refuses on advancement); self-contained bundles are
 // verified-ok by construction.
 func Revalidate(r gitx.Runner, m *Manifest, sessionDir string) RestoreVerdict {
+	v, _ := RevalidateWithCause(r, m, sessionDir)
+	return v
+}
+
+// Unverified causes (RevalidateWithCause's second return): which check
+// failed, so the recovery-critical surfaces never misattribute a corrupt
+// bundle as a network problem ("" when the verdict is not Unverified).
+const (
+	CauseRemote = "remote" // ls-remote could not reach the recorded origin
+	CauseBundle = "bundle" // the session's bundle failed the integrity probe
+)
+
+// RevalidateWithCause is Revalidate plus the unverified CAUSE.
+func RevalidateWithCause(r gitx.Runner, m *Manifest, sessionDir string) (RestoreVerdict, string) {
 	if m == nil {
-		return Unverified
+		return Unverified, CauseRemote
 	}
-	// The bundle IS the recovery (the full-implementation reliability seat:
-	// a bundle truncated to a third still listed verified-ok, then restore
-	// died on a raw index-pack error). When a bundle file is PRESENT it must
-	// verify; a corrupt one maps to Unverified - the state for "could not
-	// verify", never conflated with at-risk. An absent bundle (bare unit
-	// manifests, manifest-less sessions already flagged separately) keeps
-	// the base checks below, exactly as before.
-	if m.Mode != "plain-copy" {
+	// The integrity check is SELF-CONTAINED ONLY (the R18 verification
+	// board's spec seat, live-proven): a delta bundle's prerequisite commits
+	// are legitimately absent from any empty verification repo, so unbundling
+	// it there fails for the RIGHT reason and would map every intact delta to
+	// Unverified - collapsing the three-state contract. Self-contained
+	// bundles have no prerequisites; theirs is the shape the unbundle check
+	// exists for (truncated pack -> early EOF). Delta integrity stays at
+	// restore time (fetch-then-verify + the named corrupt copy).
+	if m.SelfContained && m.Mode != "plain-copy" {
 		if present, ok := verifyBundle(sessionDir); present && !ok {
-			return Unverified
+			return Unverified, CauseBundle
 		}
 	}
 	if m.SelfContained || (m.BaseSHA == "" && len(m.BaseBases) == 0) {
-		return VerifiedOK
+		return VerifiedOK, ""
 	}
 	out, err := r.LSRemote(m.Origin)
 	if err != nil {
-		return Unverified
+		return Unverified, CauseRemote
 	}
 	bases := map[string]bool{m.BaseSHA: true}
 	for _, b := range m.BaseBases {
@@ -1003,10 +1018,10 @@ func Revalidate(r gitx.Runner, m *Manifest, sessionDir string) RestoreVerdict {
 			continue
 		}
 		if !strings.Contains(out, sha) {
-			return AtRisk
+			return AtRisk, ""
 		}
 	}
-	return VerifiedOK
+	return VerifiedOK, ""
 }
 
 // verifyBundle runs a budgeted `git bundle verify` on the session's bundle:

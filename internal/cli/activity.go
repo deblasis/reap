@@ -57,7 +57,10 @@ func cmdActivity(args []string, stdout, stderr io.Writer) int {
 		for _, k := range keys {
 			list = append(list, records[k])
 		}
-		_ = enc.Encode(list)
+		if err := enc.Encode(list); err != nil {
+			fmt.Fprintf(stderr, "reap activity: %v\n", err)
+			return ExitState
+		}
 		return ExitOK
 	}
 

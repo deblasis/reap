@@ -172,3 +172,43 @@ func TestWiringR17DiscardJSONShape(t *testing.T) {
 		t.Fatalf("deleted = %d, want the dirty repo:\n%s", got, js.String())
 	}
 }
+
+// The -- terminator is a hard positional boundary (the verification board's
+// spec nit): dash-leading paths must stay holdable via `hold -- <path>`.
+func TestWiringR18FlagsFirstTerminator(t *testing.T) {
+	root, _ := wireFixture(t)
+	weird := filepath.Join(root, "-weirdpath")
+	os.MkdirAll(weird, 0o755)
+	if code := cmdHold([]string{"--for", "48h", "--", weird}, os.Stdout, os.Stderr); code != ExitOK {
+		t.Fatalf("hold -- -weirdpath: %d (the terminator must protect dash-leading paths)", code)
+	}
+	var hb bytes.Buffer
+	if code := cmdHolds(nil, &hb, os.Stderr); code != ExitOK || !strings.Contains(hb.String(), "-weirdpath") {
+		t.Fatalf("the dash-leading hold must be recorded: %d %q", code, hb.String())
+	}
+}
+
+// An explicit --older-than 0s means "prune everything" (the verification
+// board's rel nit: the zero duration was silently conflated with unset).
+func TestWiringR18PruneOlderThanZero(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	// An aged session dir with a manifest so the victim scan sees it.
+	sess := filepath.Join(stateDir, "quarantine", "20260101-000000-x")
+	os.MkdirAll(sess, 0o755)
+	os.WriteFile(filepath.Join(sess, "manifest.json"), []byte(`{"mode":"plain-copy","selfContained":true}`), 0o644)
+	// YOUNGER than the 30d retention default: pre-fix, the conflated 0
+	// duration meant "unset" and this printed "nothing to prune"; with 0s
+	// honored it prunes.
+	recent := time.Now().Add(-5 * 24 * time.Hour)
+	os.Chtimes(sess, recent, recent)
+	var out, e bytes.Buffer
+	if code := cmdQuarantine([]string{"prune", "--older-than", "0s", "--yes"}, &out, &e, os.Stdin); code != ExitOK {
+		t.Fatalf("prune --older-than 0s: %d (%s %s)", code, out.String(), e.String())
+	}
+	if !strings.Contains(out.String(), "pruned 1") {
+		t.Fatalf("0s must prune the 5d session (the old zero-value conflation printed 'nothing to prune'): %s", out.String())
+	}
+	if _, err := os.Stat(sess); !os.IsNotExist(err) {
+		t.Fatal("the session must be gone")
+	}
+}
