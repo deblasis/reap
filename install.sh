@@ -4,7 +4,7 @@
 # Downloads the prebuilt binary for this platform, verifies it against the
 # release's SHA256SUMS, and installs it. Nothing unverifiable is installed.
 #
-# usage: [VERSION=v0.1.1] sh install.sh
+# usage: [REAP_VERSION=v0.1.1] sh install.sh
 #        sh install.sh v0.1.1
 #
 # environment:

@@ -1,17 +1,17 @@
 # reap: know quickly what disk space is safely cleanable, and clean it easily
 
-Status: design v7 (2026-09-06), FINAL panel state. Rounds: 1) unanimous 7; 2) 9,8,8,8,8,8;
-3) 9,9,9,9,8,8; 4) 10,9,9,9,8,8; 5) 10,9,9,9,9,8; 6) 10,9,9,9,9,9 — all six seats >= 9/10
-(product 10). v7 folds the named non-gating polish items the seats listed alongside their 9s.
-Spec pending user review.
-Repo: deblasis/reap, private for now. Single Go binary; runtime deps are only git / jj / gh found
+Status: design v7 (2026-09-06), reviewed and shipped. The design passed a
+six-round adversarial panel (final round 10,9,9,9,9,9), and the
+implementation passed a 21-round three-seat review (engineering /
+reliability / spec-conformance, all >= 9/10 with no majors) in 2026-09.
+Repo: deblasis/reap. Single Go binary; runtime deps are only git / jj / gh found
 on PATH, plus golang.org/x/sys for Windows file handles.
 
 ## Problem
 
 The workstation (ryzen7pro, 1.86 TB) runs chronically near-full. Measured 2026-09-06: ~305 GB sits
-in ~470 activity directories across C:\temp, C:\tmp, C:\wt, C:\zc, C:\src, %TEMP% scratch and
-CODE\OSS per-PR clones. Nothing reaps them, because "is this safe to delete" is expensive to
+in ~470 activity directories across the machine's workspace roots and
+per-PR clones. Nothing reaps them, because "is this safe to delete" is expensive to
 answer by hand: it needs git dirty/unpushed state, open-PR state, jj state for jj workspaces, age,
 and whether any session is still using the dir.
 
@@ -472,7 +472,7 @@ at the moment of deletion.
 
 ```
 reap scan                                                                 2026-09-06 19:02
-roots: C:\temp C:\tmp C:\wt C:\zc C:\src %TEMP%\  CODE\OSS  ~\source     462 dirs, 291.4 GB logical
+roots: <the machine's workspace roots>                       462 dirs, 291.4 GB logical
 
 ACTIVE  61 dirs  23.8 GB   (touched <48h or fresh scratch; nothing to decide)
   6.5 GB  C:\temp\wintty-seam930      active (<48h)

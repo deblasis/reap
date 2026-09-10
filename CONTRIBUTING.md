@@ -21,7 +21,7 @@ just ci        # gofmt no-op, go mod tidy no-op, go vet, the full suite
 
 The suite runs serialized (`go test -p 1`): it builds real repositories and
 drives real PTYs, and a flaky green hides regressions in a tool that deletes.
-If `just ci` passes on your machine, CI will pass too.
+There is no hosted CI; the local gate is the gate.
 
 ## Sending the change
 
