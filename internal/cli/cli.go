@@ -18,8 +18,13 @@ const (
 	ExitState = 122
 )
 
-// Version is stamped at build time with -ldflags; the zero value means dev.
-var Version string
+// Version, Commit and Date are stamped at build time with -ldflags; the
+// zero Version means dev.
+var (
+	Version string
+	Commit  string
+	Date    string
+)
 
 // Main dispatches args and returns the process exit code.
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -31,6 +36,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "version":
 		fmt.Fprintf(stdout, "reap %s\n", versionLabel())
+		if Commit != "" {
+			fmt.Fprintf(stdout, "commit: %s\nbuilt:  %s\n", Commit, Date)
+		}
 		return ExitOK
 	case "scan":
 		return cmdScan(rest, stdout, stderr)
