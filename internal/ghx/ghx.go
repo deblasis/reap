@@ -129,7 +129,16 @@ func (c Client) OpenPRHeads() PRHeads {
 		why  string
 	}
 	results := make(chan baseResult, len(bases))
-	deadline := time.After(c.Budget * 4) // total wall: search + all bases
+	// Wall re-tune (round 15; the R13-14 rel seat): the wall must buy at
+	// least one full per-call budget per fan-out WAVE (the 8-wide pool),
+	// with 4x as the floor - a PR-heavy account otherwise converts steady
+	// progress into 'budget exhausted' and the whole set degrades to
+	// Unavailable. Total wall: search + all bases.
+	waves := time.Duration((len(bases) + 7) / 8)
+	if waves < 4 {
+		waves = 4
+	}
+	deadline := time.After(c.Budget * waves)
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for base := range bases {

@@ -93,7 +93,11 @@ type Totals struct {
 
 // ScanReport is the whole scan --json document.
 type ScanReport struct {
-	Generated       time.Time     `json:"generated"`
+	// Generated serializes RFC3339 (round 15: aligned with plan/apply's
+	// same-named field - time.Time's default marshaling emits RFC3339Nano
+	// and the three emitters disagreed on the shape of one schema field).
+	Generated       string        `json:"generated"`
+	generatedAt     time.Time     // the Table header's clock
 	Roots           []RootSummary `json:"roots"`
 	Entries         []Entry       `json:"entries"`
 	Excluded        int           `json:"excludedBelowMinGB"`
@@ -108,7 +112,7 @@ func gb(b int64) float64 { return float64(b) / (1 << 30) }
 // scan, so an agent reading --json cannot mistake a display floor for the
 // truth (the spec's --min-gb contract).
 func Build(now time.Time, roots []RootSummary, entries []Entry, minGB float64) *ScanReport {
-	r := &ScanReport{Generated: now, Roots: roots, Totals: Totals{Sizes: "logical"}}
+	r := &ScanReport{Generated: now.Format(time.RFC3339), generatedAt: now, Roots: roots, Totals: Totals{Sizes: "logical"}}
 	byCode := map[string]*ReasonTotal{}
 	for _, e := range entries {
 		if e.SizePartial {
@@ -159,8 +163,22 @@ func Build(now time.Time, roots []RootSummary, entries []Entry, minGB float64) *
 	return r
 }
 
-// JSON writes the machine schema.
+// JSON writes the machine schema. Every list serializes as [] on empties,
+// never null (round 15; the third emitter aligned with plan's and apply's
+// []-on-empty shape): a consumer must not branch on absent-vs-empty.
 func (r *ScanReport) JSON(w io.Writer) error {
+	if r.Roots == nil {
+		r.Roots = []RootSummary{}
+	}
+	if r.Entries == nil {
+		r.Entries = []Entry{}
+	}
+	if r.UnreadableRoots == nil {
+		r.UnreadableRoots = []string{}
+	}
+	if r.Totals.ByReason == nil {
+		r.Totals.ByReason = []ReasonTotal{}
+	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(r)
@@ -176,7 +194,7 @@ func (r *ScanReport) Table(w io.Writer) {
 		totalDirs += float64(root.Dirs)
 		totalGB += root.SizeGB
 	}
-	fmt.Fprintf(w, "reap scan%74s\n", r.Generated.Format("2006-01-02 15:04"))
+	fmt.Fprintf(w, "reap scan%74s\n", r.generatedAt.Format("2006-01-02 15:04"))
 	fmt.Fprintf(w, "roots: %-60s %d dirs, %.1f GB logical\n\n",
 		strings.Join(rootPaths(r.Roots), " "), int(totalDirs), totalGB)
 

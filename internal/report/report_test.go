@@ -114,6 +114,26 @@ func TestByReasonTotals(t *testing.T) {
 	}
 }
 
+// Empty arrays, not null (round 15; the third emitter aligned with plan's
+// and apply's []-on-empty shape), and the generated field parses RFC3339
+// (the format the plan emitter uses for the same-named field).
+func TestJSONEmptyArraysAndGeneratedFormat(t *testing.T) {
+	r := Build(time.Now(), nil, nil, 0)
+	var buf bytes.Buffer
+	if err := r.JSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	s := buf.String()
+	for _, want := range []string{`"entries": []`, `"byReason": []`, `"roots": []`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("JSON must emit %s on empties:\n%s", want, s)
+		}
+	}
+	if _, err := time.Parse(time.RFC3339, r.Generated); err != nil {
+		t.Errorf("generated must be RFC3339: %q: %v", r.Generated, err)
+	}
+}
+
 // The --json wire shape: openPR always present, nullable fields as null,
 // reclaimableGB null, sizes "logical", excluded counted not listed.
 func TestJSONShape(t *testing.T) {

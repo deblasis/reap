@@ -98,6 +98,31 @@ type SkippedPath struct {
 	Note string `json:"note,omitempty"`
 }
 
+// CoerceEmptyLists makes every list field serialize as [] instead of null
+// (round 15): the same command must emit ONE shape on empty and non-empty
+// runs alike - a consumer cannot branch on absent-vs-empty, and the empty
+// branch used to hand-roll a literal that dropped the real buckets.
+func (s *Summary) CoerceEmptyLists() {
+	if s.Planned == nil {
+		s.Planned = []string{}
+	}
+	if s.Widened == nil {
+		s.Widened = []string{}
+	}
+	if s.Deleted == nil {
+		s.Deleted = []string{}
+	}
+	if s.Skipped == nil {
+		s.Skipped = []SkippedPath{}
+	}
+	if s.ExcludedBelow == nil {
+		s.ExcludedBelow = []ExcludedRef{}
+	}
+	if s.ExcludedCodes == nil {
+		s.ExcludedCodes = []string{}
+	}
+}
+
 // ExcludedRef is a below-floor path kept out of the plan (never a skip).
 type ExcludedRef struct {
 	Path string `json:"path"`

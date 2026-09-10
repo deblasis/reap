@@ -71,6 +71,12 @@ func newScanCore(args []string, stderr io.Writer, rootsFlag []string, noGH, noJJ
 	if !core.noGH && cfg.GH {
 		h := fetchPRHeads(core.ghBudget)
 		core.prHeads = &h
+		if h.Unavailable {
+			// Surface the Why at the source (round 15; the R13-14 rel seat):
+			// every dependent row reads gh-unavailable, and 'why' lived only
+			// in doctor. Timeout vs cap-exceeded vs auth names the remedy.
+			fmt.Fprintf(stderr, "reap: gh unavailable (%s); open-PR-dependent rows read gh-unavailable\n", h.Why)
+		}
 	}
 	core.useJJ = !core.noJJ && cfg.JJ && jjx.Available()
 	core.useGit = gitx.Available()
@@ -373,7 +379,14 @@ func resolvePlan(cands []candidate, include, exclude, overrideManual []string, m
 			for _, c := range cands {
 				if c.vd.Code == code && (c.vd.BlockedClassFact != "" || c.vd.Verdict == verdict.Blocked ||
 					c.vd.Verdict == verdict.Active || c.vd.Verdict == verdict.Keep) {
-					return nil, nil, nil, fmt.Errorf("--include %s matched only non-deletable rows (e.g. %s: %s)", code, c.entry.Path, c.vd.Verdict)
+					// The refusal names the path AND the shadowed fact (round
+					// 15; the R13-14 spec seat: the spec pins both, the error
+					// carried only the verdict).
+					shadow := ""
+					if c.vd.BlockedClassFact != "" {
+						shadow = fmt.Sprintf(" (shadowed fact: %s)", c.vd.BlockedClassFact)
+					}
+					return nil, nil, nil, fmt.Errorf("--include %s matched only non-deletable rows (e.g. %s: %s%s)", code, c.entry.Path, c.vd.Verdict, shadow)
 				}
 			}
 		}
@@ -640,10 +653,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	// The empty-plan skip sits AFTER the refusal pass (R10: the round-8
 	// early return swallowed the named 120 for exactly the agent-shaped
 	// invocation) and honors --json (the schema must hold on empties);
-	// dry-run stays byte-identical to plan.
+	// dry-run stays byte-identical to plan. The --json half is the SAME
+	// encoder and the SAME type as the executed branch (round 15; the R13-14
+	// rel seat: the hand-rolled literal silently dropped the real below/byCode
+	// buckets, so the same command emitted two shapes).
 	if len(plan) == 0 && !*dryRun {
 		if *asJSON {
-			fmt.Fprintln(stdout, `{"runId":"","planned":[],"widened":[],"deleted":[],"skipped":[],"excludedBelowFloor":[],"excludedByCode":[],"deletedBytes":0,"excludedBytes":0,"skippedBytes":0,"freeBytesReclaimed":0}`)
+			s := applycmd.Summary{ExcludedBelow: below, ExcludedCodes: byCode, ExcludedBytes: sumExcluded(below)}
+			s.CoerceEmptyLists()
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(s)
 		} else {
 			fmt.Fprintln(stdout, "nothing to delete (0 planned)")
 		}
@@ -660,6 +680,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 		return ExitOK
 	}
 
+	// Under --json, stdout carries ONLY the schema document: every human
+	// line (plan echo, preflight, prompts, declines) routes to stderr
+	// (round 15; the executed branch prefixed two text lines onto the JSON).
+	// On a live TTY stderr is the same screen, so the interactive flow is
+	// unchanged; IsTerminal's both-streams check keeps its meaning because
+	// stderr is as much a real terminal as stdout there.
+	humanOut := io.Writer(stdout)
+	if *asJSON {
+		humanOut = stderr
+	}
+
 	// Preflight floor: a refusal, not a print. Carve-out runs raise the
 	// floor to cap x margin (the spec: a confirmed snapshot is never
 	// replaced by a silent no-snapshot deletion  -  the quarantine write
@@ -673,7 +704,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 	}
 	free := auditlog.FreeBytes(stateDir)
 	widened := planWidenedCodes(plan)
-	proceed, ccode := applycmd.Confirm(stdout, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes, ErrOut: stderr})
+	proceed, ccode := applycmd.Confirm(humanOut, stdin, plan, widened, minFree, free, applycmd.Options{Yes: *yes, ErrOut: stderr})
 	if !proceed {
 		return ccode
 	}
@@ -695,17 +726,17 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			if p.ParentRepo != "" {
 				gitdir = fmt.Sprintf("; stale gitdir: %s", p.ParentRepo)
 			}
-			fmt.Fprintf(stdout, "  ORPHANED %s (%.1f GB): %s%s; a capped plain-copy quarantine is taken first\n",
+			fmt.Fprintf(humanOut, "  ORPHANED %s (%.1f GB): %s%s; a capped plain-copy quarantine is taken first\n",
 				p.Path, float64(p.SizeBytes)/(1<<30), counts, gitdir)
 		}
-		fmt.Fprint(stdout, "carve-out deletion (recovery = the plain copy only). Type y to confirm: ")
+		fmt.Fprint(humanOut, "carve-out deletion (recovery = the plain copy only). Type y to confirm: ")
 		var answer string
 		if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil {
-			fmt.Fprintln(stdout, "\ndeclined")
+			fmt.Fprintln(humanOut, "\ndeclined")
 			return ExitOK
 		}
 		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
-			fmt.Fprintln(stdout, "declined")
+			fmt.Fprintln(humanOut, "declined")
 			return ExitOK
 		}
 	}
@@ -995,11 +1026,11 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 					// GB would round the decision inputs away at small scales.
 					need, cap, unit = float64(tooLarge.Need>>20), float64(tooLarge.Cap>>20), "MB"
 				}
-				fmt.Fprintf(stdout, "plain-copy snapshot exceeds the cap (needs %.1f %s, cap %.1f %s): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
+				fmt.Fprintf(humanOut, "plain-copy snapshot exceeds the cap (needs %.1f %s, cap %.1f %s): deletion is unrecoverable except for the file manifest. Proceed? [y/N] ",
 					need, unit, cap, unit)
 				var answer string
 				if _, aerr := fmt.Fscanln(stdin, &answer); aerr != nil || strings.ToLower(strings.TrimSpace(answer)) != "y" {
-					fmt.Fprintln(stdout, "declined")
+					fmt.Fprintln(humanOut, "declined")
 					// A decline is a SKIP line (the enum cause: the cap
 					// ended this deletion), visible in the summary and the
 					// exit-2 band  -  never a silent machine-invisible
@@ -1185,6 +1216,7 @@ func cmdApply(args []string, stdout, stderr io.Writer, stdin *os.File) int {
 			len(below), float64(sumExcluded(below))/(1<<30),
 			len(summary.Skipped), float64(summary.SkippedBytes)/(1<<30), summarizeSkips(summary.Skipped))
 	} else {
+		summary.CoerceEmptyLists()
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
@@ -1245,20 +1277,17 @@ func droppedWidenings(cands []candidate, include, overrideManual []string, plan 
 		// --include of a code that matched this candidate but produced no
 		// planned row: refuse naming the row  -  INCLUDING the shadowed case
 		// (the displayed code differs from the include code; the BLOCKED
-		// fact still rides this candidate).
-		// The UNDERLYING SHAPE survives rails: a held/protected orphan
-		// still matched --include orphaned-workspace by shape even though
-		// the KEEP rail rewrote its displayed code (the round-10
-		// held-shadow silent zero).
-		shapeCode := ""
-		switch c.cls.Kind {
-		case classify.KindJJWorkspaceOrphaned:
-			shapeCode = "orphaned-workspace"
-		case classify.KindGitWorktreeOrphaned:
-			shapeCode = "orphaned-worktree"
+		// fact still rides this candidate). The match keys on the PRE-RAIL
+		// code when a rail rewrote the row (round 15 closed the M3-recorded
+		// swallowed-code silent zero; the old shapeCode recovery covered
+		// orphan kinds only): a held/active/incoda-live row still matches
+		// --include of the judgment code it would carry without the rail.
+		matchCode := c.vd.Code
+		if c.vd.PreRailCode != "" {
+			matchCode = c.vd.PreRailCode
 		}
-		if (inc[c.vd.Code] || (shapeCode != "" && inc[shapeCode])) && !planned[cp] {
-			out = append(out, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, c.vd.Code, fact))
+		if inc[matchCode] && !planned[cp] {
+			out = append(out, fmt.Sprintf("%s: code %s matched but was not deletable: %s", c.entry.Path, matchCode, fact))
 		}
 	}
 	return out

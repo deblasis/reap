@@ -119,8 +119,7 @@ func TestWiringEmptyPlanAfterRefusals(t *testing.T) {
 	if !strings.Contains(js.String(), `"planned"`) {
 		t.Fatalf("empty-plan --json must carry the schema: %s", js.String())
 	}
-	// (b) The held-shadow include silent-0 is the M3-RECORDED swallowed-code
-	// nit (rails rewrite the row's code; droppedWidenings cannot associate -
-	// shapeCode recovery exists for orphans only), NOT this round's
-	// regression; it stays a declared-open nit in the plan ledger.
+	// (b) The held-shadow include silent-0 was the M3-RECORDED swallowed-code
+	// nit; CLOSED in round 15 (PreRailCode + TestWiringR15IncludeRefusal-
+	// NamesShadowedFact in r15pin_test.go pin the named refusal).
 }

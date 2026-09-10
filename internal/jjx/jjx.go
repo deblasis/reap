@@ -229,10 +229,14 @@ func captureOpHeads(dir string) func() {
 		}
 		for _, root := range roots {
 			filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
+				if err != nil {
 					return nil
 				}
-				if fi, err := d.Info(); err == nil && fi.ModTime().After(captureAt) {
+				// FILES and DIRS (round 15; the R13-14 rel nit): a directory
+				// minted by the snapshot kept a fresh mtime, and dir-mtime
+				// readers (opRecency, the op_heads/heads shape the family
+				// unlock depends on) saw activity where there was none.
+				if fi, ierr := d.Info(); ierr == nil && fi.ModTime().After(captureAt) {
 					os.Chtimes(p, clampTo, clampTo)
 				}
 				return nil

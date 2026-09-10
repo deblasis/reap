@@ -94,6 +94,10 @@ type Input struct {
 
 	Thresholds config.Thresholds
 	Now        time.Time
+
+	// noRails is decide-internal (never set by callers): compute the body
+	// rows without the KEEP/ACTIVE rails, for PreRailCode.
+	noRails bool
 }
 
 // Verdict is the decision plus everything downstream (plan, apply, report)
@@ -124,6 +128,14 @@ type Verdict struct {
 	// refusal, and hardened-confirm copy must NOT say "parent gone".
 	// Empty = the default flavor.
 	Flavor string
+
+	// PreRailCode is the code the row would carry WITHOUT the KEEP/ACTIVE
+	// rails (held/protected/reparse/incoda-live/activity). Empty when no
+	// rail rewrote the row (it equals Code then). The rails legitimately
+	// outrank the body rows, but the include-refusal association keys on
+	// this stamp, so --include of the underlying code is refused BY NAME
+	// instead of planning a silent 0 (the M3-recorded swallowed-code nit).
+	PreRailCode string
 }
 
 // The deregistered-workspace flavor (set by the re-route sites).
@@ -144,33 +156,65 @@ func Decide(in Input) Verdict {
 // KEEP rails first; orphan detection (file-based, structural) outranks
 // unreadable-state rows; every failure row outranks every clean row;
 // BLOCKED-class rows outrank SAFE so shadowing can only ever DISPLAY a
-// weaker row, never reach one.
+// weaker row, never reach one. When a rail wins, the body row's code
+// survives as PreRailCode.
 func decide(in Input) Verdict {
+	if in.noRails {
+		return decideBody(in)
+	}
 	v := Verdict{Verdict: Manual}
 
 	// BLOCKED-class fact scan first: reachability comes from the full fact
 	// set, computed before any row is chosen.
 	v.BlockedClassFact = blockedClassFact(in)
 
+	// The PRE-RAIL code (round 15; the M3-recorded swallowed-code silent
+	// zero): the rails below outrank the body rows, but the code the row
+	// would carry WITHOUT them survives the rewrite. The body is the same
+	// pure matrix over the same facts, rails off - no extra exec, no
+	// second fact source.
+	bodyIn := in
+	bodyIn.noRails = true
+	body := decide(bodyIn)
+
 	switch {
 	case in.Held:
-		return keep("held-by-user", "held by user", "reap unhold to release", v.BlockedClassFact)
+		k := keep("held-by-user", "held by user", "reap unhold to release", v.BlockedClassFact)
+		k.PreRailCode = body.Code
+		return k
 	case in.Protected:
-		return keep("protected", "protected path", "config.json protect list", v.BlockedClassFact)
+		k := keep("protected", "protected path", "config.json protect list", v.BlockedClassFact)
+		k.PreRailCode = body.Code
+		return k
 	case in.IsReparse:
 		// A junction/symlink candidate is the link, not the target: facts
 		// harvested through it are evidence about a DIFFERENT path, and the
 		// walk never ran, so activity and size are zero-value sentinels.
-		return keep("protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable", v.BlockedClassFact)
+		k := keep("protected", "reparse point (junction/symlink)", "candidate itself is a link; not deletable", v.BlockedClassFact)
+		k.PreRailCode = body.Code
+		return k
 	case in.IncodaLive:
-		return v.set(Active, "incoda-live", "live incoda ticket", "")
+		a := v.set(Active, "incoda-live", "live incoda ticket", "")
+		a.PreRailCode = body.Code
+		return a
 	}
 
 	active := in.activeHours()
 	if !in.LastActivity.IsZero() && in.Now.Sub(in.LastActivity) < active {
-		return v.set(Active, "active", fmt.Sprintf("active (<%dh)", int(active.Hours())), "")
+		a := v.set(Active, "active", fmt.Sprintf("active (<%dh)", int(active.Hours())), "")
+		a.PreRailCode = body.Code
+		return a
 	}
+	return body
+}
 
+// decideBody is decide with every rail off: the orphan, unreadable-state,
+// judgment, BLOCKED, and clean rows, plus the matrix's fail-safe MANUAL.
+func decideBody(in Input) Verdict {
+	v := Verdict{Verdict: Manual}
+	v.BlockedClassFact = blockedClassFact(in)
+
+	active := in.activeHours()
 	switch in.Kind {
 	case classify.KindGitWorktreeOrphaned:
 		v.OrphanedCarveOut = true

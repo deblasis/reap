@@ -71,6 +71,12 @@ func cmdScan(args []string, stdout, stderr io.Writer) int {
 	if !*noGH && cfg.GH {
 		h := fetchPRHeads(ghBudget)
 		prHeads = &h
+		if h.Unavailable {
+			// Surface the Why at the source (round 15; the R13-14 rel seat):
+			// every dependent row reads gh-unavailable, and 'why' lived only
+			// in doctor. Timeout vs cap-exceeded vs auth names the remedy.
+			fmt.Fprintf(stderr, "reap: gh unavailable (%s); open-PR-dependent rows read gh-unavailable\n", h.Why)
+		}
 	}
 	useJJ := !*noJJ && cfg.JJ && jjx.Available()
 	useGit := gitx.Available()

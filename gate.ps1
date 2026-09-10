@@ -7,7 +7,9 @@ $failed = $false
 
 # Tool-presence probe (the R10-12 rel seat: if a tool cannot launch,
 # $LASTEXITCODE keeps a stale value and every step "passes" vacuously).
-foreach ($tool in @("go", "gofmt")) {
+# git/jj included (round 15): the jj-dependent pins silently skip on a
+# jj-less box, which is a vacuous green of its own.
+foreach ($tool in @("go", "gofmt", "git", "jj")) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         Write-Host "GATE: FAILED ($tool not on PATH; nothing ran)"; exit 1
     }
