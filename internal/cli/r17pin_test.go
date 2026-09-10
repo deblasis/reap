@@ -262,6 +262,65 @@ func TestWiringR19CorruptRestore125(t *testing.T) {
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
 		t.Fatal("the self-created destination must be cleaned on failure")
 	}
+
+	// (b) A pre-existing FILE at --to: the never-delete refusal, the file
+	// intact (the closing board's major - the R19 shape deleted it).
+	fileDest := filepath.Join(root, "restore-file")
+	if err := os.WriteFile(fileDest, []byte("precious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdQuarantine([]string{"restore", filepath.Base(sess), "--to", fileDest}, os.Stdout, &e, os.Stdin); code != ExitUsage {
+		t.Fatalf("file at --to: %d (want the 120 refusal): %s", code, e.String())
+	}
+	if b, rerr := os.ReadFile(fileDest); rerr != nil || string(b) != "precious" {
+		t.Fatalf("the pre-existing file must survive verbatim: %q %v", b, rerr)
+	}
+
+	// (c) A pre-existing EMPTY dir at --to: the run did not create it, so a
+	// failed restore must leave it standing (the R19 shape removed it).
+	dirDest := filepath.Join(root, "restore-empty")
+	if err := os.MkdirAll(dirDest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdQuarantine([]string{"restore", filepath.Base(sess), "--to", dirDest}, os.Stdout, &e, os.Stdin); code != applycmd.ExitQuarantine {
+		t.Fatalf("empty dir at --to: %d (want 125): %s", code, e.String())
+	}
+	if _, serr := os.Stat(dirDest); serr != nil {
+		t.Fatal("a pre-existing empty dir must survive a failed restore")
+	}
+
+	// (d) The defaulted destination (m.Source, no --to) standing empty: the
+	// created-this-run guard keeps it; a defaulted path is never cleaned.
+	srcDir := sessions[0].Manifest.Source
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdQuarantine([]string{"restore", filepath.Base(sess)}, os.Stdout, &e, os.Stdin); code != applycmd.ExitQuarantine {
+		t.Fatalf("defaulted dest: %d (want 125): %s", code, e.String())
+	}
+	if _, serr := os.Stat(srcDir); serr != nil {
+		t.Fatal("a standing defaulted destination must survive a failed restore")
+	}
+}
+
+// The nil-manifest row carries the state and cause in list --json (the
+// closing board: the none cause was unreachable on the surface it existed
+// for).
+func TestWiringR20NilManifestRowState(t *testing.T) {
+	_, stateDir := wireFixture(t)
+	sess := filepath.Join(stateDir, "quarantine", "20260101-000000-x")
+	os.MkdirAll(sess, 0o755)
+	os.WriteFile(filepath.Join(sess, "manifest.json"), []byte("{corrupt"), 0o644)
+	var js bytes.Buffer
+	if code := cmdQuarantine([]string{"list", "--json"}, &js, os.Stderr, os.Stdin); code != ExitOK {
+		t.Fatalf("list --json: %d (%s)", code, js.String())
+	}
+	if !strings.Contains(js.String(), `"state": "unverified"`) || !strings.Contains(js.String(), `"stateCause": "none"`) {
+		t.Fatalf("the nil-manifest row must carry state=unverified/cause=none:\n%s", js.String())
+	}
+	if !strings.HasPrefix(strings.TrimSpace(js.String()), "[") {
+		t.Fatalf("list --json must emit an array:\n%s", js.String())
+	}
 }
 
 // An explicit --older-than 0s means "prune everything" (the verification

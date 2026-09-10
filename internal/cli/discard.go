@@ -940,6 +940,12 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 			r.SelfContained = &s.Manifest.SelfContained
 			vDbg, causeDbg := quarantine.RevalidateWithCause(gr, s.Manifest, s.Dir)
 			r.State, r.StateCause = string(vDbg), causeDbg
+		} else {
+			// Nil-manifest rows carry the state too (the closing board: the
+			// none cause was structurally unreachable on the very surface it
+			// was built for; spec L264 wants unverified SHOWN in list --json,
+			// not implied by manifestOk:false).
+			r.State, r.StateCause = string(quarantine.Unverified), quarantine.CauseNone
 		}
 		if cfgErr == nil && age >= cfg.Thresholds.QuarantineRetentionD {
 			r.PastRetention = true
@@ -949,6 +955,9 @@ func quarantineList(stateDir string, args []string, stdout, stderr io.Writer) in
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
+		if rows == nil {
+			rows = []row{} // [] on empty, never null (the closing rel nit)
+		}
 		if err := enc.Encode(rows); err != nil {
 			fmt.Fprintf(stderr, "reap quarantine list: %v\n", err)
 			return ExitState
@@ -1269,6 +1278,14 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 	}
 	// Recovery never overwrites: a non-empty destination names what is there
 	// (the full-implementation spec nit: entries themselves, up to five).
+	// A regular FILE at the destination is the same refusal (the closing
+	// board's rel + spec seats: os.ReadDir on a file errors and read as
+	// absent, the MkdirAll then failed, and the failure cleanup DELETED the
+	// user's file - the never-delete rule is absolute, spec L282-283).
+	if fi, ferr := os.Stat(dest); ferr == nil && !fi.IsDir() {
+		fmt.Fprintf(stderr, "reap quarantine restore: %s exists and is a file (recovery never deletes or overwrites)\n", dest)
+		return ExitUsage
+	}
 	if entries, rerr := os.ReadDir(dest); rerr == nil && len(entries) > 0 {
 		names := make([]string, 0, len(entries))
 		for i, e := range entries {
@@ -1281,14 +1298,15 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "reap quarantine restore: %s exists and is non-empty (recovery never deletes or overwrites; contains: %s)\n", dest, strings.Join(names, ", "))
 		return ExitUsage
 	}
-	// The self-created destination is cleaned on EVERY failure path (the
-	// final board's eng/spec seats: only the corrupt branch cleaned before,
-	// leaving an init-ed husk that made retries hit the non-empty refusal).
-	// GUARDS: only an EXPLICIT --to dest this run created (a defaulted
-	// m.Source may still hold user content), and only after the non-empty
-	// refusal has already returned above.
+	// The failure-path cleanup is armed ONLY for a destination THIS RUN
+	// creates (the closing board's major: the R19 shape armed it for any
+	// explicit --to, deleting pre-existing files and empty dirs; the guard
+	// the R19 comment claimed - 'only what this run created' - is what this
+	// actually implements). A defaulted m.Source follows the same rule: it
+	// self-cleans only when absent (this run created it) and is never
+	// touched when it stands.
 	materialized := false
-	if to != "" {
+	if _, derr := os.Stat(dest); derr != nil {
 		defer func() {
 			if !materialized {
 				os.RemoveAll(dest)
@@ -1350,7 +1368,7 @@ func quarantineRestore(stateDir string, args []string, stdout, stderr io.Writer)
 		if strings.Contains(msg, "Repository lacks these prerequisite") {
 			// An INTACT delta whose prerequisites are absent (the final
 			// board's eng nit: 'corrupt' would misname it).
-			fmt.Fprintf(stderr, "reap quarantine restore: the base this delta needs is unavailable (no origin recorded or unreachable); recovery from this session alone is not possible\n")
+			fmt.Fprintf(stderr, "reap quarantine restore: the base this delta needs is unavailable (no origin recorded or unreachable; prerequisites: %s); recovery from this session alone is not possible\n", strings.Join(prereqs, ", "))
 			return applycmd.ExitQuarantine
 		}
 		if strings.Contains(msg, "early EOF") || strings.Contains(msg, "index-pack") {
