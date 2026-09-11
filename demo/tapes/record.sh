@@ -48,6 +48,10 @@ cat > demo/tapes/apply.lines <<'EOF'
 SLEEP 1
 reap plan
 SLEEP 9
+reap unhold /tmp/reap-tape/world/scratch-old
+SLEEP 1
+reap plan
+SLEEP 9
 reap apply --yes
 SLEEP 6
 EOF

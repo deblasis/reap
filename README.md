@@ -57,37 +57,35 @@ nothing else changes):
 === scan - what exists, and what each dir is
 
 > reap scan
-reap scan                                                          2026-09-10 18:10
-roots: .../reap-demo-7C8Vih/world  4 dirs, 0.0 GB logical
+reap scan                                                          2026-09-11 07:25
+roots: .../reap-demo-c5aEqQ/world  4 dirs, 7.9 GB logical
 
-BLOCKED 1 dirs    0.0 GB   waiting on you: push or discard
-    0.0 GB  ...\world\dirty-repo 1 tracked-modified, 0 untracked
-         last: no incoda record
+BLOCKED 1 dirs    1.1 GB   waiting on you: push or discard
+    1.1 GB  ...\world\dirty-repo 1 tracked-modified, 1 untracked
          hint: commit+push the work, or reap discard ...\world\dirty-repo
 
-MANUAL  1 dirs    0.0 GB   judgment calls (run reap plan --include <code> to widen)
-    0.0 GB  ...\world\scratch-recent scratch idle 12 days (7-21)
-         last: no incoda record
+MANUAL  1 dirs    1.2 GB   judgment calls (run reap plan --include <code> to widen)
+    1.2 GB  ...\world\scratch-recent scratch idle 12 days (7-21)
          hint: wait, or widen with --include scratch-recent
 
-KEEP    1 dirs    0.0 GB   held or protected (holds expire in 29d)
-    0.0 GB  ...\world\scratch-old held by user
+KEEP    1 dirs    3.4 GB   held or protected (holds expire in 29d)
+    3.4 GB  ...\world\scratch-old held by user
 
-SAFE    1 dirs    0.0 GB   ready to reap: reap plan, then reap apply
-    0.0 GB  ...\world\clean-repo clean + fully pushed
+SAFE    1 dirs    2.2 GB   ready to reap: reap plan, then reap apply
+    2.2 GB  ...\world\clean-repo clean + fully pushed
 
 sizes are logical; hardlinked content may reclaim less (zig lane cache shares bytes)
-    0.0 GB  clean-pushed             1 dirs
-    0.0 GB  dirty-files              1 dirs
-    0.0 GB  held-by-user             1 dirs
-    0.0 GB  scratch-recent           1 dirs
+    3.4 GB  held-by-user             1 dirs
+    2.2 GB  clean-pushed             1 dirs
+    1.2 GB  scratch-recent           1 dirs
+    1.1 GB  dirty-files              1 dirs
 
 === plan - exactly what a plain apply would delete (the SAFE set only)
 # (the held scratch dir is KEEP, so only the clean-pushed repo plans)
 
 > reap plan
-reap will permanently delete 1 directories, logical 0.0 GB, expected reclaim ~0.0 GB (not recycled)
-     0.0 GB  ...\world\clean-repo  [clean-pushed]
+reap will permanently delete 1 directories, logical 2.2 GB, expected reclaim ~2.2 GB (not recycled)
+     2.2 GB  ...\world\clean-repo  [clean-pushed]
 dry-run: nothing will be deleted
 
 === holds - releasing the pin lets the dir back into the plan
@@ -99,47 +97,47 @@ dry-run: nothing will be deleted
 0 hold(s) recorded
 
 > reap plan
-reap will permanently delete 2 directories, logical 0.0 GB, expected reclaim ~0.0 GB (not recycled)
-     0.0 GB  ...\world\clean-repo  [clean-pushed]
-     0.0 GB  ...\world\scratch-old  [scratch-idle]
+reap will permanently delete 2 directories, logical 5.6 GB, expected reclaim ~5.6 GB (not recycled)
+     2.2 GB  ...\world\clean-repo  [clean-pushed]
+     3.4 GB  ...\world\scratch-old  [scratch-idle]
 dry-run: nothing will be deleted
 
 === apply - delete the SAFE set, with the write-ahead audit trail
 
 > reap apply --yes
-reap will permanently delete 2 directories, 0.0 GB logical (not recycled)
-preflight: 256 MB free required, 60855 MB free
-deleted 2 dirs (logical 0.0 GB, expected reclaim ~0.0 GB), excluded 0 (0.0 GB below floor), skipped 0 (0.0 GB): none
+reap will permanently delete 2 directories, 5.6 GB logical (not recycled)
+preflight: 256 MB free required, 8196 MB free
+deleted 2 dirs (logical 5.6 GB, expected reclaim ~5.6 GB), excluded 0 (0.0 GB below floor), skipped 0 (0.0 GB): none
 
 === discard - resolve a BLOCKED dir: quarantine it, then delete
 
 > reap discard ...\world\dirty-repo --yes
-discarded 1 dirs; freed ~0.0 GB now (dir 0.0 GB, bundle 0.0 GB kept); 0.0 GB more once the quarantine is pruned
+discarded 1 dirs; freed ~1.1 GB now (dir 1.1 GB, bundle 0.0 GB kept); 0.0 GB more once the quarantine is pruned
 
 === quarantine list - what recovery exists, and how it is doing
 
 > reap quarantine list
-     0 MB    0d  20260910-181134-dirty-repo  delta base=b66be2354d source=...\world\dirty-repo state=verified-ok
-  restore: reap quarantine restore 20260910-181134-dirty-repo
+     1 MB    0d  20260911-073249-dirty-repo  delta base=01c6ca6441 source=...\world\dirty-repo state=verified-ok
+  restore: reap quarantine restore 20260911-073249-dirty-repo
 
 === quarantine restore - prove the recovery is real (the dirty edits come back)
 
-> reap quarantine restore 20260910-181134-dirty-repo --to ...\recovered
-restored 20260910-181134-dirty-repo -> .../recovered (capture ref refs/reap/capture-20260910-181134 materialized; pinned refs under refs/reap/*)
+> reap quarantine restore 20260911-073249-dirty-repo --to ...\recovered
+restored 20260911-073249-dirty-repo -> .../recovered (capture ref refs/reap/capture-20260911-073249 materialized; pinned refs under refs/reap/*)
 
 recovered file says: uncommitted edits - the only copy
 
 === log - every decision reap made, write-ahead, one line per event
 
 > reap log
-2026-09-10T15:11:33  intent    begin     ...\world\clean-repo
-2026-09-10T15:11:33  result    deleted   ...\world\clean-repo
-2026-09-10T15:11:33  intent    begin     ...\world\scratch-old
-2026-09-10T15:11:33  result    deleted   ...\world\scratch-old
-2026-09-10T15:11:33  envelope  run end: deleted=2 skipped=0
-2026-09-10T15:11:34  intent    begin     ...\world\dirty-repo
-2026-09-10T15:11:36  result    deleted   ...\world\dirty-repo
-2026-09-10T15:11:36  envelope  run end: deleted=1 skipped=0
+2026-09-11T04:32:47  intent    begin     ...\world\clean-repo
+2026-09-11T04:32:48  result    deleted   ...\world\clean-repo
+2026-09-11T04:32:48  intent    begin     ...\world\scratch-old
+2026-09-11T04:32:48  result    deleted   ...\world\scratch-old
+2026-09-11T04:32:48  envelope  run end: deleted=2 skipped=0
+2026-09-11T04:32:49  intent    begin     ...\world\dirty-repo
+2026-09-11T04:33:12  result    deleted   ...\world\dirty-repo
+2026-09-11T04:33:12  envelope  run end: deleted=1 skipped=0
 
 ```
 

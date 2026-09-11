@@ -42,10 +42,14 @@ run() { printf '\n> %s\n' "$*"; "$@"; }
 
 # --- the sandbox ----------------------------------------------------------
 
-for n in scratch-old scratch-recent; do
-  mkdir -p "$world/$n"
-  dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\000' 'x' > "$world/$n/build.bin"
-done
+# sparse multi-GB artifacts: the apparent size carries the demo (the table
+# and the summaries show GB), the disk pays almost nothing
+mkfake() { # mkfake <path> <GB>
+  dd if=/dev/zero of="$1" bs=1M count=0 seek="$(( $(echo "$2" | awk '{printf "%d", $1 * 1024}') ))" 2>/dev/null
+}
+mkdir -p "$world/scratch-old/target" "$world/scratch-recent"
+mkfake "$world/scratch-old/target/artifact.bin" 3.4
+mkfake "$world/scratch-recent/partial.bin" 1.2
 age "$world/scratch-old" 40
 age "$world/scratch-recent" 12
 
@@ -55,6 +59,14 @@ git -C "$world/clean-repo" -c user.name=demo -c user.email=demo@demo \
   commit -q --allow-empty -m shipped
 git init -q --bare -b main "$demo/clean.git"
 git -C "$world/clean-repo" remote add origin "$demo/clean.git"
+git -C "$world/clean-repo" push -q origin main
+# a committed 2.2 GB artifact: zeros, so the object store compresses it to
+# almost nothing while the working-tree copy (sparse) keeps the walk honest
+mkdir -p "$world/clean-repo/artifacts"
+mkfake "$world/clean-repo/artifacts/build.bin" 2.2
+git -C "$world/clean-repo" add -A
+git -C "$world/clean-repo" -c user.name=demo -c user.email=demo@demo \
+  commit -q -m artifact
 git -C "$world/clean-repo" push -q origin main
 git -C "$world/clean-repo" fetch -q origin
 age "$world/clean-repo" 40
@@ -71,6 +83,7 @@ git init -q --bare -b main "$demo/dirty.git"
 git -C "$world/dirty-repo" remote add origin "$demo/dirty.git"
 git -C "$world/dirty-repo" push -q origin main
 echo 'uncommitted edits - the only copy' > "$world/dirty-repo/work-in-progress.txt"
+mkfake "$world/dirty-repo/dataset.bin" 1.1
 age "$world/dirty-repo" 40
 
 # reap's config: one root, no protect list, defaults
