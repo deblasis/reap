@@ -45,7 +45,16 @@ run() { printf '\n> %s\n' "$*"; "$@"; }
 # sparse multi-GB artifacts: the apparent size carries the demo (the table
 # and the summaries show GB), the disk pays almost nothing
 mkfake() { # mkfake <path> <GB>
-  dd if=/dev/zero of="$1" bs=1M count=0 seek="$(( $(echo "$2" | awk '{printf "%d", $1 * 1024}') ))" 2>/dev/null
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      # NTFS: fsutil createnew sets the size without writing data (dd seek=
+      # allocates real bytes there and drains the disk)
+      fsutil file createnew "$(cygpath -w "$1")" \
+        "$(( $(echo "$2" | awk '{printf "%d", $1 * 1024 * 1024 * 1024}') ))" >/dev/null ;;
+    *)
+      dd if=/dev/zero of="$1" bs=1M count=0 \
+        seek="$(( $(echo "$2" | awk '{printf "%d", $1 * 1024}') ))" 2>/dev/null ;;
+  esac
 }
 mkdir -p "$world/scratch-old/target" "$world/scratch-recent"
 mkfake "$world/scratch-old/target/artifact.bin" 3.4
