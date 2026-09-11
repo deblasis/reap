@@ -39,6 +39,15 @@ Nothing outside the sandbox is touched:
 sh demo/demo.sh            # or: sh demo/demo.sh ./path/to/reap
 ```
 
+![reap scan](img/demo-scan.gif)
+
+The full lifecycle, recorded (the casts these GIFs were rendered from are in
+`demo/casts/`; `demo/tapes/` regenerates them):
+
+![reap plan and apply](img/demo-apply.gif)
+
+![reap discard, quarantine, and restore](img/demo-discard.gif)
+
 What it looks like (verbatim from a Windows run, long paths elided;
 identical on macOS and Linux - on a machine without `gh`, the clean repo
 honestly verdicts `gh-unavailable` instead of `clean + fully pushed`, and
