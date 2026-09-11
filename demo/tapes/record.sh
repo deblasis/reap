@@ -1,5 +1,5 @@
 #!/bin/sh
-# Records the three demo casts with asciinema and converts them to GIFs
+# Records the three demo casts (built-in pty recorder) and converts them to GIFs
 # with agg. Run from the repo root inside Linux/WSL; expects reap (linux)
 # in ~/bin and the world built by demo/tapes/setup.sh (done below).
 #
@@ -7,8 +7,6 @@
 set -eu
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/bin:$PATH"
-export PYTHONPATH="$HOME/asilibs/usr/lib/python3/dist-packages"
-ASCIINEMA="$HOME/asilibs/usr/bin/asciinema"
 
 # a monospace font for agg: installed into ~/.fonts by run-record.sh, so
 # fontconfig resolves "JetBrains Mono" (agg takes families, not paths)
@@ -32,8 +30,7 @@ record() { # record <name> <script-file>
     echo '. /tmp/reap-tape/env.sh && clear'
     cat "$script"
     echo 'SLEEP 2'
-    echo 'exit'
-  } | python3 demo/tapes/record.py | "$ASCIINEMA" rec -c bash --overwrite "demo/casts/$name.cast" >/dev/null 2>&1
+  } | python3 demo/tapes/record.py "demo/casts/$name.cast"
   "$HOME/bin/agg" --idle-time-limit 1.5 \
     "demo/casts/$name.cast" "img/demo-$name.gif"
   echo "== $name: $(wc -c < "img/demo-$name.gif") bytes"
